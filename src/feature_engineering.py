@@ -1,5 +1,15 @@
-from typing import Union
+from typing import Iterable, List, Tuple
+
 import pandas as pd
+
+# Default set of feature columns expected after add_basic_features
+DEFAULT_FEATURE_COLUMNS = [
+    "mid",
+    "spread",
+    "top_bid_depth",
+    "top_ask_depth",
+    "order_book_imbalance",
+]
 
 
 def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -50,3 +60,26 @@ def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
     df["order_book_imbalance"] = bid_depth / denom.replace(0, pd.NA)
 
     return df
+
+
+def make_feature_matrix(
+    df: pd.DataFrame,
+    feature_cols: Iterable[str] | None = None,
+    drop_na: bool = True,
+) -> Tuple[pd.DataFrame, pd.Index]:
+    """
+    Stack selected feature columns into a numeric matrix `X`.
+
+    Returns (X, index) where X is a DataFrame with only the chosen features and
+    index matches the original rows that survive optional NA dropping.
+    """
+    cols: List[str] = list(feature_cols) if feature_cols is not None else DEFAULT_FEATURE_COLUMNS
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing expected feature columns: {missing}")
+
+    X = df[cols]
+    if drop_na:
+        X = X.dropna()
+
+    return X, X.index
