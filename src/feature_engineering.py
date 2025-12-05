@@ -1,14 +1,20 @@
 from typing import Iterable, List, Tuple
 
+import numpy as np
 import pandas as pd
 
-# Default set of feature columns expected after add_basic_features
+# Default set of feature columns expected after add_basic_features/add_orderflow_features
 DEFAULT_FEATURE_COLUMNS = [
     "mid",
     "spread",
     "top_bid_depth",
     "top_ask_depth",
     "order_book_imbalance",
+    "ret_1",
+    "ret_5",
+    "volatility_20",
+    "signed_volume",
+    "cvd_20",
 ]
 
 
@@ -72,6 +78,44 @@ def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
 
     denom = bid_depth.fillna(0).astype("Float64") + ask_depth.fillna(0).astype("Float64")
     df["order_book_imbalance"] = bid_depth / denom.replace(0, pd.NA)
+
+    return df
+
+
+def add_orderflow_features(
+    df: pd.DataFrame,
+    return_windows: Tuple[int, int] = (1, 5),
+    volatility_window: int = 20,
+    cvd_window: int = 20,
+) -> pd.DataFrame:
+    """
+    Add simple orderflow-style features using price/volume because depth levels are unavailable.
+
+    - ret_1 / ret_5: percent returns over short windows.
+    - volatility_20: rolling std of log returns.
+    - signed_volume: volume signed by 1-bar return direction.
+    - cvd_20: rolling sum of signed_volume (a short-horizon CVD proxy).
+    """
+    df = ensure_multiindex(df).copy()
+
+    short_win, long_win = return_windows
+    price = df["mid"]
+
+    ret_1 = price.groupby(level=0).pct_change(periods=short_win)
+    ret_5 = price.groupby(level=0).pct_change(periods=long_win)
+
+    log_ret = price.groupby(level=0).apply(lambda s: np.log(s.astype(float)).diff()).droplevel(0)
+    volatility = log_ret.groupby(level=0).transform(lambda s: s.rolling(volatility_window).std())
+
+    volume = pd.to_numeric(df.get("Volume"), errors="coerce") if "Volume" in df.columns else pd.Series(pd.NA, index=df.index)
+    signed_volume = volume * np.sign(ret_1)
+    cvd = signed_volume.groupby(level=0).transform(lambda s: s.rolling(cvd_window).sum())
+
+    df["ret_1"] = ret_1
+    df["ret_5"] = ret_5
+    df["volatility_20"] = volatility
+    df["signed_volume"] = signed_volume
+    df["cvd_20"] = cvd
 
     return df
 
