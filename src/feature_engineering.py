@@ -12,9 +12,14 @@ DEFAULT_FEATURE_COLUMNS = [
     "order_book_imbalance",
     "ret_1",
     "ret_5",
+    "ret_10",
+    "ret_20",
     "volatility_20",
+    "volatility_50",
     "signed_volume",
     "cvd_20",
+    "volume_trend_20",
+    "volume_zscore_20",
 ]
 
 
@@ -84,38 +89,42 @@ def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_orderflow_features(
     df: pd.DataFrame,
-    return_windows: Tuple[int, int] = (1, 5),
-    volatility_window: int = 20,
+    return_windows: Tuple[int, ...] = (1, 5, 10, 20),
+    volatility_windows: Tuple[int, ...] = (20, 50),
     cvd_window: int = 20,
+    volume_trend_windows: Tuple[int, ...] = (20,),
 ) -> pd.DataFrame:
     """
     Add simple orderflow-style features using price/volume because depth levels are unavailable.
 
-    - ret_1 / ret_5: percent returns over short windows.
-    - volatility_20: rolling std of log returns.
+    - ret_{w}: percent returns over multiple short windows.
+    - volatility_{w}: rolling std of log returns.
     - signed_volume: volume signed by 1-bar return direction.
-    - cvd_20: rolling sum of signed_volume (a short-horizon CVD proxy).
+    - cvd_{cvd_window}: rolling sum of signed_volume (a short-horizon CVD proxy).
+    - volume_trend_{w}: volume deviation vs rolling mean.
+    - volume_zscore_{w}: volume z-score vs rolling stats.
     """
     df = ensure_multiindex(df).copy()
 
-    short_win, long_win = return_windows
     price = df["mid"]
 
-    ret_1 = price.groupby(level=0).pct_change(periods=short_win)
-    ret_5 = price.groupby(level=0).pct_change(periods=long_win)
+    grouped_price = price.groupby(level=0)
+    for w in return_windows:
+        df[f"ret_{w}"] = grouped_price.pct_change(periods=w)
 
-    log_ret = price.groupby(level=0).apply(lambda s: np.log(s.astype(float)).diff()).droplevel(0)
-    volatility = log_ret.groupby(level=0).transform(lambda s: s.rolling(volatility_window).std())
+    log_ret = grouped_price.apply(lambda s: np.log(s.astype(float)).diff()).droplevel(0)
+    for w in volatility_windows:
+        df[f"volatility_{w}"] = log_ret.groupby(level=0).transform(lambda s: s.rolling(w).std())
 
     volume = pd.to_numeric(df.get("Volume"), errors="coerce") if "Volume" in df.columns else pd.Series(pd.NA, index=df.index)
-    signed_volume = volume * np.sign(ret_1)
-    cvd = signed_volume.groupby(level=0).transform(lambda s: s.rolling(cvd_window).sum())
+    df["signed_volume"] = volume * np.sign(df["ret_1"])
+    df[f"cvd_{cvd_window}"] = df["signed_volume"].groupby(level=0).transform(lambda s: s.rolling(cvd_window).sum())
 
-    df["ret_1"] = ret_1
-    df["ret_5"] = ret_5
-    df["volatility_20"] = volatility
-    df["signed_volume"] = signed_volume
-    df["cvd_20"] = cvd
+    for w in volume_trend_windows:
+        roll_mean = volume.groupby(level=0).transform(lambda s: s.rolling(w).mean())
+        roll_std = volume.groupby(level=0).transform(lambda s: s.rolling(w).std())
+        df[f"volume_trend_{w}"] = (volume - roll_mean) / roll_mean.replace(0, np.nan)
+        df[f"volume_zscore_{w}"] = (volume - roll_mean) / roll_std.replace(0, np.nan)
 
     return df
 

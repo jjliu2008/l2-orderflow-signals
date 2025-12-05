@@ -2,8 +2,10 @@ import os
 import sys
 from pathlib import Path
 
+import joblib
+import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
 
 # Allow running directly
@@ -38,17 +40,53 @@ def main():
     x_small = X_df.loc[common_idx]
     y_small = y.loc[common_idx]
 
+    max_rows = int(os.environ.get("TRAIN_MAX_ROWS", "0"))
+    if max_rows > 0 and len(x_small) > max_rows:
+        sampled_idx = x_small.index.to_series().sample(n=max_rows, random_state=42, replace=False).index
+        x_small = x_small.loc[sampled_idx]
+        y_small = y_small.loc[sampled_idx]
+        print(f"Sampled down to {len(x_small)} rows for training via TRAIN_MAX_ROWS={max_rows}")
+
     #print(f"Total samples: {len(y_small)}, features: {x_small.shape[1]}")
 
     X_train, X_test, y_train, y_test = train_test_split(
         x_small, y_small, test_size=0.2, random_state=42, stratify=y_small
     )
 
+    # Simple hyperparameter sweep on a validation split (using a subset for speed)
+    tune_frac = 0.3
+    X_tune = X_train.sample(frac=tune_frac, random_state=42)
+    y_tune = y_train.loc[X_tune.index]
+    X_train_sub, X_val, y_train_sub, y_val = train_test_split(
+        X_tune, y_tune, test_size=0.2, random_state=42, stratify=y_tune
+    )
+
+    candidates = [
+        {"learning_rate": 0.05, "max_depth": 6, "min_samples_leaf": 50},
+        {"learning_rate": 0.1, "max_depth": 6, "min_samples_leaf": 50},
+        {"learning_rate": 0.05, "max_depth": 8, "min_samples_leaf": 30},
+    ]
+
+    best = None
+    best_f1 = -1.0
+    for params in candidates:
+        model = HistGradientBoostingClassifier(
+            max_iter=200,
+            random_state=42,
+            **params,
+        )
+        model.fit(X_train_sub, y_train_sub)
+        val_pred = model.predict(X_val)
+        val_f1 = f1_score(y_val, val_pred, average="macro")
+        print(f"Params {params} -> val macro F1: {val_f1:.4f}")
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+            best = params
+
+    print(f"Best params: {best} (val macro F1={best_f1:.4f})")
+
     model = HistGradientBoostingClassifier(
-        learning_rate=0.05,
-        max_depth=6,
-        max_iter=200,
-        random_state=42,
+        max_iter=300, random_state=42, **best
     )
 
     #print("Training model ...")
@@ -63,6 +101,23 @@ def main():
     print("\nPredicted class order:", model.classes_)
     print("Probability preview (first 5 rows):")
     print(y_proba[:5])
+
+    artifacts_dir = PROJECT_ROOT / "artifacts"
+    artifacts_dir.mkdir(exist_ok=True)
+
+    model_path = artifacts_dir / "hgb_model.joblib"
+    joblib.dump(model, model_path)
+
+    preds_df = pd.DataFrame(index=X_test.index)
+    preds_df["y_true"] = y_test
+    preds_df["y_pred"] = y_pred
+    for i, cls in enumerate(model.classes_):
+        preds_df[f"proba_{int(cls)}"] = y_proba[:, i]
+    preds_path = artifacts_dir / "hgb_test_predictions.csv"
+    preds_df.to_csv(preds_path)
+
+    print(f"\nSaved model to {model_path}")
+    print(f"Saved test predictions to {preds_path}")
 
 if __name__ == "__main__":
     main()
