@@ -12,6 +12,20 @@ DEFAULT_FEATURE_COLUMNS = [
 ]
 
 
+def ensure_multiindex(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Guarantee the data is indexed by (Symbol, Time) so downstream features/labels
+    stay aligned. If the MultiIndex is already present it is returned as-is.
+    """
+    if isinstance(df.index, pd.MultiIndex):
+        return df
+
+    if {"Symbol", "Time"}.issubset(df.columns):
+        return df.set_index(["Symbol", "Time"]).sort_index()
+
+    raise ValueError("Expected MultiIndex on ['Symbol', 'Time'] or matching columns to build it.")
+
+
 def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add simple features to market data.
@@ -73,6 +87,8 @@ def make_feature_matrix(
     Returns (X, index) where X is a DataFrame with only the chosen features and
     index matches the original rows that survive optional NA dropping.
     """
+    df = ensure_multiindex(df)
+
     cols: List[str] = list(feature_cols) if feature_cols is not None else DEFAULT_FEATURE_COLUMNS
     missing = [c for c in cols if c not in df.columns]
     if missing:

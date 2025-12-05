@@ -14,7 +14,7 @@ def make_labels(
 
     - Looks `horizon` steps ahead on `price_col` to compute forward returns.
     - Labels: 1 for up move, -1 for down move, 0 for neutral (|ret| < threshold).
-    - Returns (y, index) aligned to the surviving rows (last `horizon` rows dropped).
+    - Returns (y, index) aligned to the surviving rows (tail rows without future price are removed).
     """
     if price_col not in df.columns:
         raise ValueError(f"Column '{price_col}' not found in DataFrame.")
@@ -30,6 +30,7 @@ def make_labels(
         - (forward_ret < -neutral_threshold).astype(int)
     ).astype("Int8")
 
-    # Drop tail rows without future data
-    y = y.iloc[:-horizon]
+    # Keep only rows with valid future data
+    valid = future_price.notna() & price.notna()
+    y = y[valid]
     return y, y.index
