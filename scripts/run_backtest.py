@@ -64,6 +64,8 @@ def main():
     long_thr = float(os.environ.get("BT_LONG_THRESHOLD", "0.1"))
     short_thr = float(os.environ.get("BT_SHORT_THRESHOLD", "-0.1"))
     fee_bps = float(os.environ.get("BT_FEE_BPS", "0.0"))  # fee per trade (entry/flip), in bps
+    slippage_bps = float(os.environ.get("BT_SLIPPAGE_BPS", "0.0"))  # slippage per trade, in bps
+    latency_ticks = int(os.environ.get("BT_LATENCY_TICKS", "0"))  # delay execution by N ticks
     horizon = int(os.environ.get("BT_HORIZON", "1"))
     save_artifacts = os.environ.get("BACKTEST_SAVE", "1").strip().lower() in {"1", "true", "yes", "y"}
 
@@ -94,14 +96,18 @@ def main():
     proba = model.predict_proba(X_bt)
     expected = (proba * classes.reshape(1, -1)).sum(axis=1)
 
-    positions = np.where(expected > long_thr, 1, np.where(expected < short_thr, -1, 0))
+    positions_signal = np.where(expected > long_thr, 1, np.where(expected < short_thr, -1, 0))
+    if latency_ticks > 0:
+        positions = np.concatenate([np.zeros(latency_ticks, dtype=int), positions_signal[:-latency_ticks]])
+    else:
+        positions = positions_signal
     fwd_values = fwd.values
 
     # Simple PnL: position * forward return. Apply fee when position changes.
     returns = positions * fwd_values
     pos_change = np.concatenate([[0], np.abs(np.diff(positions))])
-    fee = fee_bps / 10000.0
-    returns -= pos_change * fee
+    trade_cost = (fee_bps + slippage_bps) / 10000.0
+    returns -= pos_change * trade_cost
 
     equity = pd.Series(returns).cumsum() + 1.0  # start at 1.0
 
@@ -120,7 +126,7 @@ def main():
 
     ev_series = pd.Series(expected)
     print("\nExpected value quantiles (5/50/95):", ev_series.quantile([0.05, 0.5, 0.95]).to_dict())
-    print(f"Thresholds: long>{long_thr}, short<{short_thr}, fee_bps={fee_bps}")
+    print(f"Thresholds: long>{long_thr}, short<{short_thr}, fee_bps={fee_bps}, slippage_bps={slippage_bps}, latency_ticks={latency_ticks}")
 
     if save_artifacts:
         out_dir = PROJECT_ROOT / "artifacts"
@@ -131,7 +137,8 @@ def main():
                 "Symbol": merged["Symbol"],
                 "Time": merged["Time"],
                 "expected": expected,
-                "position": positions,
+                "position_signal": positions_signal,
+                "position_exec": positions,
                 "fwd_ret": fwd_values,
                 "return": returns,
                 "equity": equity.values,
