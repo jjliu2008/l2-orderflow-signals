@@ -22,7 +22,8 @@ def make_labels(
         raise ValueError("horizon must be >= 1")
 
     price = pd.to_numeric(df[price_col], errors="coerce")
-    future_price = price.shift(-horizon)
+    # Compute horizon-ahead price per symbol to avoid cross-symbol leakage
+    future_price = price.groupby(level=0).shift(-horizon)
     forward_ret = (future_price - price) / price
 
     y = (
