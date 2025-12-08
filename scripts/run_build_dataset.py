@@ -12,9 +12,9 @@ import websockets
 from cryptography.hazmat.primitives import serialization
 from websockets import exceptions
 
-# Default to Advanced Trade websocket host; override via COINBASE_WS_URL if needed.
+# Default to public Coinbase Exchange feed; override via COINBASE_WS_URL if needed.
 COINBASE_WS_URL = os.environ.get(
-    "COINBASE_WS_URL", "wss://advanced-trade-ws.coinbase.com"
+    "COINBASE_WS_URL", "wss://ws-feed.exchange.coinbase.com"
 )
 
 
@@ -74,14 +74,8 @@ def get_auth_config():
     Decide whether to use authenticated level2 (JWT) or public matches-only.
     Returns None if unauthenticated; otherwise returns (key_name, key_material).
     """
-    use_auth_env = os.environ.get("COINBASE_USE_JWT")
-    if use_auth_env is not None:
-        use_auth = use_auth_env.strip().lower() in {"y", "yes", "true", "1"}
-    else:
-        reply = input(
-            "Do you have an Advanced Trade API key for level2 (requires EC private key)? [y/N]: "
-        ).strip().lower()
-        use_auth = reply in {"y", "yes"}
+    use_auth_env = os.environ.get("COINBASE_USE_JWT", "0")
+    use_auth = use_auth_env.strip().lower() in {"y", "yes", "true", "1"}
 
     if not use_auth:
         print("Proceeding without auth: subscribing to matches only (no level2).")
@@ -100,13 +94,21 @@ def get_auth_config():
     return key_name, key_material
 
 
-async def coinbase_ws_record():
+def _choose_output_path() -> Path:
+    default_dir = os.environ.get("WS_OUTPUT_DIR", "data/live")
+    out_dir = default_dir
     ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    out_path = Path("data/raw") / f"coinbase_ws_{ts}.jsonl"
+    out_path = Path(out_dir) / f"coinbase_ws_{ts}.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     print("Writing to:", out_path)
+    return out_path
+
+
+async def coinbase_ws_record():
+    out_path = _choose_output_path()
 
     auth_config = get_auth_config()
+    msg_count = 0
 
     while True:
         try:
@@ -129,12 +131,15 @@ async def coinbase_ws_record():
                         "jwt": jwt_token,
                     }
                 await ws.send(json.dumps(subscribe_msg))
-                print("Subscribed to Coinbase WebSocket")
+                print(f"Subscribed to Coinbase WebSocket ({COINBASE_WS_URL})")
 
                 # append so we keep data across reconnects
                 with out_path.open("a", encoding="utf-8") as f:
                     async for msg in ws:
                         f.write(msg + "\n")
+                        msg_count += 1
+                        if msg_count % 100 == 0:
+                            print(f"Wrote {msg_count} messages to {out_path}")
 
         except exceptions.ConnectionClosedError as e:
             print(f"Connection closed: {e}; reconnecting in 2s")

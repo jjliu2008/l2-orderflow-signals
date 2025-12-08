@@ -23,7 +23,11 @@ from src.labels import make_labels
 
 
 def main():
-    raw_dir = PROJECT_ROOT / "data" / "raw"
+    default_dir = os.environ.get("TRAIN_DATA_DIR", str(PROJECT_ROOT / "data" / "raw"))
+    raw_dir = Path(input(f"Training data directory [{default_dir}]: ").strip() or default_dir)
+    if not raw_dir.exists():
+        raise FileNotFoundError(f"Training data directory not found: {raw_dir}")
+
     print(f"Loading data from {raw_dir} ...")
     df = ensure_multiindex(load_all_raw_data(raw_dir))
 
