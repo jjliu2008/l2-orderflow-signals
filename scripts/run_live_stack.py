@@ -1,5 +1,5 @@
 """
-Convenience launcher to start the live data recorder and the PyQtGraph viewer together.
+Convenience launcher to start the live data recorder and the TradingView (Lightweight Charts) viewer together.
 
 Usage:
   python scripts/run_live_stack.py
@@ -7,9 +7,11 @@ Usage:
 Environment overrides:
   COINBASE_*          # for run_build_dataset (JWT, URL, product IDs, etc.)
   WS_OUTPUT_DIR       # defaults to data/live
-  PYQT_DATA_DIR       # defaults to data/live
-  REFRESH_MS          # defaults to 1000
-  MC_REFRESH_MS       # defaults to 30000
+  TV_DATA_DIR         # defaults to data/live (falls back to data/raw)
+  TV_LOOKBACK_MIN     # defaults to 30
+  TV_PRICE_REFRESH_MS # defaults to 1000
+  TV_METRIC_REFRESH_MS # defaults to 15000
+  TV_PORT             # defaults to 8765
 """
 
 import subprocess
@@ -25,8 +27,7 @@ def main():
     processes = []
     commands = [
         ("recorder", [py, str(project_root / "scripts" / "run_build_dataset.py")]),
-        # Swap Dash for PyQtGraph viewer
-        ("pyqt_viewer", [py, str(project_root / "scripts" / "run_pyqt_viewer.py")]),
+        ("tv_viewer", [py, str(project_root / "scripts" / "run_lightweight_viewer.py")]),
     ]
 
     try:
@@ -38,7 +39,7 @@ def main():
             processes.append((name, proc))
 
         # Wait on the viewer process; keep the recorder running in background.
-        viewer_proc = next(p for n, p in processes if n == "pyqt_viewer")
+        viewer_proc = next(p for n, p in processes if n == "tv_viewer")
         viewer_proc.wait()
     except KeyboardInterrupt:
         print("Received interrupt, shutting down...")

@@ -1,0 +1,615 @@
+"""
+TradingView Lightweight Charts live viewer for price/backtest metrics.
+
+What it does
+------------
+- Serves a small local HTTP server with JSON endpoints for price and backtest metrics.
+- Renders TradingView Lightweight Charts in the browser (loaded from CDN, no extra Python deps).
+- Periodically re-runs the backtest (cooldown configurable) so equity artifacts stay fresh.
+
+Run
+---
+  python scripts/run_lightweight_viewer.py
+
+Environment knobs
+-----------------
+  TV_DATA_DIR: path to raw/live data (defaults to data/live, falls back to data/raw)
+  TV_LOOKBACK_MIN: minutes of mid-price history to show (default 30)
+  TV_PRICE_REFRESH_MS: price poll interval for the browser (default 1000)
+  TV_METRIC_REFRESH_MS: metrics poll interval for the browser (default 15000)
+  TV_BACKTEST_COOLDOWN_SEC: minimum seconds between backtest refreshes (default derived from TV_METRIC_REFRESH_MS)
+  TV_PORT: HTTP port (default 8765)
+"""
+
+import json
+import os
+import sys
+import threading
+import time
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
+from typing import Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(PROJECT_ROOT))
+
+from src.data_loader import load_all_raw_data  # noqa: E402
+from src.feature_engineering import add_basic_features, ensure_multiindex  # noqa: E402
+from scripts import run_backtest  # type: ignore  # noqa: E402
+
+
+DATA_DIR = Path(os.environ.get("TV_DATA_DIR", PROJECT_ROOT / "data" / "live")).expanduser().resolve()
+LOOKBACK_MIN = int(os.environ.get("TV_LOOKBACK_MIN", "30"))
+PRICE_REFRESH_MS = int(os.environ.get("TV_PRICE_REFRESH_MS", "1000"))
+METRIC_REFRESH_MS = int(os.environ.get("TV_METRIC_REFRESH_MS", "15000"))
+BACKTEST_COOLDOWN_SEC = float(
+    os.environ.get("TV_BACKTEST_COOLDOWN_SEC", max(5, METRIC_REFRESH_MS / 1000))
+)
+PORT = int(os.environ.get("TV_PORT", "8765"))
+
+INDEX_HTML_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TradingView Lightweight Charts</title>
+  <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #111827;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-2: #f59e0b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "SF Pro Display", system-ui, -apple-system, sans-serif;
+      background: radial-gradient(circle at 15% 20%, #0b1222, #0f172a 55%),
+                  radial-gradient(circle at 80% 0%, #13203b, #0f172a 50%);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 16px;
+    }
+    h1 { margin: 0 0 12px 0; font-weight: 600; letter-spacing: 0.4px; }
+    p.lead { margin: 0 0 16px 0; color: var(--muted); }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 16px;
+    }
+    .card {
+      background: linear-gradient(145deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 12px;
+      padding: 12px;
+      box-shadow: 0 15px 40px rgba(0,0,0,0.35);
+      backdrop-filter: blur(4px);
+    }
+    .card h2 {
+      margin: 0 0 8px 0;
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: 0.2px;
+    }
+    .chart {
+      height: 280px;
+    }
+    .small { height: 200px; }
+    .status {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 8px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(56, 189, 248, 0.1);
+      color: var(--accent);
+      font-size: 12px;
+      margin-left: 8px;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
+      background: rgba(245, 158, 11, 0.12);
+      color: var(--accent-2);
+      border-radius: 999px;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <h1>TradingView Lightweight Charts <span class="badge">live</span></h1>
+  <p class="lead">Mid-price plus backtest metrics pulled from local files. Updates are auto-polled by the browser.</p>
+  <div class="grid">
+    <div class="card">
+      <h2>Mid-price (lookback: TV_LOOKBACK_MIN_PLACEHOLDER min)</h2>
+      <div id="price-chart" class="chart"></div>
+      <div class="status" id="price-status"></div>
+    </div>
+    <div class="card">
+      <h2>Equity curve</h2>
+      <div id="equity-chart" class="chart"></div>
+      <div class="status" id="equity-status"></div>
+    </div>
+    <div class="card">
+      <h2>Drawdown</h2>
+      <div id="drawdown-chart" class="small"></div>
+    </div>
+    <div class="card">
+      <h2>Rolling mean return</h2>
+      <div id="rolling-chart" class="small"></div>
+    </div>
+    <div class="card">
+      <h2>EV buckets vs realized return</h2>
+      <div id="ev-chart" class="small"></div>
+    </div>
+    <div class="card">
+      <h2>Trade PnL distribution</h2>
+      <div id="pnl-chart" class="small"></div>
+    </div>
+  </div>
+  <script>
+    const priceRefreshMs = PRICE_REFRESH_MS_PLACEHOLDER;
+    const metricRefreshMs = METRIC_REFRESH_MS_PLACEHOLDER;
+
+    const palette = {
+      accent: "#38bdf8",
+      accent2: "#f59e0b",
+      accent3: "#a855f7",
+      accent4: "#22c55e",
+      grid: "rgba(148, 163, 184, 0.2)",
+      text: "#e2e8f0",
+      muted: "#94a3b8"
+    };
+
+    const baseOptions = {
+      layout: { background: { color: "transparent" }, textColor: palette.text },
+      grid: {
+        vertLines: { color: palette.grid },
+        horzLines: { color: palette.grid },
+      },
+      timeScale: { timeVisible: true, secondsVisible: true },
+      rightPriceScale: { borderVisible: false },
+    };
+
+    const priceChart = LightweightCharts.createChart(document.getElementById("price-chart"), { ...baseOptions, height: 280 });
+    const priceSeries = priceChart.addAreaSeries({
+      lineColor: palette.accent,
+      topColor: "rgba(56, 189, 248, 0.35)",
+      bottomColor: "rgba(56, 189, 248, 0.05)",
+      lineWidth: 2,
+    });
+
+    const equityChart = LightweightCharts.createChart(document.getElementById("equity-chart"), { ...baseOptions, height: 280 });
+    const equitySeries = equityChart.addLineSeries({ color: palette.accent2, lineWidth: 2 });
+
+    const drawdownChart = LightweightCharts.createChart(document.getElementById("drawdown-chart"), { ...baseOptions, height: 200 });
+    drawdownChart.timeScale().applyOptions({ timeVisible: true, secondsVisible: false });
+    const drawdownSeries = drawdownChart.addLineSeries({
+      color: palette.accent3,
+      lineWidth: 2,
+      priceFormat: { type: "percent", precision: 3 },
+    });
+
+    const rollingChart = LightweightCharts.createChart(document.getElementById("rolling-chart"), { ...baseOptions, height: 200 });
+    rollingChart.timeScale().applyOptions({ timeVisible: false });
+    const rollingSeries = rollingChart.addLineSeries({
+      color: palette.accent4,
+      lineWidth: 2,
+      priceFormat: { type: "price", precision: 2, minMove: 0.01 },
+    });
+
+    const evChart = LightweightCharts.createChart(document.getElementById("ev-chart"), {
+      ...baseOptions,
+      height: 200,
+      timeScale: { visible: false },
+      rightPriceScale: { borderVisible: false, visible: false },
+    });
+    const evSeries = evChart.addHistogramSeries({ color: palette.accent, priceFormat: { type: "price", precision: 6 } });
+
+    const pnlChart = LightweightCharts.createChart(document.getElementById("pnl-chart"), {
+      ...baseOptions,
+      height: 200,
+      timeScale: { visible: false },
+      rightPriceScale: { borderVisible: false, visible: false },
+    });
+    const pnlSeries = pnlChart.addHistogramSeries({ color: palette.accent2, base: 0 });
+
+    function sanitize(points = [], label = "") {
+      const seen = new Map();
+      let dropped = 0;
+      const bad = [];
+      for (const p of points || []) {
+        const t = p?.time;
+        const v = p?.value;
+        if (
+          t == null ||
+          v == null ||
+          !Number.isFinite(t) ||
+          !Number.isFinite(v) ||
+          Number.isNaN(t) ||
+          Number.isNaN(v)
+        ) {
+          dropped += 1;
+          bad.push(p);
+          continue;
+        }
+        // Keep the last value per timestamp to avoid duplicate times.
+        seen.set(Number(t), { time: Number(t), value: Number(v), color: p.color });
+      }
+      const clean = Array.from(seen.values()).sort((a, b) => a.time - b.time);
+      if (label) {
+        if (dropped > 0) {
+          console.warn(`sanitize(${label}) dropped ${dropped} bad points`);
+        }
+        if (clean.length === 0 && (points || []).length) {
+          console.warn(`sanitize(${label}) produced 0 points`, { sample: (points || []).slice(0, 5) });
+        }
+      }
+      return clean;
+    }
+
+    function setStatus(id, text) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = text;
+    }
+
+    async function fetchJson(url) {
+      const res = await fetch(url, { cache: "no-store" });
+      return res.json();
+    }
+
+    function safeSet(series, data, label) {
+      try {
+        series.setData(data);
+      } catch (err) {
+        console.error(`setData failed for ${label}: len=${data?.length}`, err, data?.slice ? data.slice(0, 5) : data);
+        series.setData([]);
+      }
+    }
+
+    async function loadPrice() {
+      try {
+        const data = await fetchJson("/api/price");
+        if (data.error) {
+          setStatus("price-status", data.error);
+          priceSeries.setData([]);
+          return;
+        }
+        const merged = [];
+        (data.series || []).forEach(block => {
+          (block.points || []).forEach(pt => merged.push({ time: pt.time, value: pt.value }));
+        });
+        const clean = sanitize(merged, "price").sort((a, b) => a.time - b.time);
+        console.log("price payload", { merged: merged.length, clean: clean.length, sampleClean: clean.slice(0, 3), sampleMerged: merged.slice(0, 3) });
+        if ((data.series || []).length && clean.length === 0) {
+          console.warn("sanitize(price) dropped all points", { mergedLength: merged.length, raw: merged.slice(0, 5) });
+        }
+        safeSet(priceSeries, clean, "price");
+        setStatus("price-status", `Updated ${new Date().toLocaleTimeString()}`);
+      } catch (err) {
+        setStatus("price-status", `Error: ${err}`);
+        priceSeries.setData([]);
+      }
+    }
+
+    function histogramFromEdges(edges = [], counts = []) {
+      // Lightweight charts expects one value per bar; map histogram edges to centers.
+      const pts = [];
+      for (let i = 0; i < counts.length; i++) {
+        const center = (edges[i] + edges[i + 1]) / 2;
+        pts.push({ time: i + 1, value: counts[i], color: palette.accent2 });
+      }
+      return pts;
+    }
+
+    async function loadMetrics() {
+      try {
+        const data = await fetchJson("/api/equity");
+        if (data.error) {
+          equitySeries.setData([]);
+          drawdownSeries.setData([]);
+          rollingSeries.setData([]);
+          evSeries.setData([]);
+          pnlSeries.setData([]);
+          setStatus("equity-status", data.error);
+          return;
+        }
+
+        const times = data.times || [];
+        const equity = sanitize((data.equity || []).map((v, idx) => ({ time: times[idx], value: v })), "equity");
+        const dd = sanitize((data.drawdown || []).map((v, idx) => ({ time: times[idx], value: v })), "drawdown");
+        const rollingTimes = data.rollingTimes || times;
+        const rolling = sanitize((data.rollingMeanBps || []).map((v, idx) => ({ time: rollingTimes[idx], value: v })), "rolling");
+
+        console.log("metrics payload", {
+          equity: equity.length,
+          drawdown: dd.length,
+          rolling: rolling.length,
+          ev: (data.evBuckets || []).length,
+          pnl: (data.pnlHistogram?.counts || []).length,
+          times: times.length,
+          rollingTimes: rollingTimes.length,
+          sampleRolling: rolling.slice(0, 3),
+        });
+
+        safeSet(equitySeries, equity, "equity");
+        safeSet(drawdownSeries, dd, "drawdown");
+        safeSet(rollingSeries, rolling, "rolling");
+
+        const evBuckets = sanitize((data.evBuckets || []).map((b, idx) => ({ time: idx + 1, value: b.value, color: palette.accent })), "ev");
+        safeSet(evSeries, evBuckets, "ev");
+
+        const pnlHist = sanitize(histogramFromEdges(data.pnlHistogram?.edges, data.pnlHistogram?.counts), "pnl");
+        safeSet(pnlSeries, pnlHist, "pnl");
+
+        setStatus("equity-status", `Metrics refreshed ${new Date().toLocaleTimeString()}`);
+      } catch (err) {
+        setStatus("equity-status", `Error: ${err}`);
+      }
+    }
+
+    loadPrice();
+    loadMetrics();
+    setInterval(loadPrice, priceRefreshMs);
+    setInterval(loadMetrics, metricRefreshMs);
+  </script>
+</body>
+</html>
+"""
+
+
+def _has_data_files(path: Path) -> bool:
+    return any(path.glob("*.jsonl")) or any(path.glob("*.csv"))
+
+
+def _pick_data_dir(env_dir: Optional[str] = None) -> Path:
+    target = Path(env_dir).expanduser().resolve() if env_dir else DATA_DIR
+    if not target.exists() or not _has_data_files(target):
+        fallback = PROJECT_ROOT / "data" / "raw"
+        if fallback.exists() and _has_data_files(fallback):
+            return fallback
+        raise FileNotFoundError(f"No data found in {target}")
+    return target
+
+
+def load_mid_series(data_dir: Path, lookback_min: int) -> pd.Series:
+    df = ensure_multiindex(load_all_raw_data(data_dir))
+    df_feat = add_basic_features(df)
+    mid = df_feat["mid"].dropna().sort_index()
+    if mid.empty:
+        return mid
+    cutoff = mid.index.get_level_values("Time").max() - pd.Timedelta(minutes=lookback_min)
+    return mid[mid.index.get_level_values("Time") >= cutoff]
+
+
+def load_equity_curve() -> Optional[pd.DataFrame]:
+    path = PROJECT_ROOT / "artifacts" / "backtest_results.csv"
+    if not path.exists():
+        return None
+    df = pd.read_csv(path, parse_dates=["Time"])
+    if df.empty:
+        return None
+    return df
+
+
+def _drawdown(values: List[float]) -> List[float]:
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return []
+    peak = np.maximum.accumulate(arr)
+    dd = arr / peak - 1.0
+    return dd.tolist()
+
+
+def _ev_buckets(expected: pd.Series, returns: pd.Series, buckets: int = 5) -> List[Dict[str, float]]:
+    if expected.empty or returns.empty:
+        return []
+    try:
+        bins = pd.qcut(expected, q=buckets, duplicates="drop")
+        bucket_ret = (
+            pd.DataFrame({"bucket": bins, "ret": returns})
+            .groupby("bucket", observed=False)["ret"]
+            .mean()
+        )
+        labels = [str(idx) for idx in bucket_ret.index]
+        return [{"label": lbl, "value": float(val)} for lbl, val in zip(labels, bucket_ret.values)]
+    except Exception:
+        return []
+
+
+def _pnl_histogram(returns: pd.Series, bins: int = 30) -> Dict[str, List[float]]:
+    clean = pd.to_numeric(returns, errors="coerce").dropna()
+    if clean.empty:
+        return {"edges": [], "counts": []}
+    counts, edges = np.histogram(clean.values, bins=bins)
+    return {"edges": edges.tolist(), "counts": counts.tolist()}
+
+
+def _rolling_mean(returns: pd.Series, window: int = 200, min_periods: int = 20) -> List[Optional[float]]:
+    if returns.empty:
+        return []
+    roll = pd.to_numeric(returns, errors="coerce").rolling(window, min_periods=min_periods).mean()
+    return [None if pd.isna(v) else float(v) for v in roll]
+
+
+def _filter_finite_pairs(times: List[int], values: List[Optional[float]]) -> tuple[List[int], List[float]]:
+    """Drop any entries where value is None/NaN or non-finite to keep chart happy."""
+    clean_times: List[int] = []
+    clean_vals: List[float] = []
+    for t, v in zip(times, values):
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if not (np.isfinite(fv)):
+            continue
+        clean_times.append(t)
+        clean_vals.append(fv)
+    return clean_times, clean_vals
+
+
+_last_backtest_run = 0.0
+_backtest_lock = threading.Lock()
+
+
+def refresh_backtest_if_needed():
+    """
+    Keep artifacts/backtest_results.csv fresh while throttling executions.
+    """
+    global _last_backtest_run
+    now = time.time()
+    if now - _last_backtest_run < BACKTEST_COOLDOWN_SEC:
+        return
+    with _backtest_lock:
+        if now - _last_backtest_run < BACKTEST_COOLDOWN_SEC:
+            return
+        os.environ["BT_DATA_DIR"] = str(_pick_data_dir())
+        os.environ["BACKTEST_SAVE"] = "1"
+        run_backtest.main()
+        _last_backtest_run = time.time()
+
+
+def _series_to_points(series: pd.Series) -> List[Dict[str, float]]:
+    """
+    Convert a MultiIndex Series with Time level into lightweight-charts points.
+    """
+    points: List[Dict[str, float]] = []
+    times = pd.to_datetime(series.index.get_level_values("Time"))
+    for t, v in zip(times, series.values):
+        if pd.isna(v):
+            continue
+        points.append({"time": int(t.value // 1_000_000_000), "value": float(v)})
+    return points
+
+
+class TVRequestHandler(BaseHTTPRequestHandler):
+    server_version = "TVLightweight/0.1"
+
+    def _send_json(self, payload, status: HTTPStatus = HTTPStatus.OK):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self):
+        html = (
+            INDEX_HTML_TEMPLATE
+            .replace("PRICE_REFRESH_MS_PLACEHOLDER", str(PRICE_REFRESH_MS))
+            .replace("METRIC_REFRESH_MS_PLACEHOLDER", str(METRIC_REFRESH_MS))
+            .replace("TV_LOOKBACK_MIN_PLACEHOLDER", str(LOOKBACK_MIN))
+        )
+        body = html.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args) -> None:
+        # Quieter logging; keep concise console output.
+        sys.stdout.write(f"[{self.log_date_time_string()}] {self.address_string()} {format % args}\n")
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/":
+            return self._send_html()
+        if parsed.path == "/api/price":
+            return self.handle_price()
+        if parsed.path == "/api/equity":
+            return self.handle_equity()
+        self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+    def handle_price(self):
+        try:
+            mid = load_mid_series(_pick_data_dir(), LOOKBACK_MIN)
+        except Exception as exc:
+            return self._send_json({"error": str(exc), "series": []}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+        series: List[Dict[str, object]] = []
+        for symbol, chunk in mid.groupby(level=0):
+            series.append({"symbol": symbol, "points": _series_to_points(chunk)})
+        self._send_json({"series": series})
+
+    def handle_equity(self):
+        try:
+            refresh_backtest_if_needed()
+            df = load_equity_curve()
+        except Exception as exc:
+            return self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+        if df is None:
+            return self._send_json({"error": "No backtest results found. Run a backtest to create artifacts/backtest_results.csv."})
+
+        df = df.sort_values("Time").drop_duplicates(subset=["Time"], keep="last")
+
+        times = pd.to_datetime(df["Time"])
+        epoch_times = [int(t.value // 1_000_000_000) for t in times]
+        equity = pd.to_numeric(df.get("equity"), errors="coerce").ffill()
+
+        payload = {
+            "times": epoch_times,
+            "equity": [float(v) if not pd.isna(v) else None for v in equity],
+            # Convert to percent for better visibility in the chart.
+            "drawdown": [float(v) * 100 for v in _drawdown(equity.tolist())],
+        }
+
+        if "return" in df.columns:
+            returns = pd.to_numeric(df["return"], errors="coerce")
+            payload["pnlHistogram"] = _pnl_histogram(returns)
+            # Show rolling mean in basis points for readability.
+            rolling_bps = [
+                None if v is None else float(v) * 10000 for v in _rolling_mean(returns)
+            ]
+            rt_times, rt_vals = _filter_finite_pairs(epoch_times, rolling_bps)
+            payload["rollingMeanBps"] = rt_vals
+            payload["rollingTimes"] = rt_times
+        else:
+            payload["pnlHistogram"] = {"edges": [], "counts": []}
+            payload["rollingMeanBps"] = []
+            payload["rollingTimes"] = []
+
+        if {"expected", "return"}.issubset(df.columns):
+            expected = pd.to_numeric(df["expected"], errors="coerce")
+            returns = pd.to_numeric(df["return"], errors="coerce")
+            payload["evBuckets"] = _ev_buckets(expected, returns)
+        else:
+            payload["evBuckets"] = []
+
+        self._send_json(payload)
+
+
+def main():
+    addr = ("0.0.0.0", PORT)
+    httpd = ThreadingHTTPServer(addr, TVRequestHandler)
+    print(f"Serving TradingView Lightweight Charts at http://localhost:{PORT}")
+    print(f"Data dir: {_pick_data_dir()}")
+    print(f"Price refresh: {PRICE_REFRESH_MS} ms | Metric refresh: {METRIC_REFRESH_MS} ms | Backtest cooldown: {BACKTEST_COOLDOWN_SEC} s")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down viewer.")
+        httpd.server_close()
+
+
+if __name__ == "__main__":
+    main()
