@@ -5,7 +5,7 @@ from pathlib import Path
 import joblib
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
@@ -45,6 +45,16 @@ def compute_sample_weights(y: pd.Series) -> np.ndarray:
     total = len(y)
     weights = y.map(lambda cls: total / (len(counts) * counts.get(cls, 1)))
     return weights.to_numpy()
+
+
+def compute_realized_vol(df: pd.DataFrame, window: int = 20) -> pd.Series:
+    """
+    Realized short-horizon volatility of log returns.
+    """
+    log_price = np.log(df["mid"].astype(float))
+    log_ret = log_price.groupby(level=0).diff()
+    vol = log_ret.groupby(level=0).transform(lambda s: s.rolling(window, min_periods=max(5, window // 2)).std())
+    return vol.rename("realized_vol")
 
 
 def _load_multiple_dirs(paths: list[Path]) -> pd.DataFrame:
@@ -93,18 +103,23 @@ def main():
     X_df, _ = make_feature_matrix(df_feat, drop_na=False)
 
     # Direction label from forward returns with neutral band
-    neutral_band = float(os.environ.get("TRAIN_NEUTRAL_BAND", "0.0"))
+    neutral_band = float(os.environ.get("TRAIN_NEUTRAL_BAND", "0.0001"))
     fwd_ret = forward_returns(df_feat["mid"], horizon=1).rename("fwd_ret")
     dir_label = make_dir_label(fwd_ret, neutral_band=neutral_band)
+    # Magnitude target: realized volatility over a short window
+    vol_window = int(os.environ.get("TRAIN_VOL_WINDOW", "20"))
+    realized_vol = compute_realized_vol(df_feat, window=vol_window)
 
     # Align features, direction label, and magnitude
     X_reset = X_df.reset_index()
     fwd_reset = fwd_ret.reset_index()
     dir_reset = dir_label.reset_index()
+    vol_reset = realized_vol.reset_index()
 
     merged = X_reset.merge(fwd_reset, on=["Symbol", "Time"], how="inner")
     merged = merged.merge(dir_reset, on=["Symbol", "Time"], how="inner")
-    merged = merged.dropna(subset=["fwd_ret", "label"])
+    merged = merged.merge(vol_reset, on=["Symbol", "Time"], how="inner")
+    merged = merged.dropna(subset=["fwd_ret", "label", "realized_vol"])
 
     if merged.empty:
         raise ValueError("No overlapping rows between features and forward returns after merge.")
@@ -112,7 +127,7 @@ def main():
     feature_cols = [c for c in merged.columns if c not in {"Symbol", "Time", "label", "fwd_ret"}]
     x_small = merged[feature_cols]
     y_dir = merged["label"]
-    y_mag = merged["fwd_ret"].abs()
+    y_mag = merged["realized_vol"].abs()
 
     # Default cap to keep runs lightweight; override with TRAIN_MAX_ROWS=0 to disable.
     max_rows = int(os.environ.get("TRAIN_MAX_ROWS", "50000"))
@@ -160,6 +175,7 @@ def main():
         base = HistGradientBoostingClassifier(
             max_iter=200,
             random_state=42,
+            class_weight="balanced",
             **params,
         )
         model = CalibratedClassifierCV(estimator=base, cv=3, method="isotonic")
@@ -174,41 +190,41 @@ def main():
     print(f"Best params: {best} (val macro F1={best_f1:.4f})")
 
     dir_base = HistGradientBoostingClassifier(
-        max_iter=300, random_state=42, **best
+        max_iter=300, random_state=42, class_weight="balanced", **best
     )
     dir_model = CalibratedClassifierCV(estimator=dir_base, cv=3, method="isotonic")
     dir_model.fit(X_train, y_train, sample_weight=sample_weight_train)
 
-    # Magnitude bucket classifier on abs(fwd_ret) quantiles
-    mag_bins = pd.qcut(ymag_train, q=5, labels=False, duplicates="drop")
-    unique_bins = sorted(mag_bins.dropna().unique())
-    if len(unique_bins) < 2:
-        raise ValueError("Not enough variability in |fwd_ret| to build magnitude buckets.")
-
-    bin_means = []
-    for b in unique_bins:
-        bin_means.append(float(ymag_train[mag_bins == b].mean()))
-
-    mag_model = HistGradientBoostingClassifier(
-        max_iter=200,
-        random_state=42,
+    # Magnitude quantile regressors on realized volatility
+    mag_median = HistGradientBoostingRegressor(
+        loss="quantile",
+        quantile=0.5,
+        max_iter=300,
         learning_rate=0.05,
         max_depth=6,
-        min_samples_leaf=50,
+        min_samples_leaf=30,
+        random_state=42,
     )
-    mag_model.fit(X_train, mag_bins)
+    mag_p75 = HistGradientBoostingRegressor(
+        loss="quantile",
+        quantile=0.75,
+        max_iter=300,
+        learning_rate=0.05,
+        max_depth=6,
+        min_samples_leaf=30,
+        random_state=42,
+    )
+    mag_median.fit(X_train, ymag_train)
+    mag_p75.fit(X_train, ymag_train)
 
     #print("Evaluating ...")
     y_pred = dir_model.predict(X_test)
     y_proba = dir_model.predict_proba(X_test)
     classes = dir_model.classes_.astype(float)
     expected = (y_proba * classes.reshape(1, -1)).sum(axis=1)
-    mag_proba = mag_model.predict_proba(X_test)
-    mag_classes = mag_model.classes_
-    # Align bin means to class order
-    bin_mean_map = {int(b): m for b, m in zip(unique_bins, bin_means)}
-    mag_mean_vec = np.array([bin_mean_map[int(c)] for c in mag_classes])
-    mag_pred_mean = mag_proba @ mag_mean_vec
+    mag_med = np.clip(mag_median.predict(X_test), 0, None)
+    mag_hi = np.clip(mag_p75.predict(X_test), 0, None)
+    mag_used = np.minimum(mag_hi, mag_med * 2)  # cap median by upper quantile (or 2x median to avoid zero hi)
 
     print("Classification report:\n", classification_report(y_test, y_pred))
     print("Confusion matrix:\n", confusion_matrix(y_test, y_pred))
@@ -217,9 +233,8 @@ def main():
     print(y_proba[:5])
     print("Expected value of prediction (mean over test set):", expected.mean())
     print("Expected value quantiles (5/50/95):", pd.Series(expected).quantile([0.05, 0.5, 0.95]).to_dict())
-    print("Magnitude bin probabilities preview (first 3 rows):")
-    print(mag_proba[:3])
-    print("Magnitude mean preview (first 5 rows):", mag_pred_mean[:5])
+    print("Magnitude median preview (first 5 rows):", mag_med[:5])
+    print("Magnitude p75 preview (first 5 rows):", mag_hi[:5])
 
     save_artifacts = os.environ.get("TRAIN_SAVE_ARTIFACTS", "1").strip().lower() in {"1", "true", "yes", "y"}
     if save_artifacts:
@@ -230,9 +245,8 @@ def main():
         joblib.dump(
             {
                 "direction_model": dir_model,
-                "magnitude_model": mag_model,
-                "magnitude_bin_means": mag_mean_vec,
-                "magnitude_classes": mag_classes,
+                "magnitude_median": mag_median,
+                "magnitude_p75": mag_p75,
                 "classes": classes,
                 "feature_cols": feature_cols,
             },
@@ -243,8 +257,9 @@ def main():
         preds_df["y_true"] = y_test
         preds_df["y_pred"] = y_pred
         preds_df["expected_value_dir"] = expected
-        preds_df["mag_pred_mean"] = mag_pred_mean
-        preds_df["ev_combined"] = mag_pred_mean * (y_proba[:, list(classes).index(1.0)] - y_proba[:, list(classes).index(-1.0)])
+        preds_df["mag_pred_med"] = mag_med
+        preds_df["mag_pred_p75"] = mag_hi
+        preds_df["ev_combined"] = mag_used * (y_proba[:, list(classes).index(1.0)] - y_proba[:, list(classes).index(-1.0)])
         preds_df["sample_weight"] = sample_weight_test
         for i, cls in enumerate(classes):
             preds_df[f"proba_{int(cls)}"] = y_proba[:, i]
