@@ -47,12 +47,13 @@ def _choose_data_dir() -> Path:
 def main():
     raw_dir = _choose_data_dir()
 
-    model_path = Path(os.environ.get("BT_MODEL_PATH", PROJECT_ROOT / "artifacts" / "hgb_model.joblib"))
+    model_path = Path(os.environ.get("BT_MODEL_PATH", PROJECT_ROOT / "artifacts" / "hgb_combo_model.joblib"))
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found at {model_path}; set BT_MODEL_PATH to override.")
 
     long_thr = float(os.environ.get("BT_LONG_THRESHOLD", "0.1"))
     short_thr = float(os.environ.get("BT_SHORT_THRESHOLD", "-0.1"))
+    conf_min = float(os.environ.get("BT_CONF_MIN", "0.0"))  # min abs(p_up - p_down)
     fee_bps = float(os.environ.get("BT_FEE_BPS", "0.0"))  # fee per trade (entry/flip), in bps
     slippage_bps = float(os.environ.get("BT_SLIPPAGE_BPS", "0.0"))  # slippage per trade, in bps
     latency_ticks = int(os.environ.get("BT_LATENCY_TICKS", "0"))  # delay execution by N ticks
@@ -61,6 +62,10 @@ def main():
 
     print(f"Loading data from {raw_dir} ...")
     df = ensure_multiindex(load_all_raw_data(raw_dir))
+    if df.index.duplicated().any():
+        before = len(df)
+        df = df.loc[~df.index.duplicated(keep="last")]
+        print(f"Deduped Symbol/Time rows: {before - len(df)} removed, {len(df)} remaining.")
     # Drop duplicate Symbol/Time to avoid inflating sample count and equity.
     if df.index.duplicated().any():
         before = len(df)
@@ -86,12 +91,45 @@ def main():
     fwd = merged["fwd_ret"]
 
     print(f"Loaded {len(X_bt):,} rows for backtest.")
-    model = joblib.load(model_path)
-    classes = model.classes_.astype(float)
-    proba = model.predict_proba(X_bt)
-    expected = (proba * classes.reshape(1, -1)).sum(axis=1)
+    model_bundle = joblib.load(model_path)
+    # Support legacy classifier-only models
+    if isinstance(model_bundle, dict) and "direction_model" in model_bundle:
+        dir_model = model_bundle["direction_model"]
+        mag_model = model_bundle.get("magnitude_model")
+        mag_means = model_bundle.get("magnitude_bin_means")
+        mag_classes = model_bundle.get("magnitude_classes")
+        classes = np.array(model_bundle.get("classes", dir_model.classes_)).astype(float)
+    else:
+        dir_model = model_bundle
+        mag_model = None
+        mag_means = None
+        mag_classes = None
+        classes = dir_model.classes_.astype(float)
 
-    positions_signal = np.where(expected > long_thr, 1, np.where(expected < short_thr, -1, 0))
+    proba = dir_model.predict_proba(X_bt)
+    # Map probabilities to up/down
+    p_up = proba[:, np.where(classes == 1.0)[0][0]] if 1.0 in classes else np.zeros(len(X_bt))
+    p_down = proba[:, np.where(classes == -1.0)[0][0]] if -1.0 in classes else np.zeros(len(X_bt))
+    conf = np.abs(p_up - p_down)
+
+    if mag_model is not None and mag_means is not None and mag_classes is not None:
+        mag_proba = mag_model.predict_proba(X_bt)
+        mag_means = np.asarray(mag_means, dtype=float)
+        mag_classes = np.asarray(mag_classes, dtype=float)
+        mean_vec = []
+        for c in mag_model.classes_:
+            idx = np.where(mag_classes == c)[0]
+            mean_vec.append(mag_means[idx[0]] if len(idx) else 0.0)
+        mean_vec = np.asarray(mean_vec, dtype=float)
+        mag_pred = mag_proba @ mean_vec
+        expected = mag_pred * (p_up - p_down)
+    else:
+        expected = (proba * classes.reshape(1, -1)).sum(axis=1)
+
+    # Apply confidence filter if set
+    expected_filtered = np.where(conf >= conf_min, expected, 0.0)
+
+    positions_signal = np.where(expected_filtered > long_thr, 1, np.where(expected_filtered < short_thr, -1, 0))
     if latency_ticks > 0:
         positions = np.concatenate([np.zeros(latency_ticks, dtype=int), positions_signal[:-latency_ticks]])
     else:
@@ -119,9 +157,9 @@ def main():
     print(f"  Max drawdown: {mdd:.3%}")
     print(f"  Final equity: {equity.iloc[-1]:.3f}")
 
-    ev_series = pd.Series(expected)
+    ev_series = pd.Series(expected_filtered)
     print("\nExpected value quantiles (5/50/95):", ev_series.quantile([0.05, 0.5, 0.95]).to_dict())
-    print(f"Thresholds: long>{long_thr}, short<{short_thr}, fee_bps={fee_bps}, slippage_bps={slippage_bps}, latency_ticks={latency_ticks}")
+    print(f"Thresholds: long>{long_thr}, short<{short_thr}, conf_min={conf_min}, fee_bps={fee_bps}, slippage_bps={slippage_bps}, latency_ticks={latency_ticks}")
 
     if save_artifacts:
         out_dir = PROJECT_ROOT / "artifacts"
@@ -131,7 +169,10 @@ def main():
             {
                 "Symbol": merged["Symbol"],
                 "Time": merged["Time"],
-                "expected": expected,
+                "expected": expected_filtered,
+                "expected_raw": expected,
+                "confidence": conf if "conf" in locals() else None,
+                "magnitude_pred": mag_pred if "mag_pred" in locals() else None,
                 "position_signal": positions_signal,
                 "position_exec": positions,
                 "fwd_ret": fwd_values,
