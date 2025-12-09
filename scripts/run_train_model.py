@@ -5,6 +5,8 @@ from pathlib import Path
 import joblib
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
 
@@ -22,14 +24,49 @@ from src.feature_engineering import (
 from src.labels import make_labels
 
 
-def main():
-    default_dir = os.environ.get("TRAIN_DATA_DIR", str(PROJECT_ROOT / "data" / "raw"))
-    raw_dir = Path(input(f"Training data directory [{default_dir}]: ").strip() or default_dir)
-    if not raw_dir.exists():
-        raise FileNotFoundError(f"Training data directory not found: {raw_dir}")
+def forward_returns(mid: pd.Series, horizon: int = 1) -> pd.Series:
+    future = mid.groupby(level=0).shift(-horizon)
+    return (future - mid) / mid
 
-    print(f"Loading data from {raw_dir} ...")
-    df = ensure_multiindex(load_all_raw_data(raw_dir))
+
+def _load_multiple_dirs(paths: list[Path]) -> pd.DataFrame:
+    frames = []
+    for p in paths:
+        if p.exists():
+            print(f"Loading data from {p} ...")
+            frames.append(load_all_raw_data(p))
+        else:
+            print(f"Skipping missing data dir: {p}")
+    if not frames:
+        raise FileNotFoundError("No training data directories contained usable files.")
+    # Preserve MultiIndex; load_all_raw_data already sets (Symbol, Time) index.
+    combined = pd.concat(frames)
+    return ensure_multiindex(combined)
+
+
+def main():
+    default_dirs = os.environ.get(
+        "TRAIN_DATA_DIRS",
+        ",".join(
+            [
+                str(PROJECT_ROOT / "data" / "raw"),
+                str(PROJECT_ROOT / "data" / "processed"),
+            ]
+        ),
+    )
+    user_input = input(f"Training data directories (comma-separated) [{default_dirs}]: ").strip()
+    dir_list = (
+        [Path(d.strip()) for d in user_input.split(",") if d.strip()]
+        if user_input
+        else [Path(d.strip()) for d in default_dirs.split(",") if d.strip()]
+    )
+
+    df = _load_multiple_dirs(dir_list)
+    # Drop duplicate Symbol/Time to avoid leaking duplicate samples into training (jsonl files can overlap time ranges).
+    if df.index.duplicated().any():
+        before = len(df)
+        df = df.loc[~df.index.duplicated(keep="last")]
+        print(f"Deduped Symbol/Time rows: {before - len(df)} removed, {len(df)} remaining.")
 
     #print("Computing features ...")
     df_feat = add_basic_features(df)

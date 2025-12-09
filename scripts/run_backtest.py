@@ -61,6 +61,11 @@ def main():
 
     print(f"Loading data from {raw_dir} ...")
     df = ensure_multiindex(load_all_raw_data(raw_dir))
+    # Drop duplicate Symbol/Time to avoid inflating sample count and equity.
+    if df.index.duplicated().any():
+        before = len(df)
+        df = df.loc[~df.index.duplicated(keep="last")]
+        print(f"Deduped Symbol/Time rows: {before - len(df)} removed, {len(df)} remaining.")
     df_feat = add_basic_features(df)
     df_feat = add_orderflow_features(df_feat)
 
