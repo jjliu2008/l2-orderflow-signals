@@ -13,13 +13,13 @@ def _load_csv(path: Path) -> pd.DataFrame:
 
 def _load_jsonl_matches(path: Path) -> pd.DataFrame:
     """
-    Parse Coinbase websocket jsonl (matches / last_match) into a tabular form.
+    Parse Coinbase websocket jsonl (matches/last_match/ticker) into tabular form.
     We synthesize minimal columns so feature code can run:
       - Time: message time (datetime)
       - Symbol: product_id (e.g., BTC-USD)
-      - BidPrice1/AskPrice1: set to trade price
+      - BidPrice1/AskPrice1: set to trade/ticker price
       - BidVolume1/AskVolume1: set to 0 (we don't have depth)
-      - Volume: trade size
+      - Volume: trade size (or last_size for ticker)
     """
     rows: List[dict] = []
     with path.open("r", encoding="utf-8") as f:
@@ -32,11 +32,12 @@ def _load_jsonl_matches(path: Path) -> pd.DataFrame:
             except json.JSONDecodeError:
                 continue
 
-            if msg.get("type") not in {"match", "last_match"}:
+            mtype = msg.get("type")
+            if mtype not in {"match", "last_match", "ticker"}:
                 continue
 
             price = float(msg.get("price", "nan"))
-            size = float(msg.get("size", "nan"))
+            size = float(msg.get("size", msg.get("last_size", "nan")))
             t = pd.to_datetime(msg.get("time"))
             symbol = msg.get("product_id", path.stem)
 

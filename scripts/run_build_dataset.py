@@ -94,14 +94,62 @@ def get_auth_config():
     return key_name, key_material
 
 
+def _clear_old_output(out_dir: Path):
+    """
+    Remove existing coinbase_ws_*.jsonl files before starting a new capture.
+    To avoid touching historical datasets, we only clear when targeting data/live.
+    """
+    # Only clear if we're explicitly in data/live to protect other datasets.
+    if out_dir.resolve().name != "live":
+        return
+
+    archive_dir = out_dir.parent / "processed"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    moved = 0
+    for f in out_dir.glob("coinbase_ws_*.jsonl"):
+        try:
+            dest = archive_dir / f.name
+            f.replace(dest)
+            moved += 1
+        except OSError:
+            continue
+    if moved:
+        print(f"Moved {moved} old files from {out_dir} to {archive_dir}")
+
+
 def _choose_output_path() -> Path:
     default_dir = os.environ.get("WS_OUTPUT_DIR", "data/live")
     out_dir = default_dir
     ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     out_path = Path(out_dir) / f"coinbase_ws_{ts}.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    _clear_old_output(out_path.parent)
     print("Writing to:", out_path)
     return out_path
+
+
+def _parse_product_ids() -> list[str]:
+    prod_env = os.environ.get("WS_PRODUCT_IDS", "BTC-USD")
+    return [p.strip() for p in prod_env.split(",") if p.strip()]
+
+
+def _choose_channels(auth_config) -> list[str]:
+    # Higher-frequency: include ticker and matches; add level2 if auth present.
+    base_channels = ["ticker", "matches"]
+    if auth_config is not None:
+        base_channels.append("level2")
+    extra = os.environ.get("WS_CHANNELS")
+    if extra:
+        base_channels.extend([c.strip() for c in extra.split(",") if c.strip()])
+    # Deduplicate while preserving order
+    seen = set()
+    uniq = []
+    for c in base_channels:
+        if c not in seen:
+            uniq.append(c)
+            seen.add(c)
+    return uniq
 
 
 async def coinbase_ws_record():
@@ -113,33 +161,34 @@ async def coinbase_ws_record():
     while True:
         try:
             async with websockets.connect(
-                COINBASE_WS_URL, ping_interval=20, ping_timeout=20
+                COINBASE_WS_URL, ping_interval=10, ping_timeout=10
             ) as ws:
+                products = _parse_product_ids()
+                channels = _choose_channels(auth_config)
                 if auth_config is None:
                     subscribe_msg = {
                         "type": "subscribe",
-                        "product_ids": ["BTC-USD"],
-                        "channels": ["matches"],
+                        "product_ids": products,
+                        "channels": channels,
                     }
                 else:
                     key_name, key_material = auth_config
                     jwt_token = build_cdp_jwt(key_name, key_material)
                     subscribe_msg = {
                         "type": "subscribe",
-                        "product_ids": ["BTC-USD"],
-                        "channels": ["level2", "matches"],
+                        "product_ids": products,
+                        "channels": channels,
                         "jwt": jwt_token,
                     }
                 await ws.send(json.dumps(subscribe_msg))
-                print(f"Subscribed to Coinbase WebSocket ({COINBASE_WS_URL})")
+                print(f"Subscribed to Coinbase WebSocket ({COINBASE_WS_URL}) -> products={products}, channels={channels}")
 
-                # append so we keep data across reconnects
-                with out_path.open("a", encoding="utf-8") as f:
+                # append so we keep data across reconnects; line-buffered to reduce batching
+                with out_path.open("a", encoding="utf-8", buffering=1) as f:
                     async for msg in ws:
                         f.write(msg + "\n")
+                        f.flush()
                         msg_count += 1
-                        if msg_count % 100 == 0:
-                            print(f"Wrote {msg_count} messages to {out_path}")
 
         except exceptions.ConnectionClosedError as e:
             print(f"Connection closed: {e}; reconnecting in 2s")

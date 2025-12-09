@@ -81,7 +81,8 @@ def max_drawdown(path: np.ndarray) -> float:
 
 
 def main():
-    raw_dir = PROJECT_ROOT / "data" / "raw"
+    raw_dir_env = os.environ.get("MONTE_CARLO_DATA_DIR")
+    raw_dir = Path(raw_dir_env).expanduser().resolve() if raw_dir_env else PROJECT_ROOT / "data" / "raw"
     if not raw_dir.exists():
         raise FileNotFoundError(f"Raw data directory not found: {raw_dir}")
 
@@ -102,39 +103,49 @@ def main():
     n_paths = int(os.environ.get("MONTE_CARLO_PATHS", "100"))
     path_len = int(os.environ.get("MONTE_CARLO_STEPS", "200"))
     mode = os.environ.get("MONTE_CARLO_MODE", "plain").lower()
+    compare = mode == "both"
+    modes_to_run = ["plain", "regime"] if compare else [mode]
 
     print(f"Simulating {n_paths} paths of length {path_len} from start price {start_price:.2f} ...")
-    if mode == "regime":
-        print("Using regime-aware bootstrap (low/high vol splits).")
-        paths = regime_bootstrap_paths(log_ret, start_price, n_paths, path_len)
-    else:
-        print("Using plain bootstrap of log returns.")
-        paths = bootstrap_paths(log_ret.values, start_price, n_paths, path_len)
-
-    finals = paths[:, -1]
-    returns = finals / start_price - 1.0
-    drawdowns = np.array([max_drawdown(p) for p in paths])
 
     def pct(x, q):
         return np.percentile(x, q)
 
-    print("\nPrice stats:")
-    print(f"  Final price mean: {finals.mean():.2f}")
-    print(f"  Final price 5th/50th/95th pct: {pct(finals,5):.2f} / {pct(finals,50):.2f} / {pct(finals,95):.2f}")
+    results = {}
 
-    print("\nReturn stats:")
-    print(f"  Mean return: {returns.mean()*100:.2f}%")
-    print(f"  5th/50th/95th pct: {pct(returns,5)*100:.2f}% / {pct(returns,50)*100:.2f}% / {pct(returns,95)*100:.2f}%")
+    for current_mode in modes_to_run:
+        if current_mode == "regime":
+            print("\nUsing regime-aware bootstrap (low/high vol splits).")
+            paths = regime_bootstrap_paths(log_ret, start_price, n_paths, path_len)
+        else:
+            print("\nUsing plain bootstrap of log returns.")
+            paths = bootstrap_paths(log_ret.values, start_price, n_paths, path_len)
 
-    print("\nMax drawdown stats:")
-    print(f"  Mean max DD: {drawdowns.mean()*100:.2f}%")
-    print(f"  5th/50th/95th pct: {pct(drawdowns,5)*100:.2f}% / {pct(drawdowns,50)*100:.2f}% / {pct(drawdowns,95)*100:.2f}%")
+        finals = paths[:, -1]
+        returns = finals / start_price - 1.0
+        drawdowns = np.array([max_drawdown(p) for p in paths])
 
-    # Preview first few paths
-    preview = min(3, n_paths)
-    print(f"\nPreview of {preview} simulated paths (first 5 steps):")
-    for i in range(preview):
-        print(f"  Path {i+1}: {np.round(paths[i, :6], 2)} ...")
+        print("Price stats:")
+        print(f"  Final price mean: {finals.mean():.2f}")
+        print(f"  Final price 5th/50th/95th pct: {pct(finals,5):.2f} / {pct(finals,50):.2f} / {pct(finals,95):.2f}")
+
+        print("Return stats:")
+        print(f"  Mean return: {returns.mean()*100:.2f}%")
+        print(f"  5th/50th/95th pct: {pct(returns,5)*100:.2f}% / {pct(returns,50)*100:.2f}% / {pct(returns,95)*100:.2f}%")
+
+        print("Max drawdown stats:")
+        print(f"  Mean max DD: {drawdowns.mean()*100:.2f}%")
+        print(f"  5th/50th/95th pct: {pct(drawdowns,5)*100:.2f}% / {pct(drawdowns,50)*100:.2f}% / {pct(drawdowns,95)*100:.2f}%")
+
+        # Preview first few paths
+        preview = min(3, n_paths)
+        print(f"Preview of {preview} simulated paths (first 5 steps):")
+        for i in range(preview):
+            print(f"  Path {i+1}: {np.round(paths[i, :6], 2)} ...")
+
+        results[current_mode] = paths
+
+    # No plotting or artifact saves here; visualization handled by the live viewer.
 
 
 if __name__ == "__main__":

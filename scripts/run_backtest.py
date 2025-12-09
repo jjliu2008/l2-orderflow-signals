@@ -5,7 +5,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import os
 
 # Allow running directly
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -37,17 +37,7 @@ def _choose_data_dir() -> Path:
     default_raw = PROJECT_ROOT / "data" / "raw"
     default_live = PROJECT_ROOT / "data" / "live"
     env_dir = os.environ.get("BT_DATA_DIR")
-    print("Select data directory:")
-    print(f"  1) raw ({default_raw})")
-    print(f"  2) live ({default_live})")
-    choice = input(f"Enter 1/2 or a custom path [{env_dir or default_raw}]: ").strip()
-    if choice == "1" or choice == "":
-        target = env_dir or default_raw
-    elif choice == "2":
-        target = default_live
-    else:
-        target = choice
-
+    target = env_dir or default_live if default_live.exists() else default_raw
     raw_dir = Path(target).expanduser().resolve()
     if not raw_dir.exists():
         raise FileNotFoundError(f"Raw data directory not found: {raw_dir}")
@@ -146,20 +136,6 @@ def main():
         )
         out_df.to_csv(out_path, index=False)
         print(f"\nSaved backtest results to {out_path}")
-
-        # Equity curve plot
-        plt.figure(figsize=(10, 4))
-        plt.plot(merged["Time"], equity.values, label="Equity")
-        plt.xlabel("Time")
-        plt.ylabel("Equity")
-        plt.title("Backtest Equity Curve")
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        eq_path = out_dir / "backtest_equity.png"
-        plt.savefig(eq_path, dpi=150)
-        plt.close()
-        print(f"Saved equity curve plot to {eq_path}")
     else:
         print("\nSkipping save (BACKTEST_SAVE is falsy).")
 
