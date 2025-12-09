@@ -29,7 +29,7 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -51,6 +51,22 @@ BACKTEST_COOLDOWN_SEC = float(
     os.environ.get("TV_BACKTEST_COOLDOWN_SEC", max(5, METRIC_REFRESH_MS / 1000))
 )
 PORT = int(os.environ.get("TV_PORT", "8765"))
+
+# Allowed candle timeframes for mid-price aggregation.
+CANDLE_FREQS = {
+    "1m": "60s",
+    "3m": "180s",
+    "5m": "300s",
+    "10m": "600s",
+    "15m": "900s",
+    "30m": "1800s",
+    "45m": "2700s",
+    "1h": "3600s",
+    "2h": "7200s",
+    "3h": "10800s",
+    "4h": "14400s",
+    "1d": "1d",
+}
 
 INDEX_HTML_TEMPLATE = """<!doctype html>
 <html lang="en">
@@ -136,7 +152,26 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
   <p class="lead">Mid-price plus backtest metrics pulled from local files. Updates are auto-polled by the browser.</p>
   <div class="grid">
     <div class="card">
-      <h2>Mid-price (lookback: TV_LOOKBACK_MIN_PLACEHOLDER min)</h2>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+        <h2 style="margin:0;">Mid-price (lookback: TV_LOOKBACK_MIN_PLACEHOLDER min)</h2>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <select id="price-tf" class="pill" style="cursor:pointer;border:none;padding:6px 10px;">
+            <option value="1m">1m</option>
+            <option value="3m">3m</option>
+            <option value="5m">5m</option>
+            <option value="10m">10m</option>
+            <option value="15m">15m</option>
+            <option value="30m">30m</option>
+            <option value="45m">45m</option>
+            <option value="1h">1h</option>
+            <option value="2h">2h</option>
+            <option value="3h">3h</option>
+            <option value="4h">4h</option>
+            <option value="1d">1d</option>
+          </select>
+          <button id="price-toggle" class="pill" style="cursor:pointer;border:none;">Candles</button>
+        </div>
+      </div>
       <div id="price-chart" class="chart"></div>
       <div class="status" id="price-status"></div>
     </div>
@@ -187,12 +222,26 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
     };
 
     const priceChart = LightweightCharts.createChart(document.getElementById("price-chart"), { ...baseOptions, height: 280 });
-    const priceSeries = priceChart.addAreaSeries({
+    const priceAreaSeries = priceChart.addAreaSeries({
       lineColor: palette.accent,
       topColor: "rgba(56, 189, 248, 0.35)",
       bottomColor: "rgba(56, 189, 248, 0.05)",
       lineWidth: 2,
     });
+    const priceCandleSeries = priceChart.addCandlestickSeries({
+      upColor: "#38bdf8",
+      borderUpColor: "#38bdf8",
+      wickUpColor: "#38bdf8",
+      downColor: "#0ea5e9",
+      borderDownColor: "#0ea5e9",
+      wickDownColor: "#0ea5e9",
+    });
+    let priceMode = "area"; // "area" | "candles"
+    let priceTf = "1m";
+    let lastPriceArea = [];
+    let lastPriceCandles = [];
+    let evLabels = [];
+    let pnlEdges = [];
 
     const equityChart = LightweightCharts.createChart(document.getElementById("equity-chart"), { ...baseOptions, height: 280 });
     const equitySeries = equityChart.addLineSeries({ color: palette.accent2, lineWidth: 2 });
@@ -216,7 +265,12 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
     const evChart = LightweightCharts.createChart(document.getElementById("ev-chart"), {
       ...baseOptions,
       height: 200,
-      timeScale: { visible: false },
+      timeScale: {
+        visible: true,
+        timeVisible: false,
+        secondsVisible: false,
+        tickMarkFormatter: (time) => evLabels[time - 1] || "",
+      },
       rightPriceScale: { borderVisible: false, visible: false },
     });
     const evSeries = evChart.addHistogramSeries({ color: palette.accent, priceFormat: { type: "price", precision: 6 } });
@@ -224,7 +278,16 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
     const pnlChart = LightweightCharts.createChart(document.getElementById("pnl-chart"), {
       ...baseOptions,
       height: 200,
-      timeScale: { visible: false },
+      timeScale: {
+        visible: true,
+        timeVisible: false,
+        secondsVisible: false,
+        tickMarkFormatter: (time) => {
+          const idx = Math.max(0, Math.min(pnlEdges.length - 1, Math.round(time) - 1));
+          const val = pnlEdges[idx];
+          return val != null ? Number(val).toFixed(4) : "";
+        },
+      },
       rightPriceScale: { borderVisible: false, visible: false },
     });
     const pnlSeries = pnlChart.addHistogramSeries({ color: palette.accent2, base: 0 });
@@ -268,6 +331,19 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
       if (el) el.textContent = text;
     }
 
+    function setPriceMode(mode) {
+      priceMode = mode;
+      if (mode === "area") {
+        safeSet(priceAreaSeries, lastPriceArea, "price-area");
+        safeSet(priceCandleSeries, [], "price-candles");
+      } else {
+        safeSet(priceCandleSeries, lastPriceCandles, "price-candles");
+        safeSet(priceAreaSeries, [], "price-area");
+      }
+      const btn = document.getElementById("price-toggle");
+      if (btn) btn.textContent = mode === "area" ? "Candles" : "Area";
+    }
+
     async function fetchJson(url) {
       const res = await fetch(url, { cache: "no-store" });
       return res.json();
@@ -284,10 +360,11 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
 
     async function loadPrice() {
       try {
-        const data = await fetchJson("/api/price");
+        const data = await fetchJson(`/api/price?freq=${priceTf}`);
         if (data.error) {
           setStatus("price-status", data.error);
-          priceSeries.setData([]);
+          priceAreaSeries.setData([]);
+          priceCandleSeries.setData([]);
           return;
         }
         const merged = [];
@@ -299,11 +376,36 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
         if ((data.series || []).length && clean.length === 0) {
           console.warn("sanitize(price) dropped all points", { mergedLength: merged.length, raw: merged.slice(0, 5) });
         }
-        safeSet(priceSeries, clean, "price");
-        setStatus("price-status", `Updated ${new Date().toLocaleTimeString()}`);
+        lastPriceArea = clean;
+
+        const candles = [];
+        (data.candles || []).forEach(block => {
+          (block.candles || []).forEach(c => candles.push(c));
+        });
+        const cleanCandles = candles
+          .filter(c => c.time != null && c.open != null && c.high != null && c.low != null && c.close != null)
+          .map(c => ({
+            time: Number(c.time),
+            open: Number(c.open),
+            high: Number(c.high),
+            low: Number(c.low),
+            close: Number(c.close),
+          }))
+          .sort((a, b) => a.time - b.time);
+        lastPriceCandles = cleanCandles;
+
+        if (priceMode === "area") {
+          safeSet(priceAreaSeries, lastPriceArea, "price-area");
+          safeSet(priceCandleSeries, [], "price-candles");
+        } else {
+          safeSet(priceCandleSeries, lastPriceCandles, "price-candles");
+          safeSet(priceAreaSeries, [], "price-area");
+        }
+        setStatus("price-status", `Updated ${new Date().toLocaleTimeString()} (${priceMode === "area" ? "Area" : "Candles"}, ${priceTf})`);
       } catch (err) {
         setStatus("price-status", `Error: ${err}`);
-        priceSeries.setData([]);
+        priceAreaSeries.setData([]);
+        priceCandleSeries.setData([]);
       }
     }
 
@@ -351,10 +453,12 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
         safeSet(drawdownSeries, dd, "drawdown");
         safeSet(rollingSeries, rolling, "rolling");
 
+        evLabels = (data.evBuckets || []).map(b => b.label || "");
         const evBuckets = sanitize((data.evBuckets || []).map((b, idx) => ({ time: idx + 1, value: b.value, color: palette.accent })), "ev");
         safeSet(evSeries, evBuckets, "ev");
 
-        const pnlHist = sanitize(histogramFromEdges(data.pnlHistogram?.edges, data.pnlHistogram?.counts), "pnl");
+        pnlEdges = data.pnlHistogram?.edges || [];
+        const pnlHist = sanitize(histogramFromEdges(pnlEdges, data.pnlHistogram?.counts), "pnl");
         safeSet(pnlSeries, pnlHist, "pnl");
 
         setStatus("equity-status", `Metrics refreshed ${new Date().toLocaleTimeString()}`);
@@ -367,6 +471,17 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
     loadMetrics();
     setInterval(loadPrice, priceRefreshMs);
     setInterval(loadMetrics, metricRefreshMs);
+
+    document.getElementById("price-toggle")?.addEventListener("click", () => {
+      setPriceMode(priceMode === "area" ? "candles" : "area");
+    });
+
+    document.getElementById("price-tf")?.addEventListener("change", (e) => {
+      priceTf = e.target.value || "1m";
+      loadPrice();
+    });
+
+    // initialize with area data when first payload arrives
   </script>
 </body>
 </html>
@@ -395,6 +510,43 @@ def load_mid_series(data_dir: Path, lookback_min: int) -> pd.Series:
         return mid
     cutoff = mid.index.get_level_values("Time").max() - pd.Timedelta(minutes=lookback_min)
     return mid[mid.index.get_level_values("Time") >= cutoff]
+
+
+def build_candles(mid: pd.Series, freq: str = "60s") -> list[dict]:
+    """
+    Aggregate mid-price into simple OHLC candles per symbol.
+    """
+    if mid.empty:
+        return []
+    df = mid.reset_index().rename(columns={0: "mid"})
+    df = df.rename(columns={"mid": "price"})
+    df["Time"] = pd.to_datetime(df["Time"])
+    candles = []
+    for symbol, chunk in df.groupby("Symbol"):
+        c = (
+            chunk.set_index("Time")["price"]
+            .resample(freq)
+            .agg(["first", "max", "min", "last"])
+            .dropna()
+        )
+        if c.empty:
+            continue
+        candles.append(
+            {
+                "symbol": symbol,
+                "candles": [
+                    {
+                        "time": int(ts.value // 1_000_000_000),
+                        "open": float(row["first"]),
+                        "high": float(row["max"]),
+                        "low": float(row["min"]),
+                        "close": float(row["last"]),
+                    }
+                    for ts, row in c.iterrows()
+                ],
+            }
+        )
+    return candles
 
 
 def load_equity_curve() -> Optional[pd.DataFrame]:
@@ -540,6 +692,10 @@ class TVRequestHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
     def handle_price(self):
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        freq_key = params.get("freq", ["1m"])[0]
+        freq = CANDLE_FREQS.get(freq_key, CANDLE_FREQS["1m"])
         try:
             mid = load_mid_series(_pick_data_dir(), LOOKBACK_MIN)
         except Exception as exc:
@@ -548,7 +704,8 @@ class TVRequestHandler(BaseHTTPRequestHandler):
         series: List[Dict[str, object]] = []
         for symbol, chunk in mid.groupby(level=0):
             series.append({"symbol": symbol, "points": _series_to_points(chunk)})
-        self._send_json({"series": series})
+        candles = build_candles(mid, freq=freq)
+        self._send_json({"series": series, "candles": candles, "freq": freq_key})
 
     def handle_equity(self):
         try:
