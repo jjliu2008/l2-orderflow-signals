@@ -30,7 +30,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -67,6 +67,11 @@ CANDLE_FREQS = {
     "4h": "14400s",
     "1d": "1d",
 }
+
+# In-process cache for price data to avoid rereading full files each tick.
+# Structure: {path: {"df": DataFrame, "mtime": float, "size": int}}
+_PRICE_CACHE: dict[Path, dict] = {}
+USE_PRICE_CACHE = os.environ.get("TV_USE_PRICE_CACHE", "1").lower() not in {"0", "false", "no"}
 
 INDEX_HTML_TEMPLATE = """<!doctype html>
 <html lang="en">
@@ -502,8 +507,102 @@ def _pick_data_dir(env_dir: Optional[str] = None) -> Path:
     return target
 
 
+def _parse_jsonl_lines(lines: list[str], symbol_fallback: str) -> pd.DataFrame:
+    rows: List[dict] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        mtype = msg.get("type")
+        if mtype not in {"match", "last_match", "ticker"}:
+            continue
+        try:
+            price = float(msg.get("price", "nan"))
+            size = float(msg.get("size", msg.get("last_size", "nan")))
+        except (TypeError, ValueError):
+            continue
+        t = pd.to_datetime(msg.get("time"))
+        symbol = msg.get("product_id", symbol_fallback)
+        rows.append(
+            {
+                "Time": t,
+                "Symbol": symbol,
+                "BidPrice1": price,
+                "AskPrice1": price,
+                "BidVolume1": 0.0,
+                "AskVolume1": 0.0,
+                "Volume": size,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _load_file_cached(path: Path) -> pd.DataFrame:
+    """
+    Load a file with caching to avoid full rereads.
+    JSONL: append only new lines since last size.
+    CSV: reload only if mtime/size changed.
+    """
+    global _PRICE_CACHE
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return pd.DataFrame()
+
+    cache = _PRICE_CACHE.get(path)
+
+    if path.suffix.lower() == ".jsonl":
+        offset = cache.get("size", 0) if cache else 0
+        new_rows: List[dict] = []
+        with path.open("r", encoding="utf-8") as f:
+            f.seek(offset)
+            new_lines = f.readlines()
+        new_df = _parse_jsonl_lines(new_lines, path.stem)
+        if cache and not cache["df"].empty:
+            base_df = cache["df"]
+            df = pd.concat([base_df, new_df], ignore_index=True)
+        else:
+            df = new_df
+        _PRICE_CACHE[path] = {"df": df, "mtime": stat.st_mtime, "size": stat.st_size}
+        return df
+
+    # CSV: simple mtime check
+    if cache and cache.get("mtime") == stat.st_mtime and cache.get("size") == stat.st_size:
+        return cache["df"]
+
+    try:
+        df = pd.read_csv(path, parse_dates=["Time"])
+        if "Symbol" not in df.columns:
+            df["Symbol"] = path.stem
+        _PRICE_CACHE[path] = {"df": df, "mtime": stat.st_mtime, "size": stat.st_size}
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 def load_mid_series(data_dir: Path, lookback_min: int) -> pd.Series:
-    df = ensure_multiindex(load_all_raw_data(data_dir))
+    data_dir = data_dir.resolve()
+    files = sorted(list(data_dir.glob("*.jsonl")) + list(data_dir.glob("*.csv")))
+    if not files:
+        raise FileNotFoundError(f"No data files found in {data_dir}")
+
+    if USE_PRICE_CACHE:
+        frames = []
+        for fpath in files:
+            df = _load_file_cached(fpath)
+            if not df.empty:
+                frames.append(df)
+        if not frames:
+            return pd.Series(dtype=float)
+        df = pd.concat(frames, ignore_index=True)
+    else:
+        df = load_all_raw_data(data_dir).reset_index()
+
+    df = ensure_multiindex(df)
     df_feat = add_basic_features(df)
     mid = df_feat["mid"].dropna().sort_index()
     if mid.empty:
