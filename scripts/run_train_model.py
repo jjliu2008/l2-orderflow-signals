@@ -1,14 +1,16 @@
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 import joblib
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
 
 # Allow running directly
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -57,6 +59,54 @@ def compute_realized_vol(df: pd.DataFrame, window: int = 20) -> pd.Series:
     return vol.rename("realized_vol")
 
 
+def _build_direction_estimator(model_type: str, params: dict, n_jobs: Optional[int] = None):
+    """
+    Construct the requested direction classifier.
+    """
+    model_type = model_type.lower()
+    if model_type == "xgboost":
+        try:
+            from xgboost import XGBClassifier
+        except ImportError as exc:
+            raise ImportError(
+                "XGBoost is required for TRAIN_DIR_MODEL=xgboost. Install with `pip install xgboost` "
+                "or set TRAIN_DIR_MODEL=catboost."
+            ) from exc
+        return XGBClassifier(
+            n_estimators=params.get("n_estimators", 400),
+            learning_rate=params.get("learning_rate", 0.05),
+            max_depth=params.get("max_depth", 6),
+            min_child_weight=params.get("min_child_weight", 1.0),
+            subsample=params.get("subsample", 0.9),
+            colsample_bytree=params.get("colsample_bytree", 0.9),
+            reg_lambda=params.get("reg_lambda", 1.0),
+            objective="multi:softprob",
+            eval_metric="mlogloss",
+            tree_method=os.environ.get("XGB_TREE_METHOD", "hist"),
+            random_state=42,
+            n_jobs=n_jobs,
+        )
+    if model_type == "catboost":
+        try:
+            from catboost import CatBoostClassifier
+        except ImportError as exc:
+            raise ImportError(
+                "CatBoost is required for TRAIN_DIR_MODEL=catboost. Install with `pip install catboost` "
+                "or set TRAIN_DIR_MODEL=xgboost."
+            ) from exc
+        return CatBoostClassifier(
+            iterations=params.get("iterations", params.get("n_estimators", 400)),
+            learning_rate=params.get("learning_rate", 0.05),
+            depth=params.get("depth", params.get("max_depth", 6)),
+            l2_leaf_reg=params.get("l2_leaf_reg", 3.0),
+            loss_function="MultiClass",
+            random_seed=42,
+            verbose=False,
+            allow_writing_files=False,  # keep training side-effect free
+        )
+    raise ValueError(f"Unsupported direction model type: {model_type}")
+
+
 def _load_multiple_dirs(paths: list[Path]) -> pd.DataFrame:
     frames = []
     for p in paths:
@@ -99,7 +149,7 @@ def main():
     #print("Computing features ...")
     df_feat = add_basic_features(df)
     df_feat = add_orderflow_features(df_feat)
-    # Keep rows even if they contain NaNs; HGB can handle missing values.
+    # Keep rows even if they contain NaNs; tree-based models handle missing values.
     X_df, _ = make_feature_matrix(df_feat, drop_na=False)
 
     # Direction label from forward returns with neutral band
@@ -149,8 +199,21 @@ def main():
 
     #print(f"Total samples: {len(y_small)}, features: {x_small.shape[1]}")
 
+    dir_model_type = os.environ.get("TRAIN_DIR_MODEL", "xgboost").strip().lower()
+    n_jobs_env = int(os.environ.get("TRAIN_N_JOBS", "0"))
+    dir_n_jobs = None if n_jobs_env <= 0 else n_jobs_env
+    print(f"Training direction model type: {dir_model_type} (TRAIN_DIR_MODEL)")
+
+    use_label_encoding = dir_model_type == "xgboost"
+    label_encoder = None
+    if use_label_encoding:
+        label_encoder = LabelEncoder()
+        y_dir_enc = pd.Series(label_encoder.fit_transform(y_dir.astype(int)), index=y_dir.index)
+    else:
+        y_dir_enc = y_dir
+
     X_train, X_test, y_train, y_test, ymag_train, ymag_test = train_test_split(
-        x_small, y_dir, y_mag, test_size=0.2, random_state=42, stratify=y_dir
+        x_small, y_dir_enc, y_mag, test_size=0.2, random_state=42, stratify=y_dir_enc
     )
     sample_weight_train = compute_sample_weights(y_train)
     sample_weight_test = compute_sample_weights(y_test)
@@ -163,36 +226,41 @@ def main():
         X_tune, y_tune, test_size=0.2, random_state=42, stratify=y_tune
     )
 
-    candidates = [
-        {"learning_rate": 0.05, "max_depth": 6, "min_samples_leaf": 50},
-        {"learning_rate": 0.1, "max_depth": 6, "min_samples_leaf": 50},
-        {"learning_rate": 0.05, "max_depth": 8, "min_samples_leaf": 30},
-    ]
+    if dir_model_type == "xgboost":
+        candidates = [
+            {"learning_rate": 0.05, "max_depth": 4, "min_child_weight": 1.0, "subsample": 0.9, "colsample_bytree": 0.9, "n_estimators": 300},
+            {"learning_rate": 0.1, "max_depth": 4, "min_child_weight": 1.0, "subsample": 0.9, "colsample_bytree": 0.9, "n_estimators": 300},
+            {"learning_rate": 0.05, "max_depth": 6, "min_child_weight": 1.5, "subsample": 0.8, "colsample_bytree": 0.8, "n_estimators": 400},
+        ]
+    elif dir_model_type == "catboost":
+        candidates = [
+            {"learning_rate": 0.05, "depth": 6, "l2_leaf_reg": 3.0, "iterations": 400},
+            {"learning_rate": 0.1, "depth": 6, "l2_leaf_reg": 5.0, "iterations": 300},
+            {"learning_rate": 0.05, "depth": 8, "l2_leaf_reg": 3.0, "iterations": 500},
+        ]
+    else:
+        raise ValueError(f"TRAIN_DIR_MODEL must be 'xgboost' or 'catboost', got {dir_model_type}")
 
     best = None
     best_f1 = -1.0
     for params in candidates:
-        base = HistGradientBoostingClassifier(
-            max_iter=200,
-            random_state=42,
-            class_weight="balanced",
-            **params,
-        )
-        model = CalibratedClassifierCV(estimator=base, cv=3, method="isotonic")
+        base = _build_direction_estimator(dir_model_type, params, n_jobs=dir_n_jobs)
+        model = CalibratedClassifierCV(estimator=base, cv=3, method="isotonic", n_jobs=dir_n_jobs)
         model.fit(X_train_sub, y_train_sub, sample_weight=compute_sample_weights(y_train_sub))
         val_pred = model.predict(X_val)
         val_f1 = f1_score(y_val, val_pred, average="macro")
-        print(f"Params {params} -> val macro F1: {val_f1:.4f}")
+        print(f"{dir_model_type} params {params} -> val macro F1: {val_f1:.4f}")
         if val_f1 > best_f1:
             best_f1 = val_f1
             best = params
 
-    print(f"Best params: {best} (val macro F1={best_f1:.4f})")
+    if best is None:
+        raise RuntimeError("No direction model hyperparameters were evaluated; check candidates list.")
 
-    dir_base = HistGradientBoostingClassifier(
-        max_iter=300, random_state=42, class_weight="balanced", **best
-    )
-    dir_model = CalibratedClassifierCV(estimator=dir_base, cv=3, method="isotonic")
+    print(f"Best {dir_model_type} params: {best} (val macro F1={best_f1:.4f})")
+
+    dir_base = _build_direction_estimator(dir_model_type, best, n_jobs=dir_n_jobs)
+    dir_model = CalibratedClassifierCV(estimator=dir_base, cv=3, method="isotonic", n_jobs=dir_n_jobs)
     dir_model.fit(X_train, y_train, sample_weight=sample_weight_train)
 
     # Magnitude quantile regressors on realized volatility
@@ -218,16 +286,28 @@ def main():
     mag_p75.fit(X_train, ymag_train)
 
     #print("Evaluating ...")
-    y_pred = dir_model.predict(X_test)
+    y_pred_enc = dir_model.predict(X_test)
     y_proba = dir_model.predict_proba(X_test)
-    classes = dir_model.classes_.astype(float)
+    classes_enc = dir_model.classes_
+    if use_label_encoding and label_encoder is not None:
+        # Map encoded classes/preds back to original labels for reporting and saving.
+        classes = label_encoder.inverse_transform(classes_enc.astype(int)).astype(float)
+        y_pred = label_encoder.inverse_transform(y_pred_enc.astype(int))
+    else:
+        classes = classes_enc.astype(float)
+        y_pred = y_pred_enc
     expected = (y_proba * classes.reshape(1, -1)).sum(axis=1)
     mag_med = np.clip(mag_median.predict(X_test), 0, None)
     mag_hi = np.clip(mag_p75.predict(X_test), 0, None)
     mag_used = np.minimum(mag_hi, mag_med * 2)  # cap median by upper quantile (or 2x median to avoid zero hi)
 
-    print("Classification report:\n", classification_report(y_test, y_pred))
-    print("Confusion matrix:\n", confusion_matrix(y_test, y_pred))
+    if use_label_encoding and label_encoder is not None:
+        y_test_report = label_encoder.inverse_transform(y_test.astype(int))
+    else:
+        y_test_report = y_test
+
+    print("Classification report:\n", classification_report(y_test_report, y_pred))
+    print("Confusion matrix:\n", confusion_matrix(y_test_report, y_pred))
     print("\nPredicted class order:", classes)
     print("Probability preview (first 5 rows):")
     print(y_proba[:5])
@@ -242,9 +322,13 @@ def main():
         artifacts_dir.mkdir(exist_ok=True)
 
         model_path = artifacts_dir / "hgb_combo_model.joblib"
+        label_encoder_classes = label_encoder.classes_.tolist() if label_encoder is not None else None
         joblib.dump(
             {
                 "direction_model": dir_model,
+                "direction_model_type": dir_model_type,
+                "direction_params": best,
+                "direction_label_encoder_classes": label_encoder_classes,
                 "magnitude_median": mag_median,
                 "magnitude_p75": mag_p75,
                 "classes": classes,
