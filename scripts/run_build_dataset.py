@@ -77,11 +77,9 @@ def _extra_headers() -> list[tuple[str, str]] | None:
     """
     Optionally attach an API key/token header for custom pipelines.
     Kraken public WS does not require auth, but we allow Authorization if provided.
-    When env var is absent, prompt interactively to avoid hardcoding secrets.
+    When env var is absent, skip prompting so unattended capture keeps running.
     """
     api_key = os.environ.get("KRAKEN_API_KEY")
-    if not api_key:
-        api_key = input("Enter Kraken API key (leave blank for none): ").strip()
     if not api_key:
         return None
     return [("Authorization", f"Bearer {api_key.strip()}")]
