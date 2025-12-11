@@ -10,6 +10,12 @@ DEFAULT_FEATURE_COLUMNS = [
     "top_bid_depth",
     "top_ask_depth",
     "order_book_imbalance",
+    "depth_bid_top5",
+    "depth_ask_top5",
+    "depth_imbalance_top5",
+    "book_slope_top5",
+    "sweep_cost_buy1",
+    "sweep_cost_sell1",
     "ret_1",
     "ret_5",
     "ret_10",
@@ -20,6 +26,11 @@ DEFAULT_FEATURE_COLUMNS = [
     "cvd_20",
     "volume_trend_20",
     "volume_zscore_20",
+    "vol_regime_score",
+    "risk_adj_momentum_10",
+    "risk_adj_momentum_20",
+    "trend_flip_flag",
+    "price_drawdown_50",
 ]
 
 
@@ -84,6 +95,11 @@ def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
     denom = bid_depth.fillna(0).astype("Float64") + ask_depth.fillna(0).astype("Float64")
     df["order_book_imbalance"] = bid_depth / denom.replace(0, pd.NA)
 
+    # If richer depth metrics are present (from Kraken book), keep them; otherwise set to NA for compatibility.
+    for col in ["depth_bid_top5", "depth_ask_top5", "depth_imbalance_top5", "book_slope_top5", "sweep_cost_buy1", "sweep_cost_sell1"]:
+        if col not in df.columns:
+            df[col] = pd.Series(pd.NA, index=df.index, dtype="Float64")
+
     return df
 
 
@@ -125,6 +141,28 @@ def add_orderflow_features(
         roll_std = volume.groupby(level=0).transform(lambda s: s.rolling(w).std())
         df[f"volume_trend_{w}"] = (volume - roll_mean) / roll_mean.replace(0, np.nan)
         df[f"volume_zscore_{w}"] = (volume - roll_mean) / roll_std.replace(0, np.nan)
+
+    # Volatility regime and risk-adjusted momentum helpers
+    if "volatility_20" in df and "volatility_50" in df:
+        df["vol_regime_score"] = df["volatility_20"] / df["volatility_50"].replace(0, np.nan)
+    else:
+        df["vol_regime_score"] = pd.NA
+
+    if "volatility_20" in df:
+        vol_denom = df["volatility_20"].abs().replace(0, np.nan)
+        df["risk_adj_momentum_10"] = df.get("ret_10") / vol_denom
+        df["risk_adj_momentum_20"] = df.get("ret_20") / vol_denom
+    else:
+        df["risk_adj_momentum_10"] = pd.NA
+        df["risk_adj_momentum_20"] = pd.NA
+
+    # Trend flip indicator: short vs medium horizon return sign disagreement
+    df["trend_flip_flag"] = ((df.get("ret_5") * df.get("ret_20")) < 0).astype("Int64")
+
+    # Rolling price drawdown over a medium window as a stress/regime proxy
+    grouped_price = price.groupby(level=0)
+    roll_max_50 = grouped_price.transform(lambda s: s.rolling(50).max())
+    df["price_drawdown_50"] = (roll_max_50 - price) / roll_max_50.replace(0, np.nan)
 
     return df
 
