@@ -24,6 +24,7 @@ from src.feature_engineering import (
     make_feature_matrix,
 )
 from src.labels import make_labels
+from src.trade_filters import FilterConfig, apply_filters, compute_thresholds
 
 
 def forward_returns(mid: pd.Series, horizon: int = 1) -> pd.Series:
@@ -316,6 +317,17 @@ def main():
     print("Magnitude median preview (first 5 rows):", mag_med[:5])
     print("Magnitude p75 preview (first 5 rows):", mag_hi[:5])
 
+    preds_df = pd.DataFrame(index=X_test.index)
+    preds_df["y_true"] = y_test
+    preds_df["y_pred"] = y_pred
+    preds_df["expected_value_dir"] = expected
+    preds_df["mag_pred_med"] = mag_med
+    preds_df["mag_pred_p75"] = mag_hi
+    preds_df["ev_combined"] = mag_used * (y_proba[:, list(classes).index(1.0)] - y_proba[:, list(classes).index(-1.0)])
+    preds_df["sample_weight"] = sample_weight_test
+    for i, cls in enumerate(classes):
+        preds_df[f"proba_{int(cls)}"] = y_proba[:, i]
+
     save_artifacts = os.environ.get("TRAIN_SAVE_ARTIFACTS", "1").strip().lower() in {"1", "true", "yes", "y"}
     if save_artifacts:
         artifacts_dir = PROJECT_ROOT / "artifacts"
@@ -337,16 +349,6 @@ def main():
             model_path,
         )
 
-        preds_df = pd.DataFrame(index=X_test.index)
-        preds_df["y_true"] = y_test
-        preds_df["y_pred"] = y_pred
-        preds_df["expected_value_dir"] = expected
-        preds_df["mag_pred_med"] = mag_med
-        preds_df["mag_pred_p75"] = mag_hi
-        preds_df["ev_combined"] = mag_used * (y_proba[:, list(classes).index(1.0)] - y_proba[:, list(classes).index(-1.0)])
-        preds_df["sample_weight"] = sample_weight_test
-        for i, cls in enumerate(classes):
-            preds_df[f"proba_{int(cls)}"] = y_proba[:, i]
         preds_path = artifacts_dir / "hgb_test_predictions.csv"
         preds_df.to_csv(preds_path)
 
@@ -354,6 +356,32 @@ def main():
         print(f"Saved test predictions to {preds_path}")
     else:
         print("\nSkipping artifact save (TRAIN_SAVE_ARTIFACTS is falsy).")
+
+    # Post-prediction trading gates preview
+    filter_cfg = FilterConfig.from_env()
+    ev_metric = preds_df["ev_combined"].abs() if filter_cfg.use_abs_ev else preds_df["ev_combined"]
+    ev_cutoff, mag_floor = compute_thresholds(ev_metric, preds_df["mag_pred_p75"], filter_cfg)
+
+    dir_conf = preds_df[[f"proba_{int(1.0)}", f"proba_{int(-1.0)}"]].max(axis=1)
+    preds_df["dir_conf"] = dir_conf
+    preds_df["passes_filters"] = apply_filters(
+        dir_conf=dir_conf,
+        ev_dir=preds_df["expected_value_dir"],
+        ev_combined=preds_df["ev_combined"],
+        mag_p75=preds_df["mag_pred_p75"],
+        ev_cutoff=ev_cutoff,
+        mag_floor=mag_floor,
+        cfg=filter_cfg,
+    )
+    pass_rate = preds_df["passes_filters"].mean()
+    print(
+        "\nTrade filter preview on held-out set:\n"
+        f"  min_dir_conf={filter_cfg.min_dir_conf}, min_ev_dir={filter_cfg.min_ev_dir}, "
+        f"ev_quantile={filter_cfg.ev_quantile}, mag_quantile={filter_cfg.mag_quantile}, "
+        f"mag_min_abs={filter_cfg.mag_min_abs}, use_abs_ev={filter_cfg.use_abs_ev}\n"
+        f"  derived ev_cutoff={ev_cutoff:.6g}, mag_floor={mag_floor:.6g}\n"
+        f"  pass rate: {pass_rate:.2%} ({preds_df['passes_filters'].sum()}/{len(preds_df)})"
+    )
 
 if __name__ == "__main__":
     main()
