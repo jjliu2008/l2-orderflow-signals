@@ -23,12 +23,15 @@ from src.feature_engineering import (
     ensure_multiindex,
     make_feature_matrix,
 )
-from src.labels import make_labels
+from src.labels import make_labels, _future_price_time_based
 from src.trade_filters import FilterConfig, apply_filters, compute_thresholds
 
 
-def forward_returns(mid: pd.Series, horizon: int = 1) -> pd.Series:
-    future = mid.groupby(level=0).shift(-horizon)
+def forward_returns(mid: pd.Series, horizon: int = 1, time_horizon: Optional[pd.Timedelta] = None) -> pd.Series:
+    if time_horizon is not None:
+        future = _future_price_time_based(mid, delta=time_horizon)
+    else:
+        future = mid.groupby(level=0).shift(-horizon)
     return (future - mid) / mid
 
 
@@ -58,6 +61,26 @@ def compute_realized_vol(df: pd.DataFrame, window: int = 20) -> pd.Series:
     log_ret = log_price.groupby(level=0).diff()
     vol = log_ret.groupby(level=0).transform(lambda s: s.rolling(window, min_periods=max(5, window // 2)).std())
     return vol.rename("realized_vol")
+
+
+def _contiguous_sample_per_symbol(df: pd.DataFrame, rows: int | None = None, frac: float | None = None) -> pd.DataFrame:
+    """
+    Take a contiguous head slice per symbol to preserve adjacency.
+    Allocation is proportional to per-symbol counts.
+    """
+    if rows is None and (frac is None or frac <= 0):
+        return df
+    df_sorted = df.sort_values(["Symbol", "Time"])
+    counts = df_sorted["Symbol"].value_counts()
+    total = len(df_sorted)
+    pieces = []
+    for sym, cnt in counts.items():
+        if rows is not None:
+            take = min(cnt, max(1, int(np.ceil(rows * cnt / total))))
+        else:
+            take = min(cnt, max(1, int(np.ceil(cnt * frac))))
+        pieces.append(df_sorted[df_sorted["Symbol"] == sym].head(take))
+    return pd.concat(pieces, ignore_index=True)
 
 
 def _build_direction_estimator(model_type: str, params: dict, n_jobs: Optional[int] = None):
@@ -108,12 +131,12 @@ def _build_direction_estimator(model_type: str, params: dict, n_jobs: Optional[i
     raise ValueError(f"Unsupported direction model type: {model_type}")
 
 
-def _load_multiple_dirs(paths: list[Path]) -> pd.DataFrame:
+def _load_multiple_dirs(paths: list[Path], max_rows_per_file: int | None = None) -> pd.DataFrame:
     frames = []
     for p in paths:
         if p.exists():
             print(f"Loading data from {p} ...")
-            frames.append(load_all_raw_data(p))
+            frames.append(load_all_raw_data(p, max_rows_per_file=max_rows_per_file))
         else:
             print(f"Skipping missing data dir: {p}")
     if not frames:
@@ -140,7 +163,10 @@ def main():
         else [Path(d.strip()) for d in default_dirs.split(",") if d.strip()]
     )
 
-    df = _load_multiple_dirs(dir_list)
+    max_rows_per_file_env = int(os.environ.get("TRAIN_MAX_READ_ROWS_PER_FILE", "0"))
+    max_rows_per_file = max_rows_per_file_env if max_rows_per_file_env > 0 else None
+
+    df = _load_multiple_dirs(dir_list, max_rows_per_file=max_rows_per_file)
     # Drop duplicate Symbol/Time to avoid leaking duplicate samples into training (jsonl files can overlap time ranges).
     if df.index.duplicated().any():
         before = len(df)
@@ -155,7 +181,16 @@ def main():
 
     # Direction label from forward returns with neutral band
     neutral_band = float(os.environ.get("TRAIN_NEUTRAL_BAND", "0.0001"))
-    fwd_ret = forward_returns(df_feat["mid"], horizon=1).rename("fwd_ret")
+    time_horizon_env = os.environ.get("TRAIN_TIME_HORIZON_MS")
+    time_horizon = None
+    if time_horizon_env:
+        try:
+            ms = int(time_horizon_env)
+            if ms > 0:
+                time_horizon = pd.to_timedelta(ms, unit="ms")
+        except ValueError as exc:
+            raise ValueError(f"Invalid TRAIN_TIME_HORIZON_MS={time_horizon_env}") from exc
+    fwd_ret = forward_returns(df_feat["mid"], horizon=1, time_horizon=time_horizon).rename("fwd_ret")
     dir_label = make_dir_label(fwd_ret, neutral_band=neutral_band)
     # Magnitude target: realized volatility over a short window
     vol_window = int(os.environ.get("TRAIN_VOL_WINDOW", "20"))
@@ -171,6 +206,27 @@ def main():
     merged = merged.merge(dir_reset, on=["Symbol", "Time"], how="inner")
     merged = merged.merge(vol_reset, on=["Symbol", "Time"], how="inner")
     merged = merged.dropna(subset=["fwd_ret", "label", "realized_vol"])
+
+    # Optional post-label sampling to preserve label adjacency during fast iterations
+    fast_sample_rows = int(os.environ.get("TRAIN_FAST_SAMPLE_ROWS", "0"))
+    fast_sample_frac = float(os.environ.get("TRAIN_FAST_SAMPLE_FRAC", "0"))
+    fast_contig = os.environ.get("TRAIN_FAST_CONTIGUOUS", "0").strip().lower() in {"1", "true", "yes", "y"}
+    if fast_sample_rows > 0 or (0 < fast_sample_frac < 1):
+        before = len(merged)
+        if fast_contig:
+            merged = _contiguous_sample_per_symbol(
+                merged,
+                rows=fast_sample_rows if fast_sample_rows > 0 else None,
+                frac=fast_sample_frac if fast_sample_frac > 0 else None,
+            )
+            print(f"Fast contiguous sample: rows {before} -> {len(merged)} (TRAIN_FAST_CONTIGUOUS=1)")
+        else:
+            if fast_sample_rows > 0:
+                merged = merged.sample(n=min(fast_sample_rows, before), random_state=42)
+                print(f"Fast sample: rows {before} -> {len(merged)} via TRAIN_FAST_SAMPLE_ROWS={fast_sample_rows}")
+            else:
+                merged = merged.sample(frac=fast_sample_frac, random_state=42)
+                print(f"Fast sample: rows {before} -> {len(merged)} via TRAIN_FAST_SAMPLE_FRAC={fast_sample_frac}")
 
     if merged.empty:
         raise ValueError("No overlapping rows between features and forward returns after merge.")
@@ -328,6 +384,11 @@ def main():
     for i, cls in enumerate(classes):
         preds_df[f"proba_{int(cls)}"] = y_proba[:, i]
 
+    # Add a few regime-related features for downstream filtering/analysis
+    for col in ["spread", "sweep_cost_buy1", "sweep_cost_sell1", "order_book_imbalance", "depth_imbalance_top5"]:
+        if col in X_test.columns:
+            preds_df[col] = X_test[col]
+
     save_artifacts = os.environ.get("TRAIN_SAVE_ARTIFACTS", "1").strip().lower() in {"1", "true", "yes", "y"}
     if save_artifacts:
         artifacts_dir = PROJECT_ROOT / "artifacts"
@@ -382,6 +443,57 @@ def main():
         f"  derived ev_cutoff={ev_cutoff:.6g}, mag_floor={mag_floor:.6g}\n"
         f"  pass rate: {pass_rate:.2%} ({preds_df['passes_filters'].sum()}/{len(preds_df)})"
     )
+
+    if len(preds_df["passes_filters"]) > 0:
+        filt_df = preds_df[preds_df["passes_filters"]]
+        def _ev_summary(df: pd.DataFrame) -> dict:
+            if df.empty:
+                return {"count": 0, "ev_mean": None, "ev_median": None, "ev_p05": None, "ev_p95": None}
+            ev = df["ev_combined"]
+            return {
+                "count": len(df),
+                "ev_mean": ev.mean(),
+                "ev_median": ev.median(),
+                "ev_p05": ev.quantile(0.05),
+                "ev_p95": ev.quantile(0.95),
+                "long_mean": ev[ev > 0].mean() if (ev > 0).any() else None,
+                "short_mean": ev[ev < 0].mean() if (ev < 0).any() else None,
+            }
+        def _fmt(val: float | None) -> str:
+            return "nan" if val is None else f"{val:.6g}"
+        overall_stats = _ev_summary(filt_df)
+        print(
+            "\nFiltered EV stats (post filters only):\n"
+            f"  trades: {overall_stats['count']} of {len(preds_df)} ({pass_rate:.2%})\n"
+            f"  ev_mean={_fmt(overall_stats['ev_mean'])} ev_median={_fmt(overall_stats['ev_median'])} "
+            f"ev_p05={_fmt(overall_stats['ev_p05'])} ev_p95={_fmt(overall_stats['ev_p95'])}\n"
+            f"  long_mean={_fmt(overall_stats['long_mean'])} short_mean={_fmt(overall_stats['short_mean'])}"
+        )
+
+        # Regime splits: tight vs wide spread, low vs high sweep cost magnitude
+        if not filt_df.empty:
+            regimes: dict[str, pd.DataFrame] = {}
+            if "spread" in filt_df:
+                spread_thr = filt_df["spread"].quantile(0.75)
+                regimes["spread_tight"] = filt_df[filt_df["spread"] < spread_thr]
+                regimes["spread_wide"] = filt_df[filt_df["spread"] >= spread_thr]
+            if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(filt_df.columns):
+                sweep_mag = filt_df[["sweep_cost_buy1", "sweep_cost_sell1"]].abs().max(axis=1)
+                sweep_thr = sweep_mag.quantile(0.75)
+                regimes["sweep_low"] = filt_df[sweep_mag < sweep_thr]
+                regimes["sweep_high"] = filt_df[sweep_mag >= sweep_thr]
+
+            if regimes:
+                print("\nFiltered EV by regime buckets:")
+                for name, df_reg in regimes.items():
+                    stats = _ev_summary(df_reg)
+                    if stats["count"] == 0:
+                        continue
+                    print(
+                        f"  {name}: count={stats['count']} "
+                        f"ev_mean={_fmt(stats['ev_mean'])} ev_median={_fmt(stats['ev_median'])} "
+                        f"ev_p05={_fmt(stats['ev_p05'])} ev_p95={_fmt(stats['ev_p95'])}"
+                    )
 
 if __name__ == "__main__":
     main()

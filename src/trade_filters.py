@@ -12,10 +12,10 @@ def _env_bool(env_val: str, default: bool) -> bool:
 @dataclass
 class FilterConfig:
     """Configuration for trading-time filters."""
-    min_dir_conf: float = 0.6
+    min_dir_conf: float = 0.65
     min_ev_dir: float = 0.0
-    ev_quantile: float = 0.9
-    mag_quantile: float = 0.5
+    ev_quantile: float = 0.93
+    mag_quantile: float = 0.65
     mag_min_abs: float = 0.0
     use_abs_ev: bool = True
 

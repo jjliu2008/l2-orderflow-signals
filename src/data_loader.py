@@ -5,8 +5,8 @@ from typing import Iterable, List, Union
 import pandas as pd
 
 
-def _load_csv(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path, parse_dates=["Time"])
+def _load_csv(path: Path, max_rows: int | None = None) -> pd.DataFrame:
+    df = pd.read_csv(path, parse_dates=["Time"], nrows=max_rows)
     df["Symbol"] = path.stem
     return df
 
@@ -268,7 +268,7 @@ def _parse_kraken_message(msg: Iterable, fallback_symbol: str, book_state: dict)
     return rows
 
 
-def _load_jsonl_messages(path: Path) -> pd.DataFrame:
+def _load_jsonl_messages(path: Path, max_rows: int | None = None) -> pd.DataFrame:
     """
     Parse websocket jsonl (Kraken/legacy Coinbase) into tabular form.
     We synthesize minimal columns so feature code can run:
@@ -281,7 +281,7 @@ def _load_jsonl_messages(path: Path) -> pd.DataFrame:
     rows: List[dict] = []
     book_state: dict = {}
     with path.open("r", encoding="utf-8") as f:
-        for line in f:
+        for i, line in enumerate(f):
             line = line.strip()
             if not line:
                 continue
@@ -294,6 +294,8 @@ def _load_jsonl_messages(path: Path) -> pd.DataFrame:
                 rows.extend(_parse_coinbase_message(msg, fallback_symbol=path.stem))
             elif isinstance(msg, list):
                 rows.extend(_parse_kraken_message(msg, fallback_symbol=path.stem, book_state=book_state))
+            if max_rows is not None and max_rows > 0 and i + 1 >= max_rows:
+                break
 
     if not rows:
         return pd.DataFrame()
@@ -301,7 +303,7 @@ def _load_jsonl_messages(path: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def load_all_raw_data(raw_dir: Union[str, Path]) -> pd.DataFrame:
+def load_all_raw_data(raw_dir: Union[str, Path], max_rows_per_file: int | None = None) -> pd.DataFrame:
     """
     Load and combine all CSV or jsonl files in `raw_dir`, adding Symbol from filename when missing.
     Returns a DataFrame indexed by Symbol then Time.
@@ -317,8 +319,8 @@ def load_all_raw_data(raw_dir: Union[str, Path]) -> pd.DataFrame:
         raise FileNotFoundError(f"No CSV or JSONL files found in {raw_path}")
 
     frames: List[pd.DataFrame] = []
-    frames.extend(_load_csv(f) for f in csv_files)
-    frames.extend(_load_jsonl_messages(f) for f in jsonl_files)
+    frames.extend(_load_csv(f, max_rows=max_rows_per_file) for f in csv_files)
+    frames.extend(_load_jsonl_messages(f, max_rows=max_rows_per_file) for f in jsonl_files)
     frames = [f for f in frames if not f.empty]
 
     if not frames:
