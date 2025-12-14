@@ -424,6 +424,16 @@ def main():
     ev_cutoff, mag_floor = compute_thresholds(ev_metric, preds_df["mag_pred_p75"], filter_cfg)
 
     dir_conf = preds_df[[f"proba_{int(1.0)}", f"proba_{int(-1.0)}"]].max(axis=1)
+    sweep_cost_mag = None
+    if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(preds_df.columns):
+        sweep_cost_mag = preds_df[["sweep_cost_buy1", "sweep_cost_sell1"]].abs().max(axis=1)
+    sweep_cutoff = None
+    if sweep_cost_mag is not None:
+        if filter_cfg.sweep_cost_quantile > 0:
+            sweep_cutoff = float(sweep_cost_mag.quantile(filter_cfg.sweep_cost_quantile))
+        elif filter_cfg.min_sweep_cost > 0:
+            sweep_cutoff = filter_cfg.min_sweep_cost
+
     preds_df["dir_conf"] = dir_conf
     preds_df["passes_filters"] = apply_filters(
         dir_conf=dir_conf,
@@ -433,14 +443,21 @@ def main():
         ev_cutoff=ev_cutoff,
         mag_floor=mag_floor,
         cfg=filter_cfg,
+        sweep_cost_mag=sweep_cost_mag if sweep_cutoff is not None else None,
     )
     pass_rate = preds_df["passes_filters"].mean()
+    sweep_cutoff_str = "none"
+    if sweep_cutoff is not None:
+        sweep_cutoff_str = f"{sweep_cutoff:.6g}"
+
     print(
         "\nTrade filter preview on held-out set:\n"
         f"  min_dir_conf={filter_cfg.min_dir_conf}, min_ev_dir={filter_cfg.min_ev_dir}, "
         f"ev_quantile={filter_cfg.ev_quantile}, mag_quantile={filter_cfg.mag_quantile}, "
-        f"mag_min_abs={filter_cfg.mag_min_abs}, use_abs_ev={filter_cfg.use_abs_ev}\n"
-        f"  derived ev_cutoff={ev_cutoff:.6g}, mag_floor={mag_floor:.6g}\n"
+        f"mag_min_abs={filter_cfg.mag_min_abs}, use_abs_ev={filter_cfg.use_abs_ev}, "
+        f"min_sweep_cost={filter_cfg.min_sweep_cost}, sweep_cost_quantile={filter_cfg.sweep_cost_quantile}\n"
+        f"  derived ev_cutoff={ev_cutoff:.6g}, mag_floor={mag_floor:.6g}, "
+        f"sweep_cutoff={sweep_cutoff_str}\n"
         f"  pass rate: {pass_rate:.2%} ({preds_df['passes_filters'].sum()}/{len(preds_df)})"
     )
 

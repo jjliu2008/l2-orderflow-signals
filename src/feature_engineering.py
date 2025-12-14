@@ -164,6 +164,12 @@ def add_orderflow_features(
     roll_max_50 = grouped_price.transform(lambda s: s.rolling(50).max())
     df["price_drawdown_50"] = (roll_max_50 - price) / roll_max_50.replace(0, np.nan)
 
+    # Simple order flow imbalance proxy: change in top-level depth imbalance
+    if "order_book_imbalance" in df:
+        df["ofi_1"] = df["order_book_imbalance"].groupby(level=0).diff()
+    else:
+        df["ofi_1"] = pd.NA
+
     return df
 
 
