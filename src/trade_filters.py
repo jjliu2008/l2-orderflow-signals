@@ -20,6 +20,9 @@ class FilterConfig:
     use_abs_ev: bool = True
     min_sweep_cost: float = 0.0  # minimum sweep cost magnitude required to trade
     sweep_cost_quantile: float = 0.0  # if >0, derive min_sweep_cost from this quantile of sweep cost magnitude
+    regime_sweep_quantile: float = 0.9  # q-threshold to mark fragile regime on sweep
+    regime_depth_imbalance_abs: float = 0.5  # abs threshold for depth_imbalance_top5
+    regime_book_slope_abs: float = 0.002  # abs threshold for book_slope_top5
 
     @classmethod
     def from_env(cls, env=os.environ) -> "FilterConfig":
@@ -32,6 +35,9 @@ class FilterConfig:
             use_abs_ev=_env_bool(env.get("FILTER_USE_ABS_EV"), cls.use_abs_ev),
             min_sweep_cost=float(env.get("FILTER_MIN_SWEEP_COST", cls.min_sweep_cost)),
             sweep_cost_quantile=float(env.get("FILTER_SWEEP_COST_QUANTILE", cls.sweep_cost_quantile)),
+            regime_sweep_quantile=float(env.get("FILTER_REGIME_SWEEP_QUANTILE", cls.regime_sweep_quantile)),
+            regime_depth_imbalance_abs=float(env.get("FILTER_REGIME_DEPTH_IMB_ABS", cls.regime_depth_imbalance_abs)),
+            regime_book_slope_abs=float(env.get("FILTER_REGIME_BOOK_SLOPE_ABS", cls.regime_book_slope_abs)),
         )
 
 

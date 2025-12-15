@@ -385,7 +385,7 @@ def main():
         preds_df[f"proba_{int(cls)}"] = y_proba[:, i]
 
     # Add a few regime-related features for downstream filtering/analysis
-    for col in ["spread", "sweep_cost_buy1", "sweep_cost_sell1", "order_book_imbalance", "depth_imbalance_top5"]:
+    for col in ["spread", "sweep_cost_buy1", "sweep_cost_sell1", "order_book_imbalance", "depth_imbalance_top5", "book_slope_top5"]:
         if col in X_test.columns:
             preds_df[col] = X_test[col]
 
@@ -434,6 +434,19 @@ def main():
         elif filter_cfg.min_sweep_cost > 0:
             sweep_cutoff = filter_cfg.min_sweep_cost
 
+    # Regime classifier: fragile if any of the conditions hold
+    regime = pd.Series("stable", index=preds_df.index, dtype="object")
+    regime_fragile_mask = pd.Series(False, index=preds_df.index)
+    if sweep_cost_mag is not None and filter_cfg.regime_sweep_quantile > 0:
+        sweep_reg_cut = float(sweep_cost_mag.quantile(filter_cfg.regime_sweep_quantile))
+        regime_fragile_mask |= sweep_cost_mag >= sweep_reg_cut
+    if "depth_imbalance_top5" in preds_df:
+        regime_fragile_mask |= preds_df["depth_imbalance_top5"].abs() >= filter_cfg.regime_depth_imbalance_abs
+    if "book_slope_top5" in preds_df:
+        regime_fragile_mask |= preds_df["book_slope_top5"].abs() >= filter_cfg.regime_book_slope_abs
+    regime.loc[regime_fragile_mask] = "fragile"
+    preds_df["regime"] = regime
+
     preds_df["dir_conf"] = dir_conf
     preds_df["passes_filters"] = apply_filters(
         dir_conf=dir_conf,
@@ -445,6 +458,8 @@ def main():
         cfg=filter_cfg,
         sweep_cost_mag=sweep_cost_mag if sweep_cutoff is not None else None,
     )
+    # Only allow trades in fragile regime
+    preds_df["passes_filters"] &= preds_df["regime"] == "fragile"
     pass_rate = preds_df["passes_filters"].mean()
     sweep_cutoff_str = "none"
     if sweep_cutoff is not None:
@@ -499,6 +514,9 @@ def main():
                 sweep_thr = sweep_mag.quantile(0.75)
                 regimes["sweep_low"] = filt_df[sweep_mag < sweep_thr]
                 regimes["sweep_high"] = filt_df[sweep_mag >= sweep_thr]
+            if "regime" in filt_df:
+                regimes["regime_fragile"] = filt_df[filt_df["regime"] == "fragile"]
+                regimes["regime_stable"] = filt_df[filt_df["regime"] == "stable"]
 
             if regimes:
                 print("\nFiltered EV by regime buckets:")
