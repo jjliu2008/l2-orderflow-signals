@@ -63,6 +63,48 @@ def compute_realized_vol(df: pd.DataFrame, window: int = 20) -> pd.Series:
     return vol.rename("realized_vol")
 
 
+def compute_expected_range(mid: pd.Series, horizon: int = 2) -> pd.Series:
+    """
+    Expected price range over the next `horizon` steps: (future_max - future_min) / current_mid.
+    Uses a forward-looking rolling window per symbol. Horizon should be >=2 to capture a true range.
+    """
+    if horizon < 2:
+        horizon = 2
+
+    def _fwd_range(s: pd.Series) -> pd.Series:
+        fwd = s.shift(-1)
+        fwd_max = fwd.rolling(horizon, min_periods=horizon).max()
+        fwd_min = fwd.rolling(horizon, min_periods=horizon).min()
+        return (fwd_max - fwd_min) / s
+
+    return mid.groupby(level=0).transform(_fwd_range).rename("expected_range")
+
+
+def compute_regime_flags(df: pd.DataFrame, cfg: FilterConfig) -> tuple[pd.Series, float | None]:
+    """
+    Classify regimes (fragile/stable) based on sweep cost and book/depth features.
+    Returns (regime_series, sweep_reg_cutoff).
+    """
+    sweep_mag = None
+    if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(df.columns):
+        sweep_mag = df[["sweep_cost_buy1", "sweep_cost_sell1"]].abs().max(axis=1)
+    sweep_reg_cut = None
+    if sweep_mag is not None and cfg.regime_sweep_quantile > 0:
+        sweep_reg_cut = float(sweep_mag.quantile(cfg.regime_sweep_quantile))
+
+    regime_fragile = pd.Series(False, index=df.index)
+    if sweep_mag is not None and sweep_reg_cut is not None:
+        regime_fragile |= sweep_mag >= sweep_reg_cut
+    if "depth_imbalance_top5" in df:
+        regime_fragile |= df["depth_imbalance_top5"].abs() >= cfg.regime_depth_imbalance_abs
+    if "book_slope_top5" in df:
+        regime_fragile |= df["book_slope_top5"].abs() >= cfg.regime_book_slope_abs
+
+    regime = pd.Series("stable", index=df.index, dtype="object")
+    regime.loc[regime_fragile] = "fragile"
+    return regime, sweep_reg_cut
+
+
 def _contiguous_sample_per_symbol(df: pd.DataFrame, rows: int | None = None, frac: float | None = None) -> pd.DataFrame:
     """
     Take a contiguous head slice per symbol to preserve adjacency.
@@ -190,22 +232,50 @@ def main():
                 time_horizon = pd.to_timedelta(ms, unit="ms")
         except ValueError as exc:
             raise ValueError(f"Invalid TRAIN_TIME_HORIZON_MS={time_horizon_env}") from exc
-    fwd_ret = forward_returns(df_feat["mid"], horizon=1, time_horizon=time_horizon).rename("fwd_ret")
+    dir_horizon = 1
+    fwd_ret = forward_returns(df_feat["mid"], horizon=dir_horizon, time_horizon=time_horizon).rename("fwd_ret")
     dir_label = make_dir_label(fwd_ret, neutral_band=neutral_band)
-    # Magnitude target: realized volatility over a short window
+
+    # Magnitude targets
     vol_window = int(os.environ.get("TRAIN_VOL_WINDOW", "20"))
     realized_vol = compute_realized_vol(df_feat, window=vol_window)
+    # Expected range over the same tick horizon as direction label
+    range_horizon_env = int(os.environ.get("TRAIN_RANGE_HORIZON", "0"))
+    range_horizon = max(range_horizon_env, dir_horizon + 1, 2)
+    expected_range = compute_expected_range(df_feat["mid"], horizon=range_horizon)
+    mag_target_choice = os.environ.get("TRAIN_MAG_TARGET", "range").strip().lower()
+
+    sweep_cost_mag_feat = None
+    if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(df_feat.columns):
+        sweep_cost_mag_feat = df_feat[["sweep_cost_buy1", "sweep_cost_sell1"]].abs().max(axis=1)
+
+    if mag_target_choice == "range":
+        mag_target_series = expected_range.abs()
+        mag_target_name = "expected_range"
+    elif mag_target_choice in {"impact", "range_x_sweep"}:
+        if sweep_cost_mag_feat is None:
+            raise ValueError("TRAIN_MAG_TARGET=impact requires sweep_cost_* features present.")
+        mag_target_series = (expected_range.abs() * sweep_cost_mag_feat).rename("expected_range_x_sweep")
+        mag_target_name = "expected_range_x_sweep"
+    else:
+        mag_target_series = realized_vol.abs()
+        mag_target_name = "realized_vol"
 
     # Align features, direction label, and magnitude
     X_reset = X_df.reset_index()
     fwd_reset = fwd_ret.reset_index()
     dir_reset = dir_label.reset_index()
-    vol_reset = realized_vol.reset_index()
+    mag_reset = mag_target_series.reset_index()
 
     merged = X_reset.merge(fwd_reset, on=["Symbol", "Time"], how="inner")
     merged = merged.merge(dir_reset, on=["Symbol", "Time"], how="inner")
-    merged = merged.merge(vol_reset, on=["Symbol", "Time"], how="inner")
-    merged = merged.dropna(subset=["fwd_ret", "label", "realized_vol"])
+    merged = merged.merge(mag_reset, on=["Symbol", "Time"], how="inner")
+    merged = merged.dropna(subset=["fwd_ret", "label", mag_target_name])
+
+    # Regime flags (fragile/stable) for magnitude per-regime models
+    filter_cfg = FilterConfig.from_env()
+    regime_series, sweep_reg_cut = compute_regime_flags(merged, filter_cfg)
+    merged["regime"] = regime_series
 
     # Optional post-label sampling to preserve label adjacency during fast iterations
     fast_sample_rows = int(os.environ.get("TRAIN_FAST_SAMPLE_ROWS", "0"))
@@ -231,10 +301,11 @@ def main():
     if merged.empty:
         raise ValueError("No overlapping rows between features and forward returns after merge.")
 
-    feature_cols = [c for c in merged.columns if c not in {"Symbol", "Time", "label", "fwd_ret"}]
+    feature_cols = [c for c in merged.columns if c not in {"Symbol", "Time", "label", "fwd_ret", "regime", mag_target_name}]
     x_small = merged[feature_cols]
     y_dir = merged["label"]
-    y_mag = merged["realized_vol"].abs()
+    y_mag = merged[mag_target_name].abs()
+    regimes_all = merged["regime"]
 
     # Default cap to keep runs lightweight; override with TRAIN_MAX_ROWS=0 to disable.
     max_rows = int(os.environ.get("TRAIN_MAX_ROWS", "50000"))
@@ -272,6 +343,8 @@ def main():
     X_train, X_test, y_train, y_test, ymag_train, ymag_test = train_test_split(
         x_small, y_dir_enc, y_mag, test_size=0.2, random_state=42, stratify=y_dir_enc
     )
+    regime_train = regimes_all.loc[X_train.index]
+    regime_test = regimes_all.loc[X_test.index]
     sample_weight_train = compute_sample_weights(y_train)
     sample_weight_test = compute_sample_weights(y_test)
 
@@ -320,27 +393,50 @@ def main():
     dir_model = CalibratedClassifierCV(estimator=dir_base, cv=3, method="isotonic", n_jobs=dir_n_jobs)
     dir_model.fit(X_train, y_train, sample_weight=sample_weight_train)
 
-    # Magnitude quantile regressors on realized volatility
-    mag_median = HistGradientBoostingRegressor(
-        loss="quantile",
-        quantile=0.5,
-        max_iter=300,
-        learning_rate=0.05,
-        max_depth=6,
-        min_samples_leaf=30,
-        random_state=42,
-    )
-    mag_p75 = HistGradientBoostingRegressor(
-        loss="quantile",
-        quantile=0.75,
-        max_iter=300,
-        learning_rate=0.05,
-        max_depth=6,
-        min_samples_leaf=30,
-        random_state=42,
-    )
-    mag_median.fit(X_train, ymag_train)
-    mag_p75.fit(X_train, ymag_train)
+    # Magnitude quantile regressors on realized volatility, trained per regime
+    def _fit_mag_models(X: pd.DataFrame, y: pd.Series) -> tuple:
+        mag_median = HistGradientBoostingRegressor(
+            loss="quantile",
+            quantile=0.5,
+            max_iter=300,
+            learning_rate=0.05,
+            max_depth=6,
+            min_samples_leaf=30,
+            random_state=42,
+        )
+        mag_p75 = HistGradientBoostingRegressor(
+            loss="quantile",
+            quantile=0.75,
+            max_iter=300,
+            learning_rate=0.05,
+            max_depth=6,
+            min_samples_leaf=30,
+            random_state=42,
+        )
+        mag_median.fit(X, y)
+        mag_p75.fit(X, y)
+        return mag_median, mag_p75
+
+    mag_models: dict[str, tuple] = {}
+    for regime_name in regime_train.unique():
+        mask = regime_train == regime_name
+        mag_models[regime_name] = _fit_mag_models(X_train[mask], ymag_train[mask])
+
+    # Predict magnitudes per regime
+    mag_med_pred = pd.Series(index=X_test.index, dtype=float)
+    mag_p75_pred = pd.Series(index=X_test.index, dtype=float)
+    for regime_name, (mm, mp) in mag_models.items():
+        mask = regime_test == regime_name
+        if mask.any():
+            mag_med_pred.loc[mask] = mm.predict(X_test[mask])
+            mag_p75_pred.loc[mask] = mp.predict(X_test[mask])
+    # Fallback if any missing
+    if mag_med_pred.isna().any():
+        default_regime = "fragile" if "fragile" in mag_models else list(mag_models.keys())[0]
+        mm_def, mp_def = mag_models[default_regime]
+        missing = mag_med_pred.isna()
+        mag_med_pred.loc[missing] = mm_def.predict(X_test[missing])
+        mag_p75_pred.loc[missing] = mp_def.predict(X_test[missing])
 
     #print("Evaluating ...")
     y_pred_enc = dir_model.predict(X_test)
@@ -354,8 +450,8 @@ def main():
         classes = classes_enc.astype(float)
         y_pred = y_pred_enc
     expected = (y_proba * classes.reshape(1, -1)).sum(axis=1)
-    mag_med = np.clip(mag_median.predict(X_test), 0, None)
-    mag_hi = np.clip(mag_p75.predict(X_test), 0, None)
+    mag_med = np.clip(mag_med_pred.to_numpy(), 0, None)
+    mag_hi = np.clip(mag_p75_pred.to_numpy(), 0, None)
     mag_used = np.minimum(mag_hi, mag_med * 2)  # cap median by upper quantile (or 2x median to avoid zero hi)
 
     if use_label_encoding and label_encoder is not None:
@@ -402,8 +498,8 @@ def main():
                 "direction_model_type": dir_model_type,
                 "direction_params": best,
                 "direction_label_encoder_classes": label_encoder_classes,
-                "magnitude_median": mag_median,
-                "magnitude_p75": mag_p75,
+                "magnitude_models": mag_models,
+                "magnitude_target": mag_target_name,
                 "classes": classes,
                 "feature_cols": feature_cols,
             },
