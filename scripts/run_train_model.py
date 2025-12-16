@@ -243,7 +243,7 @@ def main():
     range_horizon_env = int(os.environ.get("TRAIN_RANGE_HORIZON", "0"))
     range_horizon = max(range_horizon_env, dir_horizon + 1, 2)
     expected_range = compute_expected_range(df_feat["mid"], horizon=range_horizon)
-    mag_target_choice = os.environ.get("TRAIN_MAG_TARGET", "impact").strip().lower()
+    mag_target_choice = os.environ.get("TRAIN_MAG_TARGET", "range").strip().lower()
 
     sweep_cost_mag_feat = None
     if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(df_feat.columns):
@@ -363,6 +363,11 @@ def main():
     regime_test = regimes_all.loc[X_test.index]
     sweep_high_train = sweep_high_all.loc[X_train.index] if "sweep_high" in merged else pd.Series(False, index=X_train.index)
     sweep_high_test = sweep_high_all.loc[X_test.index] if "sweep_high" in merged else pd.Series(False, index=X_test.index)
+
+    # Sweep-high counts for awareness
+    sweep_train_counts = sweep_high_train.value_counts(dropna=False).to_dict()
+    sweep_test_counts = sweep_high_test.value_counts(dropna=False).to_dict()
+    print(f"Sweep_high counts -> train: {sweep_train_counts}, test: {sweep_test_counts}")
     sample_weight_train = compute_sample_weights(y_train)
     sample_weight_test = compute_sample_weights(y_test)
 
@@ -492,6 +497,8 @@ def main():
     preds_df["sample_weight"] = sample_weight_test
     for i, cls in enumerate(classes):
         preds_df[f"proba_{int(cls)}"] = y_proba[:, i]
+    # Carry sweep_high flag from the split for analysis/gating
+    preds_df["sweep_high"] = sweep_high_test.reindex(X_test.index).fillna(False) if "sweep_high" in merged else False
 
     # Add a few regime-related features for downstream filtering/analysis
     for col in ["spread", "sweep_cost_buy1", "sweep_cost_sell1", "order_book_imbalance", "depth_imbalance_top5", "book_slope_top5"]:
@@ -544,7 +551,7 @@ def main():
             sweep_cutoff = filter_cfg.min_sweep_cost
     if sweep_cost_mag is not None:
         preds_df["sweep_high"] = sweep_cost_mag >= (sweep_cutoff if sweep_cutoff is not None else 0)
-    else:
+    elif "sweep_high" not in preds_df.columns:
         preds_df["sweep_high"] = False
 
     # Regime classifier: fragile if any of the conditions hold
@@ -576,6 +583,12 @@ def main():
     if "sweep_high" in preds_df.columns:
         preds_df["passes_filters"] &= preds_df["sweep_high"]
     pass_rate = preds_df["passes_filters"].mean()
+    sweep_high_total = preds_df["sweep_high"].sum() if "sweep_high" in preds_df else 0
+    pass_rate_high = (
+        preds_df.loc[preds_df["sweep_high"], "passes_filters"].mean()
+        if "sweep_high" in preds_df and sweep_high_total > 0
+        else 0.0
+    )
     sweep_cutoff_str = "none"
     if sweep_cutoff is not None:
         sweep_cutoff_str = f"{sweep_cutoff:.6g}"
@@ -588,7 +601,8 @@ def main():
         f"min_sweep_cost={filter_cfg.min_sweep_cost}, sweep_cost_quantile={filter_cfg.sweep_cost_quantile}\n"
         f"  derived ev_cutoff={ev_cutoff:.6g}, mag_floor={mag_floor:.6g}, "
         f"sweep_cutoff={sweep_cutoff_str}\n"
-        f"  pass rate: {pass_rate:.2%} ({preds_df['passes_filters'].sum()}/{len(preds_df)})"
+        f"  pass rate (all): {pass_rate:.2%} ({preds_df['passes_filters'].sum()}/{len(preds_df)}), "
+        f"pass rate (sweep_high): {pass_rate_high:.2%} ({preds_df.loc[preds_df['sweep_high'], 'passes_filters'].sum() if 'sweep_high' in preds_df else 0}/{sweep_high_total})"
     )
 
     if len(preds_df["passes_filters"]) > 0:
@@ -616,6 +630,25 @@ def main():
             f"ev_p05={_fmt(overall_stats['ev_p05'])} ev_p95={_fmt(overall_stats['ev_p95'])}\n"
             f"  long_mean={_fmt(overall_stats['long_mean'])} short_mean={_fmt(overall_stats['short_mean'])}"
         )
+        if "sweep_high" in filt_df:
+            filt_high = filt_df[filt_df["sweep_high"]]
+            if not filt_high.empty:
+                stats_high = _ev_summary(filt_high)
+                print(
+                    "  (sweep_high) trades: {cnt} of {total}, ev_mean={evm}, ev_median={evmed}, ev_p05={p05}, ev_p95={p95}".format(
+                        cnt=stats_high["count"],
+                        total=sweep_high_total,
+                        evm=_fmt(stats_high["ev_mean"]),
+                        evmed=_fmt(stats_high["ev_median"]),
+                        p05=_fmt(stats_high["ev_p05"]),
+                        p95=_fmt(stats_high["ev_p95"]),
+                    )
+                )
+        # Magnitude stats on sweep_high rows for visibility
+        if "sweep_high" in preds_df and preds_df["sweep_high"].any():
+            mag_high = preds_df.loc[preds_df["sweep_high"], ["mag_pred_med", "mag_pred_p75"]]
+            print("\nMagnitude stats (sweep_high rows only):")
+            print(mag_high.describe())
 
         # Regime splits: tight vs wide spread, low vs high sweep cost magnitude
         if not filt_df.empty:
