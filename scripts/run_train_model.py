@@ -243,7 +243,7 @@ def main():
     range_horizon_env = int(os.environ.get("TRAIN_RANGE_HORIZON", "0"))
     range_horizon = max(range_horizon_env, dir_horizon + 1, 2)
     expected_range = compute_expected_range(df_feat["mid"], horizon=range_horizon)
-    mag_target_choice = os.environ.get("TRAIN_MAG_TARGET", "range").strip().lower()
+    mag_target_choice = os.environ.get("TRAIN_MAG_TARGET", "impact").strip().lower()
 
     sweep_cost_mag_feat = None
     if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(df_feat.columns):
@@ -277,6 +277,21 @@ def main():
     regime_series, sweep_reg_cut = compute_regime_flags(merged, filter_cfg)
     merged["regime"] = regime_series
 
+    # Sweep-high flag for magnitude modeling and gating
+    sweep_cutoff_train = None
+    if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(merged.columns):
+        sweep_mag_train = merged[["sweep_cost_buy1", "sweep_cost_sell1"]].abs().max(axis=1)
+        if filter_cfg.sweep_cost_quantile > 0:
+            sweep_cutoff_train = float(sweep_mag_train.quantile(filter_cfg.sweep_cost_quantile))
+        elif filter_cfg.min_sweep_cost > 0:
+            sweep_cutoff_train = filter_cfg.min_sweep_cost
+        if sweep_cutoff_train is not None:
+            merged["sweep_high"] = sweep_mag_train >= sweep_cutoff_train
+        else:
+            merged["sweep_high"] = False
+    else:
+        merged["sweep_high"] = False
+
     # Optional post-label sampling to preserve label adjacency during fast iterations
     fast_sample_rows = int(os.environ.get("TRAIN_FAST_SAMPLE_ROWS", "0"))
     fast_sample_frac = float(os.environ.get("TRAIN_FAST_SAMPLE_FRAC", "0"))
@@ -301,11 +316,12 @@ def main():
     if merged.empty:
         raise ValueError("No overlapping rows between features and forward returns after merge.")
 
-    feature_cols = [c for c in merged.columns if c not in {"Symbol", "Time", "label", "fwd_ret", "regime", mag_target_name}]
+    feature_cols = [c for c in merged.columns if c not in {"Symbol", "Time", "label", "fwd_ret", "regime", "sweep_high", mag_target_name}]
     x_small = merged[feature_cols]
     y_dir = merged["label"]
     y_mag = merged[mag_target_name].abs()
     regimes_all = merged["regime"]
+    sweep_high_all = merged["sweep_high"]
 
     # Default cap to keep runs lightweight; override with TRAIN_MAX_ROWS=0 to disable.
     max_rows = int(os.environ.get("TRAIN_MAX_ROWS", "50000"))
@@ -345,6 +361,8 @@ def main():
     )
     regime_train = regimes_all.loc[X_train.index]
     regime_test = regimes_all.loc[X_test.index]
+    sweep_high_train = sweep_high_all.loc[X_train.index] if "sweep_high" in merged else pd.Series(False, index=X_train.index)
+    sweep_high_test = sweep_high_all.loc[X_test.index] if "sweep_high" in merged else pd.Series(False, index=X_test.index)
     sample_weight_train = compute_sample_weights(y_train)
     sample_weight_test = compute_sample_weights(y_test)
 
@@ -418,25 +436,20 @@ def main():
         return mag_median, mag_p75
 
     mag_models: dict[str, tuple] = {}
+    # Train only on sweep_high samples; skip training if no data
     for regime_name in regime_train.unique():
-        mask = regime_train == regime_name
-        mag_models[regime_name] = _fit_mag_models(X_train[mask], ymag_train[mask])
+        mask = (regime_train == regime_name) & (sweep_high_train if isinstance(sweep_high_train, pd.Series) else False)
+        if mask.any():
+            mag_models[regime_name] = _fit_mag_models(X_train[mask], ymag_train[mask])
 
-    # Predict magnitudes per regime
-    mag_med_pred = pd.Series(index=X_test.index, dtype=float)
-    mag_p75_pred = pd.Series(index=X_test.index, dtype=float)
+    # Predict magnitudes only when sweep_high; else zero (don't trade)
+    mag_med_pred = pd.Series(0.0, index=X_test.index, dtype=float)
+    mag_p75_pred = pd.Series(0.0, index=X_test.index, dtype=float)
     for regime_name, (mm, mp) in mag_models.items():
-        mask = regime_test == regime_name
+        mask = (regime_test == regime_name) & (sweep_high_test if isinstance(sweep_high_test, pd.Series) else False)
         if mask.any():
             mag_med_pred.loc[mask] = mm.predict(X_test[mask])
             mag_p75_pred.loc[mask] = mp.predict(X_test[mask])
-    # Fallback if any missing
-    if mag_med_pred.isna().any():
-        default_regime = "fragile" if "fragile" in mag_models else list(mag_models.keys())[0]
-        mm_def, mp_def = mag_models[default_regime]
-        missing = mag_med_pred.isna()
-        mag_med_pred.loc[missing] = mm_def.predict(X_test[missing])
-        mag_p75_pred.loc[missing] = mp_def.predict(X_test[missing])
 
     #print("Evaluating ...")
     y_pred_enc = dir_model.predict(X_test)
@@ -521,14 +534,18 @@ def main():
 
     dir_conf = preds_df[[f"proba_{int(1.0)}", f"proba_{int(-1.0)}"]].max(axis=1)
     sweep_cost_mag = None
+    sweep_cutoff = sweep_cutoff_train  # reuse training cutoff if available
     if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(preds_df.columns):
         sweep_cost_mag = preds_df[["sweep_cost_buy1", "sweep_cost_sell1"]].abs().max(axis=1)
-    sweep_cutoff = None
-    if sweep_cost_mag is not None:
+    if sweep_cost_mag is not None and sweep_cutoff is None:
         if filter_cfg.sweep_cost_quantile > 0:
             sweep_cutoff = float(sweep_cost_mag.quantile(filter_cfg.sweep_cost_quantile))
         elif filter_cfg.min_sweep_cost > 0:
             sweep_cutoff = filter_cfg.min_sweep_cost
+    if sweep_cost_mag is not None:
+        preds_df["sweep_high"] = sweep_cost_mag >= (sweep_cutoff if sweep_cutoff is not None else 0)
+    else:
+        preds_df["sweep_high"] = False
 
     # Regime classifier: fragile if any of the conditions hold
     regime = pd.Series("stable", index=preds_df.index, dtype="object")
@@ -554,8 +571,10 @@ def main():
         cfg=filter_cfg,
         sweep_cost_mag=sweep_cost_mag if sweep_cutoff is not None else None,
     )
-    # Only allow trades in fragile regime
-    preds_df["passes_filters"] &= preds_df["regime"] == "fragile"
+    # Only allow trades in fragile regime and sweep_high
+    preds_df["passes_filters"] &= (preds_df["regime"] == "fragile")
+    if "sweep_high" in preds_df.columns:
+        preds_df["passes_filters"] &= preds_df["sweep_high"]
     pass_rate = preds_df["passes_filters"].mean()
     sweep_cutoff_str = "none"
     if sweep_cutoff is not None:
