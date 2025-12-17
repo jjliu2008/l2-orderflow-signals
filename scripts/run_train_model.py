@@ -494,6 +494,16 @@ def main():
     preds_df["mag_pred_med"] = mag_med
     preds_df["mag_pred_p75"] = mag_hi
     preds_df["ev_combined"] = mag_used * (y_proba[:, list(classes).index(1.0)] - y_proba[:, list(classes).index(-1.0)])
+    # Cost proxy: half-spread + sweep cost magnitude (if available)
+    cost_proxy = pd.Series(0.0, index=preds_df.index)
+    if "spread" in preds_df:
+        cost_proxy += preds_df["spread"] / 2
+    # compute sweep_cost_mag for preds_df if not already available
+    sweep_cost_mag = None
+    if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(preds_df.columns):
+        sweep_cost_mag = preds_df[["sweep_cost_buy1", "sweep_cost_sell1"]].abs().max(axis=1)
+        cost_proxy += sweep_cost_mag
+    preds_df["ev_net"] = preds_df["ev_combined"] - cost_proxy
     preds_df["sample_weight"] = sample_weight_test
     for i, cls in enumerate(classes):
         preds_df[f"proba_{int(cls)}"] = y_proba[:, i]
@@ -537,13 +547,21 @@ def main():
     # Post-prediction trading gates preview
     filter_cfg = FilterConfig.from_env()
     ev_metric = preds_df["ev_combined"].abs() if filter_cfg.use_abs_ev else preds_df["ev_combined"]
-    ev_cutoff, mag_floor = compute_thresholds(ev_metric, preds_df["mag_pred_p75"], filter_cfg)
+    # Compute thresholds only on sweep_high with non-zero magnitude to avoid dilution by zero-magnitude rows
+    ev_metric_subset = ev_metric
+    mag_p75_subset = preds_df["mag_pred_p75"]
+    if "sweep_high" in preds_df:
+        mask_thresh = preds_df["sweep_high"] & (preds_df["mag_pred_p75"] > 0)
+        if mask_thresh.any():
+            ev_metric_subset = ev_metric[mask_thresh]
+            mag_p75_subset = preds_df.loc[mask_thresh, "mag_pred_p75"]
+    ev_cutoff, mag_floor = compute_thresholds(ev_metric_subset, mag_p75_subset, filter_cfg)
 
     dir_conf = preds_df[[f"proba_{int(1.0)}", f"proba_{int(-1.0)}"]].max(axis=1)
-    sweep_cost_mag = None
     sweep_cutoff = sweep_cutoff_train  # reuse training cutoff if available
-    if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(preds_df.columns):
-        sweep_cost_mag = preds_df[["sweep_cost_buy1", "sweep_cost_sell1"]].abs().max(axis=1)
+    if sweep_cost_mag is None:
+        if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(preds_df.columns):
+            sweep_cost_mag = preds_df[["sweep_cost_buy1", "sweep_cost_sell1"]].abs().max(axis=1)
     if sweep_cost_mag is not None and sweep_cutoff is None:
         if filter_cfg.sweep_cost_quantile > 0:
             sweep_cutoff = float(sweep_cost_mag.quantile(filter_cfg.sweep_cost_quantile))
@@ -577,6 +595,7 @@ def main():
         mag_floor=mag_floor,
         cfg=filter_cfg,
         sweep_cost_mag=sweep_cost_mag if sweep_cutoff is not None else None,
+        ev_net=preds_df["ev_net"],
     )
     # Only allow trades in fragile regime and sweep_high
     preds_df["passes_filters"] &= (preds_df["regime"] == "fragile")
@@ -630,6 +649,16 @@ def main():
             f"ev_p05={_fmt(overall_stats['ev_p05'])} ev_p95={_fmt(overall_stats['ev_p95'])}\n"
             f"  long_mean={_fmt(overall_stats['long_mean'])} short_mean={_fmt(overall_stats['short_mean'])}"
         )
+        if "ev_net" in filt_df:
+            ev_net = filt_df["ev_net"]
+            print(
+                "  ev_net mean={mn} median={md} p05={p05} p95={p95}".format(
+                    mn=_fmt(ev_net.mean()),
+                    md=_fmt(ev_net.median()),
+                    p05=_fmt(ev_net.quantile(0.05)),
+                    p95=_fmt(ev_net.quantile(0.95)),
+                )
+            )
         if "sweep_high" in filt_df:
             filt_high = filt_df[filt_df["sweep_high"]]
             if not filt_high.empty:

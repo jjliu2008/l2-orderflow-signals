@@ -62,6 +62,7 @@ def apply_filters(
     mag_floor: float,
     cfg: FilterConfig,
     sweep_cost_mag: pd.Series | None = None,
+    ev_net: pd.Series | None = None,
 ) -> pd.Series:
     """Return a boolean mask indicating which rows pass all trading gates."""
     ev_metric = ev_combined.abs() if cfg.use_abs_ev else ev_combined
@@ -77,4 +78,6 @@ def apply_filters(
             cutoff = float(sweep_cost_mag.quantile(cfg.sweep_cost_quantile))
         if cutoff > 0:
             passes &= (sweep_cost_mag >= cutoff)
+    if ev_net is not None:
+        passes &= ev_net > 0
     return passes
