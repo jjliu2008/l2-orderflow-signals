@@ -1,1 +1,5 @@
 *.cvs filter=lfs diff=lfs merge=lfs -text
+artifacts/*.csv filter=lfs diff=lfs merge=lfs -text
+artifacts/*.joblib filter=lfs diff=lfs merge=lfs -text
+artifacts/*.html filter=lfs diff=lfs merge=lfs -text
+artifacts/*.png filter=lfs diff=lfs merge=lfs -text
