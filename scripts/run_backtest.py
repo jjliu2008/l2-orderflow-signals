@@ -54,8 +54,8 @@ def main():
     long_thr = float(os.environ.get("BT_LONG_THRESHOLD", "0.1"))
     short_thr = float(os.environ.get("BT_SHORT_THRESHOLD", "-0.1"))
     conf_min = float(os.environ.get("BT_CONF_MIN", "0.0"))  # min abs(p_up - p_down)
-    fee_bps = float(os.environ.get("BT_FEE_BPS", "0.0"))  # fee per trade (entry/flip), in bps
-    slippage_bps = float(os.environ.get("BT_SLIPPAGE_BPS", "0.0"))  # slippage per trade, in bps
+    fee_bps = float(os.environ.get("BT_FEE_BPS", "2.0"))  # fee per trade (entry/flip), in bps
+    slippage_bps = float(os.environ.get("BT_SLIPPAGE_BPS", "1.0"))  # slippage per trade, in bps
     latency_ticks = int(os.environ.get("BT_LATENCY_TICKS", "0"))  # delay execution by N ticks
     horizon = int(os.environ.get("BT_HORIZON", "1"))
     save_artifacts = os.environ.get("BACKTEST_SAVE", "1").strip().lower() in {"1", "true", "yes", "y"}
