@@ -55,13 +55,19 @@ def main():
     short_thr = float(os.environ.get("BT_SHORT_THRESHOLD", "-0.1"))
     conf_min = float(os.environ.get("BT_CONF_MIN", "0.0"))  # min abs(p_up - p_down)
     fee_bps = float(os.environ.get("BT_FEE_BPS", "2.0"))  # fee per trade (entry/flip), in bps
-    slippage_bps = float(os.environ.get("BT_SLIPPAGE_BPS", "1.0"))  # slippage per trade, in bps
+    slippage_bps = float(os.environ.get("BT_SLIPPAGE_BPS", "6.0"))  # slippage per trade, in bps
     latency_ticks = int(os.environ.get("BT_LATENCY_TICKS", "0"))  # delay execution by N ticks
     horizon = int(os.environ.get("BT_HORIZON", "1"))
-    save_artifacts = os.environ.get("BACKTEST_SAVE", "1").strip().lower() in {"1", "true", "yes", "y"}
+    save_artifacts = os.environ.get("BACKTEST_SAVE", "0").strip().lower() in {"1", "true", "yes", "y"}
+    max_rows_per_file = int(os.environ.get("BT_MAX_READ_ROWS_PER_FILE", "0"))
+    max_rows_total = int(os.environ.get("BT_MAX_ROWS", "0"))
+    use_selector = os.environ.get("BT_USE_SELECTOR", "1").strip().lower() in {"1", "true", "yes", "y"}
+    selector_path = Path(os.environ.get("SELECTOR_SCORES_PATH", PROJECT_ROOT / "artifacts" / "selector_scores.csv"))
 
     print(f"Loading data from {raw_dir} ...")
-    df = ensure_multiindex(load_all_raw_data(raw_dir))
+    df = ensure_multiindex(
+        load_all_raw_data(raw_dir, max_rows_per_file=max_rows_per_file if max_rows_per_file > 0 else None)
+    )
     if df.index.duplicated().any():
         before = len(df)
         df = df.loc[~df.index.duplicated(keep="last")]
@@ -75,6 +81,11 @@ def main():
     df_feat = add_orderflow_features(df_feat)
 
     X_df, _ = make_feature_matrix(df_feat, drop_na=False)
+
+    # Optional downsample before heavy predict to speed up iterations
+    if max_rows_total > 0 and len(X_df) > max_rows_total:
+        X_df = X_df.sample(n=max_rows_total, random_state=42)
+        df_feat = df_feat.loc[X_df.index]
 
     mid = df_feat["mid"]
     fwd_ret = forward_returns(mid, horizon=horizon).rename("fwd_ret")
@@ -91,6 +102,22 @@ def main():
     fwd = merged["fwd_ret"]
 
     print(f"Loaded {len(X_bt):,} rows for backtest.")
+
+    selector_mask = None
+    if use_selector:
+        if not selector_path.exists():
+            raise FileNotFoundError(f"Selector scores not found at {selector_path}; disable BT_USE_SELECTOR or set SELECTOR_SCORES_PATH.")
+        sel_df = pd.read_csv(selector_path)
+        if {"Symbol", "Time", "selector_pass"}.issubset(sel_df.columns):
+            sel_df = sel_df[["Symbol", "Time", "selector_pass"]].copy()
+            sel_df["Time"] = pd.to_datetime(sel_df["Time"]).dt.tz_localize(None)
+            merged["Time"] = pd.to_datetime(merged["Time"]).dt.tz_localize(None)
+            merged = merged.merge(sel_df, on=["Symbol", "Time"], how="left")
+            selector_mask = merged["selector_pass"].fillna(False).to_numpy()
+            print(f"Selector gating enabled; pass rate in backtest slice: {selector_mask.mean():.3%}")
+        else:
+            print("Selector scores missing Symbol/Time/selector_pass columns; disabling selector gate.")
+            selector_mask = None
     model_bundle = joblib.load(model_path)
     # Support legacy classifier-only models
     if isinstance(model_bundle, dict) and "direction_model" in model_bundle:
@@ -128,6 +155,8 @@ def main():
 
     # Apply confidence filter if set
     expected_filtered = np.where(conf >= conf_min, expected, 0.0)
+    if selector_mask is not None:
+        expected_filtered = np.where(selector_mask, expected_filtered, 0.0)
 
     positions_signal = np.where(expected_filtered > long_thr, 1, np.where(expected_filtered < short_thr, -1, 0))
     if latency_ticks > 0:

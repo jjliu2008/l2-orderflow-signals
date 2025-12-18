@@ -324,7 +324,7 @@ def main():
     sweep_high_all = merged["sweep_high"]
 
     # Default cap to keep runs lightweight; override with TRAIN_MAX_ROWS=0 to disable.
-    max_rows = int(os.environ.get("TRAIN_MAX_ROWS", "50000"))
+    max_rows = int(os.environ.get("TRAIN_MAX_ROWS", "0"))
     if max_rows > 0 and len(x_small) > max_rows:
         sampled_idx = x_small.index.to_series().sample(
             n=max_rows, random_state=42, replace=False
@@ -488,6 +488,8 @@ def main():
     print("Magnitude p75 preview (first 5 rows):", mag_hi[:5])
 
     preds_df = pd.DataFrame(index=X_test.index)
+    preds_df["Symbol"] = merged.loc[X_test.index, "Symbol"].values
+    preds_df["Time"] = merged.loc[X_test.index, "Time"].values
     preds_df["y_true"] = y_test
     preds_df["y_pred"] = y_pred
     preds_df["expected_value_dir"] = expected
@@ -516,6 +518,7 @@ def main():
             preds_df[col] = X_test[col]
 
     save_artifacts = os.environ.get("TRAIN_SAVE_ARTIFACTS", "1").strip().lower() in {"1", "true", "yes", "y"}
+    save_preds_csv = os.environ.get("TRAIN_SAVE_PRED_CSV", "1").strip().lower() in {"1", "true", "yes", "y"}
     if save_artifacts:
         artifacts_dir = PROJECT_ROOT / "artifacts"
         artifacts_dir.mkdir(exist_ok=True)
@@ -537,10 +540,14 @@ def main():
         )
 
         preds_path = artifacts_dir / "hgb_test_predictions.csv"
-        preds_df.to_csv(preds_path)
-
-        print(f"\nSaved combo model to {model_path}")
-        print(f"Saved test predictions to {preds_path}")
+        if save_preds_csv:
+            preds_out = preds_df.copy()
+            preds_out.to_csv(preds_path, index=False)
+            print(f"\nSaved combo model to {model_path}")
+            print(f"Saved test predictions to {preds_path}")
+        else:
+            print(f"\nSaved combo model to {model_path}")
+            print("Skipping test predictions CSV (TRAIN_SAVE_PRED_CSV is falsy).")
     else:
         print("\nSkipping artifact save (TRAIN_SAVE_ARTIFACTS is falsy).")
 
