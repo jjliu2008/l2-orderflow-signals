@@ -80,6 +80,29 @@ def compute_expected_range(mid: pd.Series, horizon: int = 2) -> pd.Series:
     return mid.groupby(level=0).transform(_fwd_range).rename("expected_range")
 
 
+def compute_directional_excursion(mid: pd.Series, direction: pd.Series, horizon: int, cost_proxy: pd.Series) -> pd.Series:
+    """
+    Directional excursion net of costs:
+      max_{k<=H} (sign(direction) * delta_price(t->t+k)/mid) - cost_proxy
+    """
+    if horizon < 2:
+        horizon = 2
+    dir_sign = direction.astype(float).clip(-1, 1)
+
+    def _excursion(s: pd.Series, sign: pd.Series) -> pd.Series:
+        # cumulative forward returns up to horizon
+        fwd = s.groupby(level=0).apply(lambda x: x.shift(-1)).droplevel(0)
+        # rolling max in direction of sign
+        rel = (fwd - s) / s
+        rel_signed = rel * sign
+        roll_max = rel_signed.groupby(level=0).transform(lambda x: x.rolling(horizon, min_periods=horizon).max())
+        return roll_max
+
+    exc = _excursion(mid, dir_sign)
+    net = exc - cost_proxy
+    return net.rename("dir_excursion_net")
+
+
 def compute_regime_flags(df: pd.DataFrame, cfg: FilterConfig) -> tuple[pd.Series, float | None]:
     """
     Classify regimes (fragile/stable) based on sweep cost and book/depth features.
@@ -232,34 +255,27 @@ def main():
                 time_horizon = pd.to_timedelta(ms, unit="ms")
         except ValueError as exc:
             raise ValueError(f"Invalid TRAIN_TIME_HORIZON_MS={time_horizon_env}") from exc
-    dir_horizon = 1
+    dir_horizon = int(os.environ.get("TRAIN_DIR_HORIZON", "1"))
     fwd_ret = forward_returns(df_feat["mid"], horizon=dir_horizon, time_horizon=time_horizon).rename("fwd_ret")
     dir_label = make_dir_label(fwd_ret, neutral_band=neutral_band)
 
-    # Magnitude targets
-    vol_window = int(os.environ.get("TRAIN_VOL_WINDOW", "20"))
-    realized_vol = compute_realized_vol(df_feat, window=vol_window)
-    # Expected range over the same tick horizon as direction label
-    range_horizon_env = int(os.environ.get("TRAIN_RANGE_HORIZON", "0"))
-    range_horizon = max(range_horizon_env, dir_horizon + 1, 2)
-    expected_range = compute_expected_range(df_feat["mid"], horizon=range_horizon)
-    mag_target_choice = os.environ.get("TRAIN_MAG_TARGET", "range").strip().lower()
-
+    # Cost proxy
     sweep_cost_mag_feat = None
     if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(df_feat.columns):
         sweep_cost_mag_feat = df_feat[["sweep_cost_buy1", "sweep_cost_sell1"]].abs().max(axis=1)
+    if "mid" not in df_feat or "spread" not in df_feat:
+        raise ValueError("Required columns mid/spread missing after feature construction.")
+    spread_rel = df_feat["spread"] / df_feat["mid"]
+    cost_proxy_feat = spread_rel / 2
+    if sweep_cost_mag_feat is not None:
+        cost_proxy_feat = cost_proxy_feat + sweep_cost_mag_feat
 
-    if mag_target_choice == "range":
-        mag_target_series = expected_range.abs()
-        mag_target_name = "expected_range"
-    elif mag_target_choice in {"impact", "range_x_sweep"}:
-        if sweep_cost_mag_feat is None:
-            raise ValueError("TRAIN_MAG_TARGET=impact requires sweep_cost_* features present.")
-        mag_target_series = (expected_range.abs() * sweep_cost_mag_feat).rename("expected_range_x_sweep")
-        mag_target_name = "expected_range_x_sweep"
-    else:
-        mag_target_series = realized_vol.abs()
-        mag_target_name = "realized_vol"
+    # Magnitude target: directional excursion net of costs over a longer horizon
+    range_horizon_env = int(os.environ.get("TRAIN_RANGE_HORIZON", "20"))
+    range_horizon = max(range_horizon_env, dir_horizon + 1, 2)
+    dir_excursion_net = compute_directional_excursion(df_feat["mid"], dir_label, range_horizon, cost_proxy_feat)
+    mag_target_series = dir_excursion_net
+    mag_target_name = "dir_excursion_net"
 
     # Align features, direction label, and magnitude
     X_reset = X_df.reset_index()
@@ -277,7 +293,7 @@ def main():
     regime_series, sweep_reg_cut = compute_regime_flags(merged, filter_cfg)
     merged["regime"] = regime_series
 
-    # Sweep-high flag for magnitude modeling and gating
+    # Sweep-high flag for magnitude modeling and gating (robust with floor/cap)
     sweep_cutoff_train = None
     if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(merged.columns):
         sweep_mag_train = merged[["sweep_cost_buy1", "sweep_cost_sell1"]].abs().max(axis=1)
@@ -285,7 +301,14 @@ def main():
             sweep_cutoff_train = float(sweep_mag_train.quantile(filter_cfg.sweep_cost_quantile))
         elif filter_cfg.min_sweep_cost > 0:
             sweep_cutoff_train = filter_cfg.min_sweep_cost
+        # Clamp cutoff to avoid collapse
+        sweep_min_floor = float(os.environ.get("FILTER_SWEEP_MIN_FLOOR", "0.0"))
+        sweep_max_cap = float(os.environ.get("FILTER_SWEEP_MAX_CAP", "0.0"))
         if sweep_cutoff_train is not None:
+            if sweep_min_floor > 0:
+                sweep_cutoff_train = max(sweep_cutoff_train, sweep_min_floor)
+            if sweep_max_cap > 0:
+                sweep_cutoff_train = min(sweep_cutoff_train, sweep_max_cap)
             merged["sweep_high"] = sweep_mag_train >= sweep_cutoff_train
         else:
             merged["sweep_high"] = False
@@ -306,12 +329,22 @@ def main():
             )
             print(f"Fast contiguous sample: rows {before} -> {len(merged)} (TRAIN_FAST_CONTIGUOUS=1)")
         else:
-            if fast_sample_rows > 0:
-                merged = merged.sample(n=min(fast_sample_rows, before), random_state=42)
-                print(f"Fast sample: rows {before} -> {len(merged)} via TRAIN_FAST_SAMPLE_ROWS={fast_sample_rows}")
+            # Sweep-aware sampling: keep all sweep_high, sample remainder
+            if "sweep_high" in merged and merged["sweep_high"].any():
+                sweep_high_df = merged[merged["sweep_high"]]
+                rest_df = merged[~merged["sweep_high"]]
+                target = fast_sample_rows if fast_sample_rows > 0 else int(len(merged) * fast_sample_frac)
+                take_rest = max(0, target - len(sweep_high_df))
+                rest_sampled = rest_df.sample(n=min(take_rest, len(rest_df)), random_state=42) if take_rest > 0 else rest_df.iloc[0:0]
+                merged = pd.concat([sweep_high_df, rest_sampled], ignore_index=True)
+                print(f"Fast sample (sweep-aware): kept {len(sweep_high_df)} sweep_high, sampled {len(rest_sampled)} rest; rows {before} -> {len(merged)}")
             else:
-                merged = merged.sample(frac=fast_sample_frac, random_state=42)
-                print(f"Fast sample: rows {before} -> {len(merged)} via TRAIN_FAST_SAMPLE_FRAC={fast_sample_frac}")
+                if fast_sample_rows > 0:
+                    merged = merged.sample(n=min(fast_sample_rows, before), random_state=42)
+                    print(f"Fast sample: rows {before} -> {len(merged)} via TRAIN_FAST_SAMPLE_ROWS={fast_sample_rows}")
+                else:
+                    merged = merged.sample(frac=fast_sample_frac, random_state=42)
+                    print(f"Fast sample: rows {before} -> {len(merged)} via TRAIN_FAST_SAMPLE_FRAC={fast_sample_frac}")
 
     if merged.empty:
         raise ValueError("No overlapping rows between features and forward returns after merge.")
@@ -368,6 +401,8 @@ def main():
     sweep_train_counts = sweep_high_train.value_counts(dropna=False).to_dict()
     sweep_test_counts = sweep_high_test.value_counts(dropna=False).to_dict()
     print(f"Sweep_high counts -> train: {sweep_train_counts}, test: {sweep_test_counts}")
+    if sweep_high_train.sum() == 0 or sweep_high_test.sum() == 0:
+        raise ValueError("No sweep_high samples in train/test after sampling; adjust FILTER_SWEEP_COST_QUANTILE or sampling.")
     sample_weight_train = compute_sample_weights(y_train)
     sample_weight_test = compute_sample_weights(y_test)
 
@@ -496,14 +531,15 @@ def main():
     preds_df["mag_pred_med"] = mag_med
     preds_df["mag_pred_p75"] = mag_hi
     preds_df["ev_combined"] = mag_used * (y_proba[:, list(classes).index(1.0)] - y_proba[:, list(classes).index(-1.0)])
-    # Cost proxy: half-spread + sweep cost magnitude (if available)
+    # Cost proxy: half-spread (relative) + sweep cost magnitude (relative) if available
     cost_proxy = pd.Series(0.0, index=preds_df.index)
-    if "spread" in preds_df:
-        cost_proxy += preds_df["spread"] / 2
-    # compute sweep_cost_mag for preds_df if not already available
     sweep_cost_mag = None
     if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(preds_df.columns):
         sweep_cost_mag = preds_df[["sweep_cost_buy1", "sweep_cost_sell1"]].abs().max(axis=1)
+    if "mid" in preds_df and "spread" in preds_df:
+        spread_rel = preds_df["spread"] / preds_df["mid"]
+        cost_proxy += spread_rel / 2
+    if sweep_cost_mag is not None:
         cost_proxy += sweep_cost_mag
     preds_df["ev_net"] = preds_df["ev_combined"] - cost_proxy
     preds_df["sample_weight"] = sample_weight_test
@@ -553,8 +589,8 @@ def main():
 
     # Post-prediction trading gates preview
     filter_cfg = FilterConfig.from_env()
-    ev_metric = preds_df["ev_combined"].abs() if filter_cfg.use_abs_ev else preds_df["ev_combined"]
     # Compute thresholds only on sweep_high with non-zero magnitude to avoid dilution by zero-magnitude rows
+    ev_metric = preds_df["ev_combined"].abs() if filter_cfg.use_abs_ev else preds_df["ev_combined"]
     ev_metric_subset = ev_metric
     mag_p75_subset = preds_df["mag_pred_p75"]
     if "sweep_high" in preds_df:
@@ -562,6 +598,7 @@ def main():
         if mask_thresh.any():
             ev_metric_subset = ev_metric[mask_thresh]
             mag_p75_subset = preds_df.loc[mask_thresh, "mag_pred_p75"]
+    # For net-excursion target, cutoffs are less relevant; defaults to zero if subset empty
     ev_cutoff, mag_floor = compute_thresholds(ev_metric_subset, mag_p75_subset, filter_cfg)
 
     dir_conf = preds_df[[f"proba_{int(1.0)}", f"proba_{int(-1.0)}"]].max(axis=1)
@@ -593,21 +630,21 @@ def main():
     preds_df["regime"] = regime
 
     preds_df["dir_conf"] = dir_conf
-    preds_df["passes_filters"] = apply_filters(
-        dir_conf=dir_conf,
-        ev_dir=preds_df["expected_value_dir"],
-        ev_combined=preds_df["ev_combined"],
-        mag_p75=preds_df["mag_pred_p75"],
-        ev_cutoff=ev_cutoff,
-        mag_floor=mag_floor,
-        cfg=filter_cfg,
-        sweep_cost_mag=sweep_cost_mag if sweep_cutoff is not None else None,
-        ev_net=preds_df["ev_net"],
-    )
-    # Only allow trades in fragile regime and sweep_high
-    preds_df["passes_filters"] &= (preds_df["regime"] == "fragile")
+    # Stage A: economics gate (sweep_high + optional spread cap)
+    spread_cap = float(os.environ.get("FILTER_SPREAD_MAX", "0"))
+    passes_stage_a = pd.Series(True, index=preds_df.index)
     if "sweep_high" in preds_df.columns:
-        preds_df["passes_filters"] &= preds_df["sweep_high"]
+        passes_stage_a &= preds_df["sweep_high"]
+    if spread_cap > 0 and "spread" in preds_df:
+        passes_stage_a &= preds_df["spread"] <= spread_cap
+
+    # Stage B: economic gate on net excursion (ev_net > 0)
+    passes_stage_b = preds_df["ev_net"] > 0
+
+    preds_df["passes_filters"] = passes_stage_a & passes_stage_b
+    # Optional regime filter
+    if "regime" in preds_df:
+        preds_df["passes_filters"] &= preds_df["regime"] == "fragile"
     pass_rate = preds_df["passes_filters"].mean()
     sweep_high_total = preds_df["sweep_high"].sum() if "sweep_high" in preds_df else 0
     pass_rate_high = (
