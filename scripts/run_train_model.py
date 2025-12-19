@@ -103,6 +103,70 @@ def compute_directional_excursion(mid: pd.Series, direction: pd.Series, horizon:
     return net.rename("dir_excursion_net")
 
 
+def build_candidate_mask(df: pd.DataFrame) -> pd.Series:
+    """
+    Candidate gate. Modes:
+      - baseline: tight spread + low sweep (cheap regime)
+      - commitment: baseline + commitment signals (refill, absorption, vol suppression)
+      - imbalance: legacy imbalance-driven gate
+    Target rate 5-15%; raises if outside [1%,30%].
+    """
+    gate_type = os.environ.get("CAND_GATE_TYPE", "commitment").strip().lower()
+
+    spread_bps = (df["spread"] / df["mid"]) * 1e4 if {"spread", "mid"}.issubset(df.columns) else pd.Series(np.inf, index=df.index)
+    sweep_bps = None
+    if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(df.columns):
+        sweep_bps = df[["sweep_cost_buy1", "sweep_cost_sell1"]].abs().max(axis=1) * 1e4
+
+    # Defaults by quantile
+    spread_cap_bps = float(os.environ.get("CAND_SPREAD_MAX_BPS") or spread_bps.quantile(0.3))
+    sweep_cap_bps = float(os.environ.get("CAND_SWEEP_MAX_BPS") or (sweep_bps.quantile(0.3) if sweep_bps is not None else np.inf))
+
+    mask = spread_bps <= spread_cap_bps
+    if sweep_bps is not None and np.isfinite(sweep_cap_bps):
+        mask &= sweep_bps <= sweep_cap_bps
+
+    if gate_type == "commitment":
+        # Commitment signals: refill, absorption, vol suppression
+        refill = df.get("refill_count", pd.Series(0, index=df.index))
+        refill_q = float(os.environ.get("CAND_REFILL_Q", "0.8"))
+        refill_thresh = refill.quantile(refill_q)
+
+        absorp = df.get("absorption_ratio", pd.Series(0, index=df.index)).replace([np.inf, -np.inf], np.nan).fillna(0)
+        absorp_q = float(os.environ.get("CAND_ABSORB_Q", "0.8"))
+        absorp_thresh = absorp.quantile(absorp_q)
+
+        rv_short = df.get("rv_short", pd.Series(np.inf, index=df.index))
+        rv_q = float(os.environ.get("CAND_RV_Q", "0.3"))
+        rv_thresh = rv_short.quantile(rv_q)
+
+        mask &= (refill >= refill_thresh) & (absorp >= absorp_thresh) & (rv_short <= rv_thresh)
+        print(f"Candidate gate (commitment): spread_cap_bps={spread_cap_bps:.2f}, sweep_cap_bps={sweep_cap_bps:.2f}, refill>={refill_thresh:.6g}, absorption>={absorp_thresh:.6g}, rv_short<={rv_thresh:.6g}")
+
+    elif gate_type == "imbalance":
+        persist_window = int(os.environ.get("CAND_IMB_WINDOW", "50"))
+        imb = df["order_book_imbalance"] if "order_book_imbalance" in df else df.get("depth_imbalance_top5", pd.Series(0, index=df.index))
+        imb_roll = imb.groupby(level=0).transform(lambda x: x.rolling(persist_window, min_periods=max(5, persist_window // 2)).mean())
+        sign_persist = imb.groupby(level=0).transform(
+            lambda x: (np.sign(x).rolling(persist_window, min_periods=max(5, persist_window // 2)).mean()).abs()
+        )
+        activity = df["volatility_20"] if "volatility_20" in df else df.get("ret_5", pd.Series(0, index=df.index)).abs()
+        imb_abs_thresh = float(os.environ.get("CAND_IMB_ABS_THRESH") or imb_roll.abs().quantile(0.8))
+        persist_min = float(os.environ.get("CAND_IMB_PERSIST_MIN") or 0.7)
+        activity_min = float(os.environ.get("CAND_ACTIVITY_MIN") or activity.quantile(0.5))
+        mask &= (imb_roll.abs() >= imb_abs_thresh) & (sign_persist >= persist_min) & (activity >= activity_min)
+        print(f"Candidate gate (imbalance): spread_cap_bps={spread_cap_bps:.2f}, sweep_cap_bps={sweep_cap_bps:.2f}, imb_abs_thresh={imb_abs_thresh:.4f}, persist_min={persist_min:.2f}, activity_min={activity_min:.6f}")
+
+    else:  # baseline
+        print(f"Candidate gate (baseline): spread_cap_bps={spread_cap_bps:.2f}, sweep_cap_bps={sweep_cap_bps:.2f}")
+
+    rate = mask.mean()
+    print(f"Candidate rate: {rate:.2%}")
+    if rate < 0.01 or rate > 0.30:
+        raise ValueError(f"Candidate rate {rate:.2%} outside [1%,30%]; adjust CAND_* or quantiles.")
+    return mask
+
+
 def compute_regime_flags(df: pd.DataFrame, cfg: FilterConfig) -> tuple[pd.Series, float | None]:
     """
     Classify regimes (fragile/stable) based on sweep cost and book/depth features.
@@ -288,6 +352,13 @@ def main():
     merged = merged.merge(mag_reset, on=["Symbol", "Time"], how="inner")
     merged = merged.dropna(subset=["fwd_ret", "label", mag_target_name])
 
+    # Candidate mask
+    cand_mask = build_candidate_mask(merged)
+    merged["candidate"] = cand_mask
+    merged = merged[merged["candidate"]]
+    if merged.empty:
+        raise ValueError("No candidate rows after applying candidate mask. Loosen CAND_* gates.")
+
     # Regime flags (fragile/stable) for magnitude per-regime models
     filter_cfg = FilterConfig.from_env()
     regime_series, sweep_reg_cut = compute_regime_flags(merged, filter_cfg)
@@ -349,7 +420,7 @@ def main():
     if merged.empty:
         raise ValueError("No overlapping rows between features and forward returns after merge.")
 
-    feature_cols = [c for c in merged.columns if c not in {"Symbol", "Time", "label", "fwd_ret", "regime", "sweep_high", mag_target_name}]
+    feature_cols = [c for c in merged.columns if c not in {"Symbol", "Time", "label", "fwd_ret", "regime", "sweep_high", mag_target_name, "candidate"}]
     x_small = merged[feature_cols]
     y_dir = merged["label"]
     y_mag = merged[mag_target_name].abs()
@@ -401,8 +472,6 @@ def main():
     sweep_train_counts = sweep_high_train.value_counts(dropna=False).to_dict()
     sweep_test_counts = sweep_high_test.value_counts(dropna=False).to_dict()
     print(f"Sweep_high counts -> train: {sweep_train_counts}, test: {sweep_test_counts}")
-    if sweep_high_train.sum() == 0 or sweep_high_test.sum() == 0:
-        raise ValueError("No sweep_high samples in train/test after sampling; adjust FILTER_SWEEP_COST_QUANTILE or sampling.")
     sample_weight_train = compute_sample_weights(y_train)
     sample_weight_test = compute_sample_weights(y_test)
 
@@ -589,16 +658,11 @@ def main():
 
     # Post-prediction trading gates preview
     filter_cfg = FilterConfig.from_env()
-    # Compute thresholds only on sweep_high with non-zero magnitude to avoid dilution by zero-magnitude rows
+    # Compute thresholds only on rows with non-zero magnitude to avoid dilution by zero-magnitude rows
     ev_metric = preds_df["ev_combined"].abs() if filter_cfg.use_abs_ev else preds_df["ev_combined"]
-    ev_metric_subset = ev_metric
-    mag_p75_subset = preds_df["mag_pred_p75"]
-    if "sweep_high" in preds_df:
-        mask_thresh = preds_df["sweep_high"] & (preds_df["mag_pred_p75"] > 0)
-        if mask_thresh.any():
-            ev_metric_subset = ev_metric[mask_thresh]
-            mag_p75_subset = preds_df.loc[mask_thresh, "mag_pred_p75"]
-    # For net-excursion target, cutoffs are less relevant; defaults to zero if subset empty
+    mask_thresh = preds_df["mag_pred_p75"] > 0
+    ev_metric_subset = ev_metric[mask_thresh] if mask_thresh.any() else ev_metric
+    mag_p75_subset = preds_df.loc[mask_thresh, "mag_pred_p75"] if mask_thresh.any() else preds_df["mag_pred_p75"]
     ev_cutoff, mag_floor = compute_thresholds(ev_metric_subset, mag_p75_subset, filter_cfg)
 
     dir_conf = preds_df[[f"proba_{int(1.0)}", f"proba_{int(-1.0)}"]].max(axis=1)
@@ -630,11 +694,9 @@ def main():
     preds_df["regime"] = regime
 
     preds_df["dir_conf"] = dir_conf
-    # Stage A: economics gate (sweep_high + optional spread cap)
+    # Stage A: economics gate (candidate gate already applied upstream), optional spread cap
     spread_cap = float(os.environ.get("FILTER_SPREAD_MAX", "0"))
     passes_stage_a = pd.Series(True, index=preds_df.index)
-    if "sweep_high" in preds_df.columns:
-        passes_stage_a &= preds_df["sweep_high"]
     if spread_cap > 0 and "spread" in preds_df:
         passes_stage_a &= preds_df["spread"] <= spread_cap
 

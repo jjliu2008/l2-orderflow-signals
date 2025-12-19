@@ -25,6 +25,7 @@ import pandas as pd
 
 from src.data_loader import load_all_raw_data
 from src.feature_engineering import add_basic_features, add_orderflow_features
+from scripts.run_train_model import build_candidate_mask
 
 
 def compute_expected_range(mid: pd.Series, horizon: int = 2) -> pd.Series:
@@ -44,6 +45,22 @@ def compute_expected_range(mid: pd.Series, horizon: int = 2) -> pd.Series:
     return mid.groupby(level=0).transform(_fwd_range).rename(f"expected_range_{horizon}")
 
 
+def compute_fav_excursion(mid: pd.Series, ref_dir: pd.Series, horizon: int = 2) -> pd.Series:
+    """
+    Directional favorable excursion over next `horizon` steps in bps:
+      max_{k<=H} (ref_dir * (mid_{t+k} - mid_t) / mid_t) * 1e4
+    """
+    if horizon < 2:
+        horizon = 2
+
+    grouped = mid.groupby(level=0)
+    fwd = grouped.apply(lambda x: x.shift(-1)).droplevel(0)
+    rel = (fwd - mid) / mid
+    rel_dir = rel * ref_dir
+    fav = rel_dir.groupby(level=0).transform(lambda x: x.rolling(horizon, min_periods=horizon).max())
+    return (fav * 1e4).rename(f"fav_excursion_{horizon}")
+
+
 def main():
     default_dirs = os.environ.get("TRAIN_DATA_DIRS", "data/processed")
     dir_list = [Path(d.strip()) for d in default_dirs.split(",") if d.strip()]
@@ -51,7 +68,7 @@ def main():
     horizons_env = os.environ.get("HORIZON_SWEEP_HORIZONS", "10,20,50,100")
     horizons: List[int] = [int(h.strip()) for h in horizons_env.split(",") if h.strip()]
 
-    sweep_q = float(os.environ.get("HORIZON_SWEEP_QUANTILE", "0.8"))
+    sweep_q = float(os.environ.get("HORIZON_SWEEP_QUANTILE", "0.0"))
     sweep_min_floor = float(os.environ.get("HORIZON_SWEEP_MIN_FLOOR", "0.0"))
     sweep_max_cap = float(os.environ.get("HORIZON_SWEEP_MAX_CAP", "0.0"))
 
@@ -81,48 +98,71 @@ def main():
     sweep_cost_mag = None
     if {"sweep_cost_buy1", "sweep_cost_sell1"}.issubset(df.columns):
         sweep_cost_mag = df[["sweep_cost_buy1", "sweep_cost_sell1"]].abs().max(axis=1)
-    if sweep_cost_mag is None:
-        raise ValueError("Sweep cost columns missing; cannot define sweep_high.")
 
-    sweep_cutoff = None
-    if sweep_q > 0:
-        sweep_cutoff = float(sweep_cost_mag.quantile(sweep_q))
-    if sweep_cutoff is None or sweep_cutoff == 0:
-        raise ValueError("Sweep cutoff collapsed to zero; set a nonzero HORIZON_SWEEP_QUANTILE.")
-    if sweep_min_floor > 0:
-        sweep_cutoff = max(sweep_cutoff, sweep_min_floor)
-    if sweep_max_cap > 0:
-        sweep_cutoff = min(sweep_cutoff, sweep_max_cap)
-
-    sweep_high = sweep_cost_mag >= sweep_cutoff
-    n_sweep = sweep_high.sum()
+    # Candidate gate (imbalance-driven)
+    cand_mask = build_candidate_mask(df)
+    if not cand_mask.any():
+        raise ValueError("No candidates after applying imbalance/spread/activity gate. Loosen CAND_* envs.")
+    df_cand = df[cand_mask]
     total = len(df)
-    print(f"sweep_high cutoff={sweep_cutoff:.6g}, count={n_sweep} / {total} ({n_sweep/total:.2%})")
-    if n_sweep == 0:
-        raise ValueError("No sweep_high rows after cutoff; aborting sweep.")
+    n_cand = len(df_cand)
 
-    # Cost proxy
-    # cost proxy in relative terms
-    spread_rel = df["spread"] / df["mid"]
-    cost_proxy = spread_rel / 2 + sweep_cost_mag
+    # Optional mild sweep filter to drop ultra-thick/dead regimes
+    if sweep_cost_mag is not None and sweep_q > 0:
+        sweep_cost_mag = sweep_cost_mag[cand_mask]
+        sweep_cutoff = float(sweep_cost_mag.quantile(sweep_q))
+        if sweep_min_floor > 0:
+            sweep_cutoff = max(sweep_cutoff, sweep_min_floor)
+        if sweep_max_cap > 0:
+            sweep_cutoff = min(sweep_cutoff, sweep_max_cap)
+        sweep_mask = (sweep_cost_mag <= sweep_cutoff).reindex(df_cand.index).fillna(False)
+    else:
+        sweep_mask = pd.Series(True, index=df_cand.index)
+        sweep_cutoff = None
+
+    cand_keep = df_cand[sweep_mask]
+    if cand_keep.empty:
+        raise ValueError("No rows after candidate gate (and optional sweep cap); aborting sweep.")
+
+    # Cost proxy (relative bps) on kept candidates
+    spread_rel = cand_keep["spread"] / cand_keep["mid"]
+    spread_bps = spread_rel * 1e4
+    if sweep_cost_mag is not None:
+        sweep_bps = (sweep_cost_mag.reindex(cand_keep.index) * 1e4).fillna(0)
+    else:
+        sweep_bps = pd.Series(0, index=cand_keep.index)
+    cost_proxy_bps = spread_bps / 2 + sweep_bps
+
+    print(f"candidates: {n_cand} / {total} ({(n_cand/total if total else 0):.2%}), kept after sweep cap: {len(cand_keep)} ({(len(cand_keep)/n_cand if n_cand else 0):.2%}), sweep_cutoff={sweep_cutoff if sweep_cutoff is not None else 'none'}")
+
+    ref_dir = np.sign((cand_keep["order_book_imbalance"].groupby(level=0).transform(lambda x: x.rolling(50, min_periods=25).mean())))
+    # Constant sample across horizons: require forward coverage for max horizon
+    max_h = max(horizons) if horizons else 0
+    base_idx = cand_keep.index
+    if max_h > 0:
+        fav_max = compute_fav_excursion(cand_keep["mid"], ref_dir, horizon=max_h)
+        base_idx = fav_max.dropna().index
+        cand_keep = cand_keep.loc[base_idx]
+        ref_dir = ref_dir.loc[base_idx]
+        cost_proxy_bps = cost_proxy_bps.loc[base_idx]
 
     for h in horizons:
-        rng = compute_expected_range(df["mid"], horizon=h)
+        fav = compute_fav_excursion(cand_keep["mid"], ref_dir.loc[cand_keep.index], horizon=h)
         sub = pd.DataFrame({
-            "range": rng,
-            "cost_proxy": cost_proxy,
-            "sweep_high": sweep_high,
+            "fav_exc_bps": fav,
+            "cost_bps": cost_proxy_bps,
         }).dropna()
-        sub_high = sub[sub["sweep_high"]]
-        if sub_high.empty:
-            print(f"H={h}: no sweep_high rows with range; skipping")
+        if sub.empty:
+            print(f"H={h}: no candidate rows; skipping")
             continue
-        ev_net = sub_high["range"] - sub_high["cost_proxy"]
+        ev_net = sub["fav_exc_bps"] - sub["cost_bps"]
+        cost_desc = sub["cost_bps"].quantile([0.5, 0.75, 0.9]).to_dict()
         print(
-            f"H={h}: sweep_high rows={len(sub_high)}, "
-            f"range p50={sub_high['range'].median():.6g}, p75={sub_high['range'].quantile(0.75):.6g}, "
-            f"p90={sub_high['range'].quantile(0.9):.6g}, "
-            f"ev_net p50={ev_net.median():.6g}, p75={ev_net.quantile(0.75):.6g}, p90={ev_net.quantile(0.9):.6g}"
+            f"H={h}: candidates={len(sub)}, "
+            f"fav_exc_bps p50={sub['fav_exc_bps'].median():.6g}, p75={sub['fav_exc_bps'].quantile(0.75):.6g}, "
+            f"p90={sub['fav_exc_bps'].quantile(0.9):.6g}, "
+            f"ev_net p50={ev_net.median():.6g}, p75={ev_net.quantile(0.75):.6g}, p90={ev_net.quantile(0.9):.6g}, "
+            f"cost_bps p50={cost_desc.get(0.5, float('nan')):.6g}, p75={cost_desc.get(0.75, float('nan')):.6g}, p90={cost_desc.get(0.9, float('nan')):.6g}"
         )
 
 

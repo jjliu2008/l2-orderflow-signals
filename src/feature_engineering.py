@@ -31,6 +31,11 @@ DEFAULT_FEATURE_COLUMNS = [
     "risk_adj_momentum_20",
     "trend_flip_flag",
     "price_drawdown_50",
+    "refill_count",
+    "refill_latency",
+    "absorption_ratio",
+    "imbalance_persist",
+    "rv_short",
 ]
 
 
@@ -169,6 +174,33 @@ def add_orderflow_features(
         df["ofi_1"] = df["order_book_imbalance"].groupby(level=0).diff()
     else:
         df["ofi_1"] = pd.NA
+
+    # Commitment-oriented features
+    window_refill = 20
+    for side, col in [("bid", "top_bid_depth"), ("ask", "top_ask_depth")]:
+        depth = df[col] if col in df else pd.Series(0, index=df.index)
+        grouped = depth.groupby(level=0)
+        delta = grouped.diff()
+        refill = (delta > 0).astype(int)
+        refill_count = refill.groupby(level=0).transform(lambda s: s.rolling(window_refill, min_periods=max(5, window_refill // 2)).sum())
+        refill_latency = refill.groupby(level=0).transform(lambda s: s.rolling(window_refill, min_periods=max(5, window_refill // 2)).apply(lambda x: np.argmax(x[::-1]==1) if (x==1).any() else np.nan))
+        df[f"refill_count_{side}"] = refill_count
+        df[f"refill_latency_{side}"] = refill_latency
+    df["refill_count"] = df[[c for c in df.columns if c.startswith("refill_count_")]].max(axis=1)
+    df["refill_latency"] = df[[c for c in df.columns if c.startswith("refill_latency_")]].min(axis=1)
+
+    vol_window = 20
+    signed_vol = df.get("signed_volume", pd.Series(0, index=df.index))
+    vol_roll = signed_vol.groupby(level=0).transform(lambda s: s.rolling(vol_window, min_periods=max(5, vol_window // 2)).sum())
+    price_change = df["mid"].groupby(level=0).transform(lambda s: s.diff(vol_window))
+    abs_price_change = price_change.abs().replace(0, np.nan)
+    df["absorption_ratio"] = vol_roll / abs_price_change
+
+    imb = df["order_book_imbalance"]
+    imb_window = 50
+    df["imbalance_persist"] = imb.groupby(level=0).transform(lambda s: (np.sign(s).rolling(imb_window, min_periods=max(10, imb_window // 2)).mean()).abs())
+    rv_window = 20
+    df["rv_short"] = df["mid"].groupby(level=0).transform(lambda s: np.log(s.astype(float)).diff().rolling(rv_window, min_periods=max(5, rv_window // 2)).std())
 
     return df
 
