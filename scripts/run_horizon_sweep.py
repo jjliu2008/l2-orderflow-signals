@@ -91,12 +91,25 @@ def compute_fav_excursion(mid: pd.Series, ref_dir: pd.Series, horizon: int = 2) 
     if horizon < 2:
         horizon = 2
 
-    grouped = mid.groupby(level=0)
-    fwd = grouped.apply(lambda x: x.shift(-1)).droplevel(0)
+    sym = mid.index.get_level_values(0)
+    day = mid.index.get_level_values(1).date
+    grouped = mid.groupby([sym, day])
+    fwd = grouped.transform(lambda x: x.shift(-1))
     rel = (fwd - mid) / mid
     rel_dir = rel * ref_dir
-    fav = rel_dir.groupby(level=0).transform(lambda x: x.rolling(horizon, min_periods=horizon).max())
+    fav = rel_dir.groupby([sym, day]).transform(lambda x: x.rolling(horizon, min_periods=horizon).max())
     return (fav * 1e4).rename(f"fav_excursion_{horizon}")
+
+
+def compute_forward_return_bps(mid: pd.Series, ref_dir: pd.Series, horizon: int) -> pd.Series:
+    if horizon < 1:
+        horizon = 1
+    sym = mid.index.get_level_values(0)
+    day = mid.index.get_level_values(1).date
+    grouped = mid.groupby([sym, day])
+    fwd = grouped.transform(lambda x: x.shift(-horizon))
+    rel = (fwd - mid) / mid
+    return (rel * ref_dir * 1e4).rename(f"fwd_ret_{horizon}")
 
 
 def compute_repriced_within(
@@ -104,11 +117,13 @@ def compute_repriced_within(
 ) -> pd.Series:
     if horizon < 2:
         horizon = 2
-    grouped = mid.groupby(level=0)
-    fwd = grouped.apply(lambda x: x.shift(-1)).droplevel(0)
+    sym = mid.index.get_level_values(0)
+    day = mid.index.get_level_values(1).date
+    grouped = mid.groupby([sym, day])
+    fwd = grouped.transform(lambda x: x.shift(-1))
     rel = (fwd - mid) / mid
     rel_dir = rel * ref_dir
-    max_rel = rel_dir.groupby(level=0).transform(lambda x: x.rolling(horizon, min_periods=horizon).max())
+    max_rel = rel_dir.groupby([sym, day]).transform(lambda x: x.rolling(horizon, min_periods=horizon).max())
     return (max_rel >= (reprice_bps / 1e4)).rename(f"repriced_within_{horizon}")
 
 
@@ -236,9 +251,11 @@ def main():
         sub_cost = cost_bps.loc[sub.index]
         for h in horizons:
             fav = compute_fav_excursion(sub["mid"], ref_dir.loc[sub.index], horizon=h)
+            fwd = compute_forward_return_bps(sub["mid"], ref_dir.loc[sub.index], horizon=h)
             rep = compute_repriced_within(sub["mid"], ref_dir.loc[sub.index], horizon=h, reprice_bps=reprice_bps)
             out = pd.DataFrame({
                 "fav_exc_bps": fav,
+                "fwd_ret_bps": fwd,
                 "cost_bps": sub_cost,
                 "repriced": rep,
             }).dropna()
@@ -246,6 +263,7 @@ def main():
                 print(f"{name} H={h}: no rows; skipping")
                 continue
             ev_net = out["fav_exc_bps"] - out["cost_bps"]
+            ev_net_fwd = out["fwd_ret_bps"] - out["cost_bps"]
             cost_desc = out["cost_bps"].quantile([0.5, 0.75, 0.9]).to_dict()
             print(
                 f"{name} H={h}: rows={len(out)}, "
@@ -253,6 +271,7 @@ def main():
                 f"fav_exc_bps p50={out['fav_exc_bps'].median():.6g}, p75={out['fav_exc_bps'].quantile(0.75):.6g}, "
                 f"p90={out['fav_exc_bps'].quantile(0.9):.6g}, "
                 f"ev_net p50={ev_net.median():.6g}, p75={ev_net.quantile(0.75):.6g}, p90={ev_net.quantile(0.9):.6g}, "
+                f"fwd_ev_net p50={ev_net_fwd.median():.6g}, p75={ev_net_fwd.quantile(0.75):.6g}, p90={ev_net_fwd.quantile(0.9):.6g}, "
                 f"p(ev_net>0)={(ev_net > 0).mean():.3f}, "
                 f"cost_bps p50={cost_desc.get(0.5, float('nan')):.6g}, p75={cost_desc.get(0.75, float('nan')):.6g}, p90={cost_desc.get(0.9, float('nan')):.6g}"
             )
