@@ -137,8 +137,14 @@ def add_orderflow_features(
     for w in volatility_windows:
         df[f"volatility_{w}"] = log_ret.groupby(level=0).transform(lambda s: s.rolling(w).std())
 
-    volume = pd.to_numeric(df.get("Volume"), errors="coerce") if "Volume" in df.columns else pd.Series(pd.NA, index=df.index)
-    df["signed_volume"] = volume * np.sign(df["ret_1"])
+    if "Volume" in df.columns:
+        volume = pd.to_numeric(df.get("Volume"), errors="coerce")
+    elif "trade_volume" in df.columns:
+        volume = pd.to_numeric(df.get("trade_volume"), errors="coerce")
+    else:
+        volume = pd.Series(pd.NA, index=df.index, dtype="Float64")
+    df["signed_volume"] = (volume * np.sign(df["ret_1"])).astype("float64")
+    df["signed_volume"] = df["signed_volume"].fillna(0.0)
     df[f"cvd_{cvd_window}"] = df["signed_volume"].groupby(level=0).transform(lambda s: s.rolling(cvd_window).sum())
 
     for w in volume_trend_windows:

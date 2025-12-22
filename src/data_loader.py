@@ -11,6 +11,18 @@ def _load_csv(path: Path, max_rows: int | None = None) -> pd.DataFrame:
     return df
 
 
+def _load_parquet(path: Path, max_rows: int | None = None) -> pd.DataFrame:
+    df = pd.read_parquet(path)
+    if "Time" in df.columns:
+        df["Time"] = pd.to_datetime(df["Time"], utc=True, errors="coerce")
+    for col in ("signed_volume", "trade_volume", "trade_count"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    if max_rows is not None and max_rows > 0:
+        df = df.iloc[:max_rows]
+    return df
+
+
 def _parse_coinbase_message(msg: dict, fallback_symbol: str) -> List[dict]:
     """
     Handle Coinbase websocket messages (matches/last_match/ticker).
@@ -305,7 +317,7 @@ def _load_jsonl_messages(path: Path, max_rows: int | None = None) -> pd.DataFram
 
 def load_all_raw_data(raw_dir: Union[str, Path], max_rows_per_file: int | None = None) -> pd.DataFrame:
     """
-    Load and combine all CSV or jsonl files in `raw_dir`, adding Symbol from filename when missing.
+    Load and combine all CSV, jsonl, or Parquet files in `raw_dir`, adding Symbol from filename when missing.
     Returns a DataFrame indexed by Symbol then Time.
     """
     raw_path = Path(raw_dir).expanduser().resolve()
@@ -314,13 +326,15 @@ def load_all_raw_data(raw_dir: Union[str, Path], max_rows_per_file: int | None =
 
     csv_files = sorted(raw_path.glob("*.csv"))
     jsonl_files = sorted(raw_path.glob("*.jsonl"))
+    parquet_files = sorted(raw_path.rglob("*.parquet"))
 
-    if not csv_files and not jsonl_files:
-        raise FileNotFoundError(f"No CSV or JSONL files found in {raw_path}")
+    if not csv_files and not jsonl_files and not parquet_files:
+        raise FileNotFoundError(f"No CSV, JSONL, or Parquet files found in {raw_path}")
 
     frames: List[pd.DataFrame] = []
     frames.extend(_load_csv(f, max_rows=max_rows_per_file) for f in csv_files)
     frames.extend(_load_jsonl_messages(f, max_rows=max_rows_per_file) for f in jsonl_files)
+    frames.extend(_load_parquet(f, max_rows=max_rows_per_file) for f in parquet_files)
     frames = [f for f in frames if not f.empty]
 
     if not frames:
