@@ -10,12 +10,21 @@ Env vars:
   INPUT_TRADES_DBN     path to TRADES .dbn file (optional)
   OUTPUT_DIR           output root (default: data/processed)
   INSTRUMENT           instrument symbol (default: ES)
-  FRONT_MONTH          optional exact symbol to keep (e.g., ESU5); others skipped
+  FRONT_MONTH          optional exact symbol to keep (e.g., ESU5); others skipped (requires symbol field)
+  FRONT_MONTH_RAW      optional raw symbol in DBN metadata (e.g., ESZ5) to keep
+  FRONT_MONTH_ID       optional instrument_id to keep (fastest filter)
   STEP_MS              emit interval in ms (default: 100)
   HORIZON_MS           label horizon in ms (default: 1000)
   NEUTRAL_BAND_BPS     neutral band in bps for direction label (default: 0.0)
   REPRICE_BPS          repricing event threshold in bps (default: 4.0)
   FLOW_WINDOW          rolling window (rows) for flow/lag features (default: 20)
+  LFP_HORIZONS         comma-separated horizons for LFP AE labels (default: 10,20,50)
+  LFP_AE_X_PCT         percentile for AE threshold X (default: 0.90)
+  LFP_AE_X_MODE        global|day (default: day)
+  LFP_LAMBDA_FAST      rolling window for lambda fast (default: 20)
+  LFP_LAMBDA_SLOW      rolling window for lambda slow (default: 100)
+  LFP_STRESS_WINDOW    rolling window for stress/imbalance/spread (default: 50)
+  LFP_TICK_SIZE        tick size override (default: 0.25 for ES)
   SESSION_START        optional session start (HH:MM:SS) in exchange time (treated as UTC if SESSION_TZ unset)
   SESSION_END          optional session end (HH:MM:SS) in exchange time (treated as UTC if SESSION_TZ unset)
   SESSION_TZ           optional IANA timezone for session filtering (e.g., America/Chicago)
@@ -33,6 +42,22 @@ import datetime
 import numpy as np
 import pandas as pd
 import heapq
+
+
+MONTH_CODE = {
+    1: "F",
+    2: "G",
+    3: "H",
+    4: "J",
+    5: "K",
+    6: "M",
+    7: "N",
+    8: "Q",
+    9: "U",
+    10: "V",
+    11: "X",
+    12: "Z",
+}
 
 
 @dataclass
@@ -115,6 +140,9 @@ def _parse_mbp10(rec) -> Dict[str, float]:
     ask0 = ask_px[0]
     if not np.isfinite(bid0) or not np.isfinite(ask0):
         return {}
+    if ask0 < bid0:
+        # Ignore crossed book updates to avoid invalid top-of-book snapshots.
+        return {}
 
     mid = (bid0 + ask0) / 2
     spread = ask0 - bid0
@@ -136,6 +164,10 @@ def _parse_mbp10(rec) -> Dict[str, float]:
     sweep_cost_sell1 = _sweep_cost(bid_px, bid_sz, mid=mid, qty=1.0)
 
     return {
+        "bid_price_1": bid0,
+        "ask_price_1": ask0,
+        "bid_size_1": top_bid_depth,
+        "ask_size_1": top_ask_depth,
         "mid": mid,
         "spread": spread,
         "top_bid_depth": top_bid_depth,
@@ -236,6 +268,132 @@ def _add_derived_features(df: pd.DataFrame, step_ms: int, window: int) -> pd.Dat
     return df
 
 
+def _tick_size_for_symbol(symbol: str, env_tick_size: float) -> float:
+    if env_tick_size > 0:
+        return env_tick_size
+    if symbol.upper().startswith("ES"):
+        return 0.25
+    return float("nan")
+
+
+def _auto_front_month_raw(
+    instrument: str,
+    ts: pd.Timestamp,
+    mappings: dict,
+) -> str | None:
+    if not mappings:
+        return None
+    month_code = MONTH_CODE.get(ts.month)
+    if not month_code:
+        return None
+    year_digit = str(ts.year % 10)
+    candidate = f"{instrument}{month_code}{year_digit}"
+    if candidate in mappings:
+        return candidate
+    # Fallback: look for outrights with same month code and year digit.
+    matches = [
+        k for k in mappings.keys()
+        if k.startswith(instrument) and "-" not in k and k.endswith(year_digit) and k[-2] == month_code
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _validate_book_sanity(
+    df: pd.DataFrame,
+    step_ms: int,
+    tick_size: float,
+    jump_bound_points: float = 20.0,
+) -> None:
+    bid = pd.to_numeric(df["bid_price_1"], errors="coerce")
+    ask = pd.to_numeric(df["ask_price_1"], errors="coerce")
+    spread = ask - bid
+    bad_spread = spread < -1e-9
+    if bad_spread.any():
+        sample = df.loc[bad_spread, ["Time", "bid_price_1", "ask_price_1"]].head(5)
+        raise ValueError(f"Negative spread detected; sample:\n{sample}")
+    if np.isfinite(tick_size) and tick_size > 0:
+        ratio = spread / tick_size
+        off = (ratio - np.round(ratio)).abs()
+        eps = 1e-6 * max(1.0, tick_size)
+        bad_tick = off > eps
+        if bad_tick.any():
+            sample = df.loc[bad_tick, ["Time", "bid_price_1", "ask_price_1"]].head(5)
+            raise ValueError(f"Spread not multiple of tick size; sample:\n{sample}")
+    bound = jump_bound_points * (step_ms / 100.0)
+    bid_jump = bid.diff().abs()
+    ask_jump = ask.diff().abs()
+    if bid_jump.max() > bound or ask_jump.max() > bound:
+        bad_rows = (bid_jump > bound) | (ask_jump > bound)
+        sample = df.loc[bad_rows, ["Time", "bid_price_1", "ask_price_1"]].head(5)
+        print(
+            f"Warning: large bid/ask jump detected (>{bound:.2f} points per bar). "
+            f"Sample:\n{sample}"
+        )
+
+
+def _lambda_feature(q: pd.Series, dp: pd.Series, group_keys, window: int, eps: float) -> pd.Series:
+    qdp = q * dp
+    numer = qdp.groupby(group_keys).transform(lambda s: s.rolling(window, min_periods=window).sum())
+    denom = (q * q).groupby(group_keys).transform(lambda s: s.rolling(window, min_periods=window).sum())
+    return numer / (denom + eps)
+
+
+def _add_lfp_features_labels(
+    df: pd.DataFrame,
+    horizons: list[int],
+    x_pct: float,
+    x_mode: str,
+    win_fast: int,
+    win_slow: int,
+    stress_window: int,
+) -> pd.DataFrame:
+    df = df.copy()
+    df["dmid_bps"] = df.get("dmid_bps", ((df["mid"] - df["mid"].shift(1)) / df["mid"].shift(1)) * 1e4)
+    df["signed_volume"] = pd.to_numeric(df.get("signed_volume", 0.0), errors="coerce").fillna(0.0)
+    group_keys = [df["Symbol"], df["Time"].dt.date]
+
+    lam_fast = _lambda_feature(df["signed_volume"], df["dmid_bps"], group_keys, win_fast, eps=1e-9)
+    lam_slow = _lambda_feature(df["signed_volume"], df["dmid_bps"], group_keys, win_slow, eps=1e-9)
+    df[f"kyle_lambda_{win_fast}"] = lam_fast
+    df[f"kyle_lambda_{win_slow}"] = lam_slow
+
+    if "flow_intensity_roll" in df.columns and "depth_total_top5" in df.columns:
+        df["stress_ratio"] = df["flow_intensity_roll"] / (df["depth_total_top5"].replace(0, np.nan))
+    if "order_book_imbalance" in df.columns:
+        df["imbalance_delta"] = df["order_book_imbalance"].diff()
+        df["imbalance_vol"] = df["order_book_imbalance"].rolling(stress_window, min_periods=stress_window).std()
+    if "spread" in df.columns and "mid" in df.columns:
+        spread_bps = (df["spread"] / df["mid"]) * 1e4
+        df["spread_bps"] = spread_bps
+        df["spread_bps_vol"] = spread_bps.rolling(stress_window, min_periods=stress_window).std()
+
+    mid = pd.to_numeric(df["mid"], errors="coerce")
+    for h in horizons:
+        future_min = mid.groupby(group_keys).transform(lambda s: s.shift(-1).rolling(h, min_periods=h).min())
+        future_max = mid.groupby(group_keys).transform(lambda s: s.shift(-1).rolling(h, min_periods=h).max())
+        ae_buy = ((future_min - mid) / mid) * 1e4
+        ae_sell = ((future_max - mid) / mid) * 1e4
+        df[f"ae_buy_bps_{h}"] = ae_buy
+        df[f"ae_sell_bps_{h}"] = ae_sell
+
+        if x_mode == "day":
+            def _day_x(g: pd.DataFrame) -> float:
+                vals = pd.concat([g[f"ae_buy_bps_{h}"].abs(), g[f"ae_sell_bps_{h}"].abs()])
+                return float(vals.quantile(x_pct))
+            x_by_day = df.groupby(df["Time"].dt.date).apply(_day_x)
+            x_val = df["Time"].dt.date.map(x_by_day)
+        else:
+            vals = pd.concat([ae_buy.abs(), ae_sell.abs()])
+            x_val = float(vals.quantile(x_pct))
+
+        df[f"lfp_event_buy_{h}"] = ae_buy <= -x_val
+        df[f"lfp_event_sell_{h}"] = ae_sell >= x_val
+
+    return df
+
+
 def _parse_time(value: str) -> Optional[datetime.time]:
     if not value:
         return None
@@ -277,11 +435,20 @@ def main():
     output_root = Path(os.environ.get("OUTPUT_DIR", "data/processed")).expanduser().resolve()
     instrument = os.environ.get("INSTRUMENT", "ES")
     front_month = os.environ.get("FRONT_MONTH", "").strip()
+    front_month_raw = os.environ.get("FRONT_MONTH_RAW", "").strip()
+    front_month_id = os.environ.get("FRONT_MONTH_ID", "").strip()
     step_ms = int(os.environ.get("STEP_MS", "100"))
     horizon_ms = int(os.environ.get("HORIZON_MS", "1000"))
     neutral_band_bps = float(os.environ.get("NEUTRAL_BAND_BPS", "0.0"))
     reprice_bps = float(os.environ.get("REPRICE_BPS", "4.0"))
     flow_window = int(os.environ.get("FLOW_WINDOW", "20"))
+    lfp_horizons = [int(x.strip()) for x in os.environ.get("LFP_HORIZONS", "10,20,50").split(",") if x.strip()]
+    lfp_x_pct = float(os.environ.get("LFP_AE_X_PCT", "0.90"))
+    lfp_x_mode = os.environ.get("LFP_AE_X_MODE", "day").strip().lower()
+    lfp_lambda_fast = int(os.environ.get("LFP_LAMBDA_FAST", "20"))
+    lfp_lambda_slow = int(os.environ.get("LFP_LAMBDA_SLOW", "100"))
+    lfp_stress_window = int(os.environ.get("LFP_STRESS_WINDOW", "50"))
+    lfp_tick_size = float(os.environ.get("LFP_TICK_SIZE", "0"))
     emit_empty = os.environ.get("EMIT_EMPTY", "0").strip() in {"1", "true", "yes", "y"}
     session_start = _parse_time(os.environ.get("SESSION_START", "").strip())
     session_end = _parse_time(os.environ.get("SESSION_END", "").strip())
@@ -325,6 +492,61 @@ def main():
     book: Dict[str, float] = {}
     agg = TradeAgg()
     next_emit_ns: Optional[int] = None
+    allowed_ids: Optional[set[int]] = None
+
+    meta = None
+    if mbp_files:
+        try:
+            meta = db.DBNStore.from_file(mbp_files[0]).metadata
+        except Exception:
+            meta = None
+    elif trade_files:
+        try:
+            meta = db.DBNStore.from_file(trade_files[0]).metadata
+        except Exception:
+            meta = None
+
+    if front_month_id:
+        try:
+            allowed_ids = {int(front_month_id)}
+        except ValueError:
+            raise ValueError("FRONT_MONTH_ID must be an integer instrument_id.")
+    elif front_month_raw:
+        # Build allowed instrument_id set from DBN metadata mappings.
+        if meta and hasattr(meta, "mappings"):
+            ids = set()
+            for raw, intervals in meta.mappings.items():
+                if raw != front_month_raw:
+                    continue
+                for interval in intervals:
+                    try:
+                        ids.add(int(interval.get("symbol")))
+                    except Exception:
+                        continue
+            allowed_ids = ids if ids else None
+        if not allowed_ids:
+            raise ValueError(f"FRONT_MONTH_RAW={front_month_raw} not found in DBN metadata mappings.")
+    elif meta and hasattr(meta, "mappings"):
+        ts0 = pd.to_datetime(heap[0][0], unit="ns", utc=True)
+        auto_raw = _auto_front_month_raw(instrument, ts0, meta.mappings)
+        if auto_raw:
+            ids = set()
+            for raw, intervals in meta.mappings.items():
+                if raw != auto_raw:
+                    continue
+                for interval in intervals:
+                    try:
+                        ids.add(int(interval.get("symbol")))
+                    except Exception:
+                        continue
+            allowed_ids = ids if ids else None
+            if allowed_ids:
+                print(f"Auto-selected FRONT_MONTH_RAW={auto_raw} (instrument_id={sorted(allowed_ids)})")
+        if not allowed_ids:
+            raise ValueError(
+                "No FRONT_MONTH/FRONT_MONTH_RAW/FRONT_MONTH_ID provided and auto-detect failed. "
+                "Set FRONT_MONTH_RAW (e.g., ESZ5) or FRONT_MONTH_ID."
+            )
 
     while heap:
         ts_event, idx, rec, it = heapq.heappop(heap)
@@ -344,7 +566,15 @@ def main():
         if next_emit_ns is None:
             next_emit_ns = int(ts_event // (step_ms * 1_000_000) * (step_ms * 1_000_000) + step_ms * 1_000_000)
 
-        if front_month:
+        if allowed_ids is not None:
+            if getattr(rec, "instrument_id", None) not in allowed_ids:
+                try:
+                    rec = next(it)
+                    heapq.heappush(heap, (rec.ts_event, idx, rec, it))
+                except StopIteration:
+                    pass
+                continue
+        elif front_month:
             rec_symbol = getattr(rec, "symbol", None) or getattr(rec, "instrument", None)
             if rec_symbol and rec_symbol != front_month:
                 try:
@@ -391,7 +621,24 @@ def main():
 
     df = pd.DataFrame(rows)
     df = df.sort_values("Time")
+    if not {"bid_price_1", "ask_price_1"}.issubset(df.columns):
+        raise ValueError("Missing bid_price_1/ask_price_1 in emitted rows; check MBP-10 parsing.")
+    bid = pd.to_numeric(df["bid_price_1"], errors="coerce")
+    ask = pd.to_numeric(df["ask_price_1"], errors="coerce")
+    df["mid"] = 0.5 * (bid + ask)
+    df["spread"] = ask - bid
+    tick_size = _tick_size_for_symbol(instrument, lfp_tick_size)
+    _validate_book_sanity(df, step_ms=step_ms, tick_size=tick_size, jump_bound_points=20.0)
     df = _add_derived_features(df, step_ms=step_ms, window=flow_window)
+    df = _add_lfp_features_labels(
+        df,
+        horizons=lfp_horizons,
+        x_pct=lfp_x_pct,
+        x_mode=lfp_x_mode,
+        win_fast=lfp_lambda_fast,
+        win_slow=lfp_lambda_slow,
+        stress_window=lfp_stress_window,
+    )
     horizon_steps = max(1, horizon_ms // step_ms)
     df, missing_pct = _label_rows(
         df,
@@ -414,6 +661,8 @@ def main():
 
     # Dtype tightening for Parquet size/speed
     float32_cols = [
+        "bid_price_1",
+        "ask_price_1",
         "mid",
         "spread",
         "order_book_imbalance",
@@ -427,7 +676,15 @@ def main():
         "trade_volume",
         "signed_volume",
     ]
-    int32_cols = ["trade_count", "top_bid_depth", "top_ask_depth", "depth_bid_top5", "depth_ask_top5"]
+    int32_cols = [
+        "trade_count",
+        "bid_size_1",
+        "ask_size_1",
+        "top_bid_depth",
+        "top_ask_depth",
+        "depth_bid_top5",
+        "depth_ask_top5",
+    ]
     int8_cols = ["label"]
     for col in float32_cols:
         if col in df.columns:
