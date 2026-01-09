@@ -29,11 +29,15 @@ Env vars:
   SESSION_END          optional session end (HH:MM:SS) in exchange time (treated as UTC if SESSION_TZ unset)
   SESSION_TZ           optional IANA timezone for session filtering (e.g., America/Chicago)
   EMIT_EMPTY           if "1", emit empty intervals even with no events (default: 0)
+  DATE_FILTER         optional YYYY-MM-DD to write a single day only
+  START_DATE          optional YYYY-MM-DD inclusive lower bound for output days
+  END_DATE            optional YYYY-MM-DD inclusive upper bound for output days
 """
 
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -268,6 +272,21 @@ def _add_derived_features(df: pd.DataFrame, step_ms: int, window: int) -> pd.Dat
     return df
 
 
+def _day_health_stats(df_day: pd.DataFrame) -> Dict[str, float]:
+    bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
+    ask = pd.to_numeric(df_day["ask_price_1"], errors="coerce").to_numpy()
+    mid = 0.5 * (bid + ask)
+    mid_diff = np.diff(mid)
+    mid_change_pct = float(np.mean(np.isfinite(mid_diff) & (mid_diff != 0))) if mid_diff.size else 0.0
+    return {
+        "n_rows": int(len(df_day)),
+        "nunique_bid": int(pd.Series(bid).nunique(dropna=True)),
+        "nunique_ask": int(pd.Series(ask).nunique(dropna=True)),
+        "nunique_mid": int(pd.Series(mid).nunique(dropna=True)),
+        "mid_change_pct": mid_change_pct,
+    }
+
+
 def _tick_size_for_symbol(symbol: str, env_tick_size: float) -> float:
     if env_tick_size > 0:
         return env_tick_size
@@ -453,6 +472,9 @@ def main():
     session_start = _parse_time(os.environ.get("SESSION_START", "").strip())
     session_end = _parse_time(os.environ.get("SESSION_END", "").strip())
     session_tz = os.environ.get("SESSION_TZ", "").strip() or None
+    date_filter = os.environ.get("DATE_FILTER", "").strip()
+    start_date = os.environ.get("START_DATE", "").strip()
+    end_date = os.environ.get("END_DATE", "").strip()
 
     files = _iter_dbn_files(input_path) if input_path is not None else []
     if input_mbp is not None:
@@ -696,12 +718,31 @@ def main():
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype("int8")
 
-    # Partition by date
+    # Partition by date (optionally filter)
     df["date"] = df["Time"].dt.date.astype(str)
+    if date_filter:
+        df = df[df["date"] == date_filter]
+    if start_date:
+        df = df[df["date"] >= start_date]
+    if end_date:
+        df = df[df["date"] <= end_date]
     for date, df_day in df.groupby("date"):
         out_dir = output_root / f"instrument={instrument}" / f"date={date}"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / "features_labels.parquet"
+        health = _day_health_stats(df_day)
+        health_path = out_dir / "health.json"
+        with open(health_path, "w", encoding="utf-8") as f:
+            json.dump(health, f, indent=2)
+        if (
+            health["nunique_bid"] < 50
+            or health["nunique_ask"] < 50
+            or health["mid_change_pct"] < 0.005
+        ):
+            raise RuntimeError(
+                f"Day {date} failed health checks: {health}. "
+                "Refusing to write processed output."
+            )
         df_day.drop(columns=["date"]).to_parquet(out_path, index=False)
         print(f"Wrote {len(df_day)} rows to {out_path}")
 

@@ -472,6 +472,106 @@ def _plot_equity(trades_base: pd.DataFrame, trades_gated: pd.DataFrame, out_path
     plt.close()
 
 
+def _day_health_report(
+    df_day: pd.DataFrame,
+    events_day: pd.DataFrame,
+    tick_size: float,
+    lookback_bars: int,
+    entry_threshold_ticks: int,
+    hold_bars: int,
+    spread_min_t: int,
+    spread_max_t: int,
+) -> Dict[str, object]:
+    report: Dict[str, object] = {}
+    n_rows = int(len(df_day))
+    report["n_rows"] = n_rows
+    report["first_time"] = str(df_day["Time"].iloc[0]) if n_rows else None
+    report["last_time"] = str(df_day["Time"].iloc[-1]) if n_rows else None
+
+    if n_rows >= 2:
+        dt_ms = df_day["Time"].diff().dt.total_seconds().to_numpy() * 1000.0
+        dt_ms = dt_ms[np.isfinite(dt_ms) & (dt_ms > 0)]
+        report["median_dt_ms"] = float(np.median(dt_ms)) if dt_ms.size else None
+    else:
+        report["median_dt_ms"] = None
+
+    bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
+    ask = pd.to_numeric(df_day["ask_price_1"], errors="coerce").to_numpy()
+    mid = 0.5 * (bid + ask)
+    spread = ask - bid
+    spread_ticks = np.rint(spread / tick_size).astype(np.int64)
+
+    def _nan_count(arr: np.ndarray) -> int:
+        return int(np.sum(~np.isfinite(arr)))
+
+    report["nan_counts"] = {
+        "bid_price_1": _nan_count(bid),
+        "ask_price_1": _nan_count(ask),
+        "mid": _nan_count(mid),
+        "spread": _nan_count(spread),
+        "top_bid_depth": _nan_count(pd.to_numeric(df_day["top_bid_depth"], errors="coerce").to_numpy())
+        if "top_bid_depth" in df_day.columns
+        else None,
+        "top_ask_depth": _nan_count(pd.to_numeric(df_day["top_ask_depth"], errors="coerce").to_numpy())
+        if "top_ask_depth" in df_day.columns
+        else None,
+        "signed_volume": _nan_count(pd.to_numeric(df_day["signed_volume"], errors="coerce").to_numpy())
+        if "signed_volume" in df_day.columns
+        else None,
+        "trade_count": _nan_count(pd.to_numeric(df_day["trade_count"], errors="coerce").to_numpy())
+        if "trade_count" in df_day.columns
+        else None,
+    }
+
+    report["unique_counts"] = {
+        "bid_price_1": int(pd.Series(bid).nunique(dropna=True)),
+        "ask_price_1": int(pd.Series(ask).nunique(dropna=True)),
+        "mid": int(pd.Series(mid).nunique(dropna=True)),
+    }
+    mid_diff = np.diff(mid)
+    mid_change_pct = float(np.mean(np.isfinite(mid_diff) & (mid_diff != 0))) if mid_diff.size else 0.0
+    report["mid_change_pct"] = mid_change_pct
+    spread_ok = (spread_ticks >= spread_min_t) & (spread_ticks <= spread_max_t)
+    report["spread_ok_pct"] = float(np.mean(spread_ok)) if spread_ok.size else 0.0
+
+    ret_ticks = (mid - np.roll(mid, lookback_bars)) / tick_size
+    ret_ticks[:lookback_bars] = np.nan
+    pos_signals = np.isfinite(ret_ticks) & (ret_ticks >= entry_threshold_ticks)
+    neg_signals = np.isfinite(ret_ticks) & (ret_ticks <= -entry_threshold_ticks)
+    max_i = n_rows - hold_bars - 2
+    valid_idx = np.zeros(n_rows, dtype=bool)
+    if max_i >= lookback_bars:
+        valid_idx[lookback_bars : max_i + 1] = True
+    report["signal_counts"] = {
+        "pos_total": int(np.sum(pos_signals)),
+        "neg_total": int(np.sum(neg_signals)),
+        "pos_valid": int(np.sum(pos_signals & valid_idx)),
+        "neg_valid": int(np.sum(neg_signals & valid_idx)),
+    }
+
+    report["event_counts"] = {
+        "events_total": int(len(events_day)),
+        "events_with_threshold": int(events_day["asym_threshold"].notna().sum()) if not events_day.empty else 0,
+    }
+
+    reasons = []
+    if n_rows < (lookback_bars + hold_bars + 3):
+        reasons.append("insufficient rows for lookback/hold horizon")
+    if report["nan_counts"]["bid_price_1"] and report["nan_counts"]["bid_price_1"] > n_rows * 0.5:
+        reasons.append("bid_price_1 missing for most rows")
+    if report["nan_counts"]["ask_price_1"] and report["nan_counts"]["ask_price_1"] > n_rows * 0.5:
+        reasons.append("ask_price_1 missing for most rows")
+    if mid_change_pct < 0.01:
+        reasons.append("mid rarely changes")
+    if (report["signal_counts"]["pos_valid"] + report["signal_counts"]["neg_valid"]) == 0:
+        reasons.append("no valid entry signals")
+    if report["spread_ok_pct"] < 0.5:
+        reasons.append("spread rarely within expected band")
+    report["likely_reasons"] = reasons[:3]
+
+    return report
+
+
 def main() -> None:
     tick_size = float(os.environ.get("TICK_SIZE", "0.25"))
     lookback_bars = int(os.environ.get("LOOKBACK_BARS", "10"))
@@ -532,6 +632,9 @@ def main() -> None:
     skipped_days: List[str] = []
     day_count = len(selected_days)
 
+    health_dir = out_dir / "health"
+    health_dir.mkdir(parents=True, exist_ok=True)
+
     for gate_mode in gate_modes:
         for gate_lookback_bars in sweep_ws:
             out_dir_w = out_dir / f"W{gate_lookback_bars}" / f"mode={gate_mode}"
@@ -553,6 +656,28 @@ def main() -> None:
                         "event_pos"
                     )
                     all_events.append(events_day)
+
+                    health = _day_health_report(
+                        df_day,
+                        events_day,
+                        tick_size=tick_size,
+                        lookback_bars=lookback_bars,
+                        entry_threshold_ticks=entry_threshold_ticks,
+                        hold_bars=hold_bars,
+                        spread_min_t=spread_min_t,
+                        spread_max_t=spread_max_t,
+                    )
+                    health_path = health_dir / f"{instrument}_{day}_health.json"
+                    with open(health_path, "w", encoding="utf-8") as f:
+                        json.dump(health, f, indent=2)
+                    print(
+                        f"{instrument} {day} health n_rows={health['n_rows']} "
+                        f"median_dt_ms={health['median_dt_ms']} "
+                        f"mid_change_pct={health['mid_change_pct']:.2%} "
+                        f"signals_valid={health['signal_counts']['pos_valid'] + health['signal_counts']['neg_valid']} "
+                        f"events={health['event_counts']['events_total']}",
+                        flush=True,
+                    )
 
                     trades_base, skipped_base, total_signals_base, eligible_base, blocked_base, skip_base = _simulate_day(
                         df_day,
@@ -576,6 +701,16 @@ def main() -> None:
                         gated=True,
                         gate_mode=gate_mode,
                     )
+
+                    if len(trades_base) == 0:
+                        reasons = health.get("likely_reasons", [])
+                        if reasons:
+                            print(
+                                f"{instrument} {day} baseline_trades=0 likely_reasons={reasons}",
+                                flush=True,
+                            )
+                        else:
+                            print(f"{instrument} {day} baseline_trades=0 reason=unknown", flush=True)
 
                     trades_base["date"] = day
                     trades_base["Symbol"] = instrument
