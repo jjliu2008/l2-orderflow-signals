@@ -25,6 +25,8 @@ Gate:
   GATE_MODE_LIST          comma list; overrides GATE_MODE if set
   SWEEP_W                 comma list of W values (optional)
   WORST_Q                 worst-quantile threshold (default: 0.90)
+  TP_TICKS                take profit in ticks (default: 1)
+  SL_TICKS                stop loss in ticks (default: 2)
 
 LRAMS event params (match falsification defaults):
   V_MIN                   min abs signed_volume (default: 1)
@@ -290,10 +292,12 @@ def _simulate_day(
     lookback_bars: int,
     entry_threshold_ticks: int,
     hold_bars: int,
+    tp_ticks: int,
+    sl_ticks: int,
     gate_lookback_bars: int,
     gated: bool,
     gate_mode: str,
-) -> Tuple[pd.DataFrame, int, int, int, int, Dict[str, int]]:
+) -> Tuple[pd.DataFrame, int, int, int, int, int, int, Dict[str, int]]:
     bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
     ask = pd.to_numeric(df_day["ask_price_1"], errors="coerce").to_numpy()
     mid = 0.5 * (bid + ask)
@@ -301,8 +305,11 @@ def _simulate_day(
     trades: List[Dict[str, float]] = []
     skipped = 0
     total_signals = 0
+    signals_when_flat = 0
+    signals_in_position = 0
     eligible_signals = 0
     blocked_signals = 0
+    entries_taken = 0
     skip_reasons = {
         "gated_blocked": 0,
         "no_recent_event": 0,
@@ -333,10 +340,88 @@ def _simulate_day(
         event_asym_sell = event_asym_all[sell_mask.to_numpy()]
         event_thr_sell = event_thr_all[sell_mask.to_numpy()]
 
+    in_position = False
+    pos: Dict[str, object] = {}
+    debug_trigger_printed = False
     i = lookback_bars
-    max_i = n - hold_bars - 2
+    max_i = n - 1
     while i <= max_i:
-        if not np.isfinite(mid[i]) or not np.isfinite(mid[i - lookback_bars]):
+        if in_position:
+            entry_bar = int(pos["entry_bar"])
+            side = str(pos["side"])
+            entry_px = float(pos["entry_px"])
+            tp_level = float(pos["tp_level"])
+            sl_level = float(pos["sl_level"])
+            exit_bar = int(pos["exit_bar"])
+            if i >= lookback_bars and np.isfinite(mid[i]) and np.isfinite(mid[i - lookback_bars]):
+                ret_ticks = (mid[i] - mid[i - lookback_bars]) / tick_size
+                if ret_ticks >= entry_threshold_ticks or ret_ticks <= -entry_threshold_ticks:
+                    total_signals += 1
+                    signals_in_position += 1
+            if i >= entry_bar + 1:
+                mark_px = bid[i] if side == "long" else ask[i]
+                if np.isfinite(mark_px):
+                    if side == "long":
+                        if mark_px >= tp_level:
+                            pos["exit_bar"] = i
+                            pos["exit_reason"] = "TP"
+                        elif mark_px <= sl_level:
+                            pos["exit_bar"] = i
+                            pos["exit_reason"] = "SL"
+                    else:
+                        if mark_px <= tp_level:
+                            pos["exit_bar"] = i
+                            pos["exit_reason"] = "TP"
+                        elif mark_px >= sl_level:
+                            pos["exit_bar"] = i
+                            pos["exit_reason"] = "SL"
+            if i >= int(pos["exit_bar"]):
+                exit_bar = int(pos["exit_bar"])
+                if not np.isfinite(bid[exit_bar]) or not np.isfinite(ask[exit_bar]):
+                    raise RuntimeError("Non-finite exit price; check data integrity.")
+                exit_px = bid[exit_bar] if side == "long" else ask[exit_bar]
+                pnl_ticks = (exit_px - entry_px) / tick_size if side == "long" else (entry_px - exit_px) / tick_size
+                exit_reason = str(pos["exit_reason"])
+                eps = 1e-9
+                if pnl_ticks < -(sl_ticks + eps):
+                    dt_ms = (df_day["Time"].iloc[exit_bar] - pos["entry_time"]).total_seconds() * 1000.0
+                    print(
+                        f"PnL below bound: pnl_ticks={pnl_ticks:.2f} entry={entry_px} exit={exit_px} "
+                        f"side={side} reason={exit_reason} entry_time={pos['entry_time']} "
+                        f"exit_time={df_day['Time'].iloc[exit_bar]} dt_ms={dt_ms:.1f}",
+                        flush=True,
+                    )
+                if not debug_trigger_printed and exit_reason in {"TP", "SL"}:
+                    j0 = entry_bar + 1
+                    j1 = min(entry_bar + 5, exit_bar)
+                    series = (bid[j0 : j1 + 1] if side == "long" else ask[j0 : j1 + 1]).tolist()
+                    print(
+                        f"Exit trigger debug: side={side} entry_bar={entry_bar} exit_bar={exit_bar} "
+                        f"entry_time={pos['entry_time']} exit_time={df_day['Time'].iloc[exit_bar]} "
+                        f"entry_px={entry_px:.2f} exit_px={exit_px:.2f} tp_level={tp_level:.2f} sl_level={sl_level:.2f} "
+                        f"series={series} first_cross_bar={exit_bar} reason={exit_reason}",
+                        flush=True,
+                    )
+                    debug_trigger_printed = True
+                trades.append(
+                    {
+                        "entry_time": pos["entry_time"],
+                        "exit_time": df_day["Time"].iloc[exit_bar],
+                        "side": side,
+                        "entry_px": float(entry_px),
+                        "exit_px": float(exit_px),
+                        "pnl_ticks": float(pnl_ticks),
+                        "entry_bar": int(pos["entry_bar"]),
+                        "exit_bar": int(exit_bar),
+                        "exit_reason": exit_reason,
+                    }
+                )
+                in_position = False
+                pos = {}
+            i += 1
+            continue
+
+        if i < lookback_bars or not np.isfinite(mid[i]) or not np.isfinite(mid[i - lookback_bars]):
             i += 1
             continue
         ret_ticks = (mid[i] - mid[i - lookback_bars]) / tick_size
@@ -348,17 +433,14 @@ def _simulate_day(
         if desired_side is None:
             i += 1
             continue
-        entry_bar = i + 1
-        exit_bar = i + hold_bars + 1
-        if entry_bar >= n or exit_bar >= n:
-            break
-        if not np.isfinite(bid[entry_bar]) or not np.isfinite(ask[entry_bar]):
-            i += 1
-            continue
-        if not np.isfinite(bid[exit_bar]) or not np.isfinite(ask[exit_bar]):
-            i += 1
-            continue
         total_signals += 1
+        entry_bar = i + 1
+        if entry_bar >= n:
+            break
+        if not np.isfinite(bid[entry_bar]) or not np.isfinite(ask[entry_bar]) or not np.isfinite(mid[entry_bar]):
+            i += 1
+            continue
+        signals_when_flat += 1
 
         if gated:
             if gate_mode == "side_matched":
@@ -377,48 +459,82 @@ def _simulate_day(
 
             if event_pos.size == 0:
                 skip_reasons["no_recent_event"] += 1
+                skipped += 1
+                blocked_signals += 1
+                i += 1
+                continue
             else:
-                pos = np.searchsorted(event_pos, entry_bar - 1, side="right") - 1
-                if pos < 0:
+                idx_pos = np.searchsorted(event_pos, entry_bar - 1, side="right") - 1
+                if idx_pos < 0:
                     skip_reasons["no_recent_event"] += 1
-                elif event_pos[pos] < entry_bar - gate_lookback_bars:
+                    skipped += 1
+                    blocked_signals += 1
+                    i += 1
+                    continue
+                elif event_pos[idx_pos] < entry_bar - gate_lookback_bars:
                     skip_reasons["no_event_in_window"] += 1
+                    skipped += 1
+                    blocked_signals += 1
+                    i += 1
+                    continue
                 else:
-                    thr = event_thr[pos]
+                    thr = event_thr[idx_pos]
                     if not np.isfinite(thr):
                         skip_reasons["no_threshold_yet"] += 1
+                        skipped += 1
+                        blocked_signals += 1
+                        i += 1
+                        continue
                     else:
                         eligible_signals += 1
-                        if event_asym[pos] >= thr:
+                        if event_asym[idx_pos] >= thr:
                             skip_reasons["gated_blocked"] += 1
                             skipped += 1
                             blocked_signals += 1
-                            i = exit_bar
+                            i += 1
                             continue
 
-        if desired_side == "long":
-            entry_px = ask[entry_bar]
-            exit_px = bid[exit_bar]
-            pnl_ticks = (exit_px - entry_px) / tick_size
-        else:
-            entry_px = bid[entry_bar]
-            exit_px = ask[exit_bar]
-            pnl_ticks = (entry_px - exit_px) / tick_size
-        trades.append(
-            {
-                "entry_time": df_day["Time"].iloc[entry_bar],
-                "exit_time": df_day["Time"].iloc[exit_bar],
-                "side": desired_side,
-                "entry_px": float(entry_px),
-                "exit_px": float(exit_px),
-                "pnl_ticks": float(pnl_ticks),
-                "entry_bar": int(entry_bar),
-                "exit_bar": int(exit_bar),
-            }
-        )
-        i = exit_bar
+        entry_px = ask[entry_bar] if desired_side == "long" else bid[entry_bar]
+        tp_level = entry_px + (tp_ticks * tick_size if desired_side == "long" else -tp_ticks * tick_size)
+        sl_level = entry_px - (sl_ticks * tick_size if desired_side == "long" else -sl_ticks * tick_size)
+        pos = {
+            "entry_time": df_day["Time"].iloc[entry_bar],
+            "entry_bar": entry_bar,
+            "entry_px": float(entry_px),
+            "exit_bar": int(min(entry_bar + hold_bars, n - 1)),
+            "exit_reason": "TIME",
+            "tp_level": float(tp_level),
+            "sl_level": float(sl_level),
+            "side": desired_side,
+        }
+        in_position = True
+        entries_taken += 1
+        i = entry_bar + 1
 
-    return pd.DataFrame(trades), skipped, total_signals, eligible_signals, blocked_signals, skip_reasons
+    return (
+        pd.DataFrame(trades),
+        skipped,
+        total_signals,
+        signals_when_flat,
+        signals_in_position,
+        entries_taken,
+        eligible_signals,
+        blocked_signals,
+        skip_reasons,
+    )
+
+
+def _equity_stats(pnl: np.ndarray) -> Dict[str, float]:
+    if pnl.size == 0:
+        return {"final": 0.0, "peak": 0.0, "max_dd": 0.0}
+    equity = np.cumsum(pnl)
+    running_peak = np.maximum.accumulate(equity)
+    drawdown = running_peak - equity
+    return {
+        "final": float(equity[-1]),
+        "peak": float(running_peak.max()) if running_peak.size else 0.0,
+        "max_dd": float(drawdown.max()) if drawdown.size else 0.0,
+    }
 
 
 def _metrics(trades: pd.DataFrame) -> Dict[str, float]:
@@ -426,6 +542,8 @@ def _metrics(trades: pd.DataFrame) -> Dict[str, float]:
         return {
             "trade_count": 0,
             "total_pnl_ticks": 0.0,
+            "final_pnl_ticks": 0.0,
+            "peak_equity_ticks": 0.0,
             "mean_pnl_ticks": 0.0,
             "win_rate": 0.0,
             "max_drawdown_ticks": 0.0,
@@ -435,15 +553,15 @@ def _metrics(trades: pd.DataFrame) -> Dict[str, float]:
             "worst_trade_ticks": 0.0,
         }
     pnl = trades["pnl_ticks"].to_numpy()
-    equity = np.cumsum(pnl)
-    peak = np.maximum.accumulate(equity)
-    drawdown = peak - equity
+    eq = _equity_stats(pnl)
     return {
         "trade_count": int(len(trades)),
         "total_pnl_ticks": float(np.sum(pnl)),
+        "final_pnl_ticks": eq["final"],
+        "peak_equity_ticks": eq["peak"],
         "mean_pnl_ticks": float(np.mean(pnl)),
         "win_rate": float(np.mean(pnl > 0)),
-        "max_drawdown_ticks": float(np.max(drawdown)) if len(drawdown) else 0.0,
+        "max_drawdown_ticks": eq["max_dd"],
         "p1": float(np.quantile(pnl, 0.01)),
         "p5": float(np.quantile(pnl, 0.05)),
         "p10": float(np.quantile(pnl, 0.10)),
@@ -585,6 +703,8 @@ def main() -> None:
     else:
         gate_modes = [gate_mode]
     worst_q = float(os.environ.get("WORST_Q", "0.90"))
+    tp_ticks = int(os.environ.get("TP_TICKS", "1"))
+    sl_ticks = int(os.environ.get("SL_TICKS", "2"))
 
     v_min = float(os.environ.get("V_MIN", "1"))
     v_max = float(os.environ.get("V_MAX", "10"))
@@ -646,6 +766,7 @@ def main() -> None:
             all_events = []
 
             day_index = 0
+            sample_printed = False
             for day in selected_days:
                 day_index += 1
                 try:
@@ -679,28 +800,72 @@ def main() -> None:
                         flush=True,
                     )
 
-                    trades_base, skipped_base, total_signals_base, eligible_base, blocked_base, skip_base = _simulate_day(
+                    (
+                        trades_base,
+                        skipped_base,
+                        total_signals_base,
+                        signals_flat_base,
+                        signals_in_pos_base,
+                        entries_taken_base,
+                        eligible_base,
+                        blocked_base,
+                        skip_base,
+                    ) = _simulate_day(
                         df_day,
                         events_day,
                         tick_size=tick_size,
                         lookback_bars=lookback_bars,
                         entry_threshold_ticks=entry_threshold_ticks,
                         hold_bars=hold_bars,
+                        tp_ticks=tp_ticks,
+                        sl_ticks=sl_ticks,
                         gate_lookback_bars=gate_lookback_bars,
                         gated=False,
                         gate_mode=gate_mode,
                     )
-                    trades_gate, skipped_gate, total_signals_gate, eligible_gate, blocked_gate, skip_gate = _simulate_day(
+                    (
+                        trades_gate,
+                        skipped_gate,
+                        total_signals_gate,
+                        signals_flat_gate,
+                        signals_in_pos_gate,
+                        entries_taken_gate,
+                        eligible_gate,
+                        blocked_gate,
+                        skip_gate,
+                    ) = _simulate_day(
                         df_day,
                         events_day,
                         tick_size=tick_size,
                         lookback_bars=lookback_bars,
                         entry_threshold_ticks=entry_threshold_ticks,
                         hold_bars=hold_bars,
+                        tp_ticks=tp_ticks,
+                        sl_ticks=sl_ticks,
                         gate_lookback_bars=gate_lookback_bars,
                         gated=True,
                         gate_mode=gate_mode,
                     )
+
+                    if not sample_printed and day == selected_days[0]:
+                        base_eq = _equity_stats(trades_base["pnl_ticks"].to_numpy())
+                        gate_eq = _equity_stats(trades_gate["pnl_ticks"].to_numpy())
+                        base_stats_sample = _metrics(trades_base)
+                        gate_stats_sample = _metrics(trades_gate)
+                        print(
+                            f"Sample day {instrument} {day} W={gate_lookback_bars} mode={gate_mode} "
+                            f"baseline_final={base_eq['final']:.2f} baseline_peak={base_eq['peak']:.2f} "
+                            f"baseline_max_dd={base_eq['max_dd']:.2f} baseline_worst={base_stats_sample['worst_trade_ticks']:.2f} "
+                            f"baseline_p1={base_stats_sample['p1']:.2f} baseline_p5={base_stats_sample['p5']:.2f} | "
+                            f"gated_final={gate_eq['final']:.2f} gated_peak={gate_eq['peak']:.2f} "
+                            f"gated_max_dd={gate_eq['max_dd']:.2f} gated_worst={gate_stats_sample['worst_trade_ticks']:.2f} "
+                            f"gated_p1={gate_stats_sample['p1']:.2f} gated_p5={gate_stats_sample['p5']:.2f}",
+                            flush=True,
+                        )
+                        assert base_eq["max_dd"] >= 0 and gate_eq["max_dd"] >= 0
+                        assert base_eq["peak"] >= base_eq["final"] or trades_base.empty
+                        assert gate_eq["peak"] >= gate_eq["final"] or trades_gate.empty
+                        sample_printed = True
 
                     if len(trades_base) == 0:
                         reasons = health.get("likely_reasons", [])
@@ -729,12 +894,16 @@ def main() -> None:
                             "W": gate_lookback_bars,
                             "gate_mode": gate_mode,
                             "skipped_trades": int(skipped_base),
-                            "skip_rate": float(skipped_base / total_signals_base) if total_signals_base else 0.0,
+                            "skip_rate": 0.0,
                             "total_signals": int(total_signals_base),
+                            "signals_when_flat": int(signals_flat_base),
+                            "signals_in_position": int(signals_in_pos_base),
                             "eligible_signals": int(eligible_base),
                             "blocked_signals": int(blocked_base),
-                            "coverage": float(eligible_base / total_signals_base) if total_signals_base else 0.0,
-                            "block_rate": float(blocked_base / total_signals_base) if total_signals_base else 0.0,
+                            "entries_taken": int(entries_taken_base),
+                            "entries_blocked_by_gate": 0,
+                            "coverage": float(eligible_base / signals_flat_base) if signals_flat_base else 0.0,
+                            "block_rate": 0.0,
                         }
                     )
                     gate_stats.update(
@@ -745,12 +914,16 @@ def main() -> None:
                             "W": gate_lookback_bars,
                             "gate_mode": gate_mode,
                             "skipped_trades": int(skipped_gate),
-                            "skip_rate": float(skipped_gate / total_signals_gate) if total_signals_gate else 0.0,
+                            "skip_rate": float(blocked_gate / signals_flat_gate) if signals_flat_gate else 0.0,
                             "total_signals": int(total_signals_gate),
+                            "signals_when_flat": int(signals_flat_gate),
+                            "signals_in_position": int(signals_in_pos_gate),
                             "eligible_signals": int(eligible_gate),
                             "blocked_signals": int(blocked_gate),
-                            "coverage": float(eligible_gate / total_signals_gate) if total_signals_gate else 0.0,
-                            "block_rate": float(blocked_gate / total_signals_gate) if total_signals_gate else 0.0,
+                            "entries_taken": int(entries_taken_gate),
+                            "entries_blocked_by_gate": int(blocked_gate),
+                            "coverage": float(eligible_gate / signals_flat_gate) if signals_flat_gate else 0.0,
+                            "block_rate": float(blocked_gate / signals_flat_gate) if signals_flat_gate else 0.0,
                         }
                     )
                     summaries.extend([base_stats, gate_stats])
@@ -762,6 +935,10 @@ def main() -> None:
                             "gate_mode": gate_mode,
                             "baseline_pnl_ticks": base_stats["total_pnl_ticks"],
                             "gated_pnl_ticks": gate_stats["total_pnl_ticks"],
+                            "baseline_final_pnl_ticks": base_stats["final_pnl_ticks"],
+                            "gated_final_pnl_ticks": gate_stats["final_pnl_ticks"],
+                            "baseline_peak_equity_ticks": base_stats["peak_equity_ticks"],
+                            "gated_peak_equity_ticks": gate_stats["peak_equity_ticks"],
                             "pnl_improvement_ticks": gate_stats["total_pnl_ticks"] - base_stats["total_pnl_ticks"],
                             "blocked_signals": int(blocked_gate),
                             "improvement_per_blocked": (gate_stats["total_pnl_ticks"] - base_stats["total_pnl_ticks"])
@@ -777,6 +954,12 @@ def main() -> None:
                             "gated_p5_trade_ticks": gate_stats["p5"],
                             "baseline_mean_trade_ticks": base_stats["mean_pnl_ticks"],
                             "gated_mean_trade_ticks": gate_stats["mean_pnl_ticks"],
+                            "coverage": gate_stats["coverage"],
+                            "block_rate": gate_stats["block_rate"],
+                            "signals_total": int(total_signals_gate),
+                            "signals_when_flat": int(signals_flat_gate),
+                            "signals_in_position": int(signals_in_pos_gate),
+                            "entries_blocked_by_gate": int(blocked_gate),
                         }
                     )
 
@@ -796,17 +979,27 @@ def main() -> None:
                         f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode} skip_reasons={skip_gate}",
                         flush=True,
                     )
-                    expected_skipped = len(trades_base) - len(trades_gate)
-                    if skipped_gate != expected_skipped:
+                    if sum(skip_gate.values()) != skipped_gate:
+                        raise RuntimeError(
+                            f"Skip reasons mismatch: sum={sum(skip_gate.values())} skipped={skipped_gate} "
+                            f"day={day} W={gate_lookback_bars} mode={gate_mode}"
+                        )
+                    if entries_taken_base != signals_flat_base:
+                        raise RuntimeError(
+                            f"Baseline entries mismatch: entries_taken={entries_taken_base} "
+                            f"signals_when_flat={signals_flat_base} day={day}"
+                        )
+                    expected_gate = entries_taken_gate + blocked_gate
+                    if expected_gate != signals_flat_gate:
                         print(
-                            f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode} skip_mismatch skipped={skipped_gate} "
-                            f"expected={expected_skipped} signals={total_signals_gate} reasons={skip_gate}",
+                            f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode} gate_mismatch "
+                            f"entries_taken={entries_taken_gate} blocked={blocked_gate} signals_when_flat={signals_flat_gate}",
                             flush=True,
                         )
-                    assert skipped_gate == expected_skipped, (
-                        f"Skipped mismatch: skipped={skipped_gate} expected={expected_skipped} "
-                        f"symbol={instrument} day={day} W={gate_lookback_bars} mode={gate_mode} reasons={skip_gate}"
-                    )
+                        raise RuntimeError(
+                            f"Gated entries mismatch: entries_taken+blocked={expected_gate} "
+                            f"signals_when_flat={signals_flat_gate} day={day}"
+                        )
                 except Exception as exc:
                     skipped_days.append(f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode}: {exc}")
                     print(f"[{day_index}/{day_count}] {instrument} {day} W={gate_lookback_bars} mode={gate_mode} FAILED: {exc}", flush=True)
@@ -828,6 +1021,20 @@ def main() -> None:
 
     sweep_df = pd.DataFrame(sweep_rows)
     sweep_df.to_csv(out_dir / "summary_sweep.csv", index=False)
+    if not sweep_df.empty:
+        dd_equal = np.isclose(
+            sweep_df["baseline_max_dd_ticks"].astype(float),
+            sweep_df["baseline_final_pnl_ticks"].abs().astype(float),
+        )
+        if bool(dd_equal.all()):
+            print(
+                "Warning: baseline_max_dd_ticks equals |baseline_final_pnl_ticks| for all rows; "
+                "check drawdown computation.",
+                flush=True,
+            )
+        bad_tail = (sweep_df["baseline_p1_trade_ticks"] > sweep_df["baseline_p5_trade_ticks"]).sum()
+        if bad_tail:
+            print("Warning: baseline p1 > p5 detected; check tail computation.", flush=True)
     agg_rows = []
     if not sweep_df.empty:
         for (w, mode), g in sweep_df.groupby(["W", "gate_mode"], sort=False):
@@ -863,6 +1070,14 @@ def main() -> None:
     if not agg_df.empty:
         print("Aggregate summary by W, gate_mode:", flush=True)
         print(agg_df.to_string(index=False), flush=True)
+        for metric, label in [
+            ("median_pnl_improvement_ticks", "median pnl improvement"),
+            ("median_improvement_per_blocked", "median improvement per blocked"),
+            ("median_dd_improvement", "median dd improvement"),
+        ]:
+            top = agg_df.sort_values(metric, ascending=False).head(3)
+            print(f"Top 3 by {label}:", flush=True)
+            print(top[["W", "gate_mode", "days_count", "pct_days_improved", metric]].to_string(index=False), flush=True)
 
     if skipped_days:
         skipped_path = out_dir / "skipped_days.txt"
