@@ -18,6 +18,11 @@ Baseline:
   LOOKBACK_BARS           lookback L (default: 10)
   ENTRY_THRESHOLD_TICKS   entry threshold in ticks (default: 1)
   HOLD_BARS               holding horizon H (default: 20)
+  BASELINE_MODE           flat|not_awful (default: flat)
+  BASELINE_K_BARS         window for not_awful (default: 5)
+  TRADE_SESSION           all|rth (default: all)
+  MIN_SPREAD_TICKS        min spread ticks to allow entry (default: 0)
+  ENTRY_COOLDOWN_BARS     bars to wait after exit (default: 10)
 
 Gate:
   GATE_LOOKBACK_BARS      event lookback W (default: 10)
@@ -43,6 +48,7 @@ import json
 import os
 import sys
 import time
+import datetime
 from collections import deque
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -294,10 +300,15 @@ def _simulate_day(
     hold_bars: int,
     tp_ticks: int,
     sl_ticks: int,
+    baseline_mode: str,
+    baseline_k_bars: int,
+    trade_session: str,
+    min_spread_ticks: int,
+    entry_cooldown_bars: int,
     gate_lookback_bars: int,
     gated: bool,
     gate_mode: str,
-) -> Tuple[pd.DataFrame, int, int, int, int, int, int, Dict[str, int]]:
+) -> Tuple[pd.DataFrame, int, int, int, int, int, int, int, int, int, Dict[str, int]]:
     bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
     ask = pd.to_numeric(df_day["ask_price_1"], errors="coerce").to_numpy()
     mid = 0.5 * (bid + ask)
@@ -309,6 +320,9 @@ def _simulate_day(
     signals_in_position = 0
     eligible_signals = 0
     blocked_signals = 0
+    spread_suppressed = 0
+    session_suppressed = 0
+    cooldown_suppressed = 0
     entries_taken = 0
     skip_reasons = {
         "gated_blocked": 0,
@@ -316,6 +330,43 @@ def _simulate_day(
         "no_threshold_yet": 0,
         "no_event_in_window": 0,
     }
+
+    signed_vol = pd.to_numeric(df_day["signed_volume"], errors="coerce").fillna(0.0).to_numpy()
+    spread_ticks = np.rint((ask - bid) / tick_size).astype(np.int64)
+    if trade_session == "rth":
+        times = pd.to_datetime(df_day["Time"], utc=True, errors="coerce")
+        times_cst = times.dt.tz_convert("America/Chicago")
+        session_ok = (times_cst.dt.time >= datetime.time(9, 30)) & (times_cst.dt.time < datetime.time(16, 0))
+        session_ok = session_ok.to_numpy()
+    else:
+        session_ok = np.ones(n, dtype=bool)
+
+    if baseline_mode == "not_awful":
+        k = max(1, int(baseline_k_bars))
+        cs = np.concatenate([[0.0], np.cumsum(signed_vol)])
+
+        def _signal(i: int) -> str | None:
+            # Simple order-flow sign: take the side of recent signed volume.
+            if i + 1 < k:
+                return None
+            window_sum = cs[i + 1] - cs[i + 1 - k]
+            if window_sum >= 1.0:
+                return "long"
+            if window_sum <= -1.0:
+                return "short"
+            return None
+
+    else:
+
+        def _signal(i: int) -> str | None:
+            if i < lookback_bars or not np.isfinite(mid[i]) or not np.isfinite(mid[i - lookback_bars]):
+                return None
+            ret_ticks = (mid[i] - mid[i - lookback_bars]) / tick_size
+            if ret_ticks >= entry_threshold_ticks:
+                return "long"
+            if ret_ticks <= -entry_threshold_ticks:
+                return "short"
+            return None
 
     if events_day.empty:
         event_pos_all = np.array([], dtype=int)
@@ -343,6 +394,7 @@ def _simulate_day(
     in_position = False
     pos: Dict[str, object] = {}
     debug_trigger_printed = False
+    cooldown_until = -1
     i = lookback_bars
     max_i = n - 1
     while i <= max_i:
@@ -353,11 +405,10 @@ def _simulate_day(
             tp_level = float(pos["tp_level"])
             sl_level = float(pos["sl_level"])
             exit_bar = int(pos["exit_bar"])
-            if i >= lookback_bars and np.isfinite(mid[i]) and np.isfinite(mid[i - lookback_bars]):
-                ret_ticks = (mid[i] - mid[i - lookback_bars]) / tick_size
-                if ret_ticks >= entry_threshold_ticks or ret_ticks <= -entry_threshold_ticks:
-                    total_signals += 1
-                    signals_in_position += 1
+            desired_side = _signal(i)
+            if desired_side is not None:
+                total_signals += 1
+                signals_in_position += 1
             if i >= entry_bar + 1:
                 mark_px = bid[i] if side == "long" else ask[i]
                 if np.isfinite(mark_px):
@@ -403,7 +454,7 @@ def _simulate_day(
                         flush=True,
                     )
                     debug_trigger_printed = True
-                trades.append(
+            trades.append(
                     {
                         "entry_time": pos["entry_time"],
                         "exit_time": df_day["Time"].iloc[exit_bar],
@@ -415,21 +466,14 @@ def _simulate_day(
                         "exit_bar": int(exit_bar),
                         "exit_reason": exit_reason,
                     }
-                )
-                in_position = False
-                pos = {}
+            )
+            in_position = False
+            pos = {}
+            cooldown_until = exit_bar + entry_cooldown_bars
             i += 1
             continue
 
-        if i < lookback_bars or not np.isfinite(mid[i]) or not np.isfinite(mid[i - lookback_bars]):
-            i += 1
-            continue
-        ret_ticks = (mid[i] - mid[i - lookback_bars]) / tick_size
-        desired_side = None
-        if ret_ticks >= entry_threshold_ticks:
-            desired_side = "long"
-        elif ret_ticks <= -entry_threshold_ticks:
-            desired_side = "short"
+        desired_side = _signal(i)
         if desired_side is None:
             i += 1
             continue
@@ -438,6 +482,18 @@ def _simulate_day(
         if entry_bar >= n:
             break
         if not np.isfinite(bid[entry_bar]) or not np.isfinite(ask[entry_bar]) or not np.isfinite(mid[entry_bar]):
+            i += 1
+            continue
+        if entry_bar < len(session_ok) and not session_ok[entry_bar]:
+            session_suppressed += 1
+            i += 1
+            continue
+        if spread_ticks[entry_bar] < min_spread_ticks:
+            spread_suppressed += 1
+            i += 1
+            continue
+        if i < cooldown_until:
+            cooldown_suppressed += 1
             i += 1
             continue
         signals_when_flat += 1
@@ -520,6 +576,9 @@ def _simulate_day(
         entries_taken,
         eligible_signals,
         blocked_signals,
+        spread_suppressed,
+        session_suppressed,
+        cooldown_suppressed,
         skip_reasons,
     )
 
@@ -695,6 +754,11 @@ def main() -> None:
     lookback_bars = int(os.environ.get("LOOKBACK_BARS", "10"))
     entry_threshold_ticks = int(os.environ.get("ENTRY_THRESHOLD_TICKS", "1"))
     hold_bars = int(os.environ.get("HOLD_BARS", "20"))
+    baseline_mode = os.environ.get("BASELINE_MODE", "flat").strip().lower()
+    baseline_k_bars = int(os.environ.get("BASELINE_K_BARS", "5"))
+    trade_session = os.environ.get("TRADE_SESSION", "all").strip().lower()
+    min_spread_ticks = int(os.environ.get("MIN_SPREAD_TICKS", "0"))
+    entry_cooldown_bars = int(os.environ.get("ENTRY_COOLDOWN_BARS", "10"))
     gate_lookback_bars = int(os.environ.get("GATE_LOOKBACK_BARS", "10"))
     gate_mode = os.environ.get("GATE_MODE", "side_matched").strip().lower()
     gate_mode_list_env = os.environ.get("GATE_MODE_LIST", "").strip()
@@ -809,6 +873,9 @@ def main() -> None:
                         entries_taken_base,
                         eligible_base,
                         blocked_base,
+                        spread_supp_base,
+                        session_supp_base,
+                        cooldown_supp_base,
                         skip_base,
                     ) = _simulate_day(
                         df_day,
@@ -819,6 +886,11 @@ def main() -> None:
                         hold_bars=hold_bars,
                         tp_ticks=tp_ticks,
                         sl_ticks=sl_ticks,
+                        baseline_mode=baseline_mode,
+                        baseline_k_bars=baseline_k_bars,
+                        trade_session=trade_session,
+                        min_spread_ticks=min_spread_ticks,
+                        entry_cooldown_bars=entry_cooldown_bars,
                         gate_lookback_bars=gate_lookback_bars,
                         gated=False,
                         gate_mode=gate_mode,
@@ -832,6 +904,9 @@ def main() -> None:
                         entries_taken_gate,
                         eligible_gate,
                         blocked_gate,
+                        spread_supp_gate,
+                        session_supp_gate,
+                        cooldown_supp_gate,
                         skip_gate,
                     ) = _simulate_day(
                         df_day,
@@ -842,6 +917,11 @@ def main() -> None:
                         hold_bars=hold_bars,
                         tp_ticks=tp_ticks,
                         sl_ticks=sl_ticks,
+                        baseline_mode=baseline_mode,
+                        baseline_k_bars=baseline_k_bars,
+                        trade_session=trade_session,
+                        min_spread_ticks=min_spread_ticks,
+                        entry_cooldown_bars=entry_cooldown_bars,
                         gate_lookback_bars=gate_lookback_bars,
                         gated=True,
                         gate_mode=gate_mode,
@@ -893,11 +973,18 @@ def main() -> None:
                             "Symbol": instrument,
                             "W": gate_lookback_bars,
                             "gate_mode": gate_mode,
+                            "baseline_mode": baseline_mode,
+                            "trade_session": trade_session,
+                            "min_spread_ticks": min_spread_ticks,
+                            "entry_cooldown_bars": entry_cooldown_bars,
                             "skipped_trades": int(skipped_base),
                             "skip_rate": 0.0,
                             "total_signals": int(total_signals_base),
                             "signals_when_flat": int(signals_flat_base),
                             "signals_in_position": int(signals_in_pos_base),
+                            "signals_spread_suppressed": int(spread_supp_base),
+                            "signals_session_suppressed": int(session_supp_base),
+                            "signals_cooldown_suppressed": int(cooldown_supp_base),
                             "eligible_signals": int(eligible_base),
                             "blocked_signals": int(blocked_base),
                             "entries_taken": int(entries_taken_base),
@@ -913,11 +1000,18 @@ def main() -> None:
                             "Symbol": instrument,
                             "W": gate_lookback_bars,
                             "gate_mode": gate_mode,
+                            "baseline_mode": baseline_mode,
+                            "trade_session": trade_session,
+                            "min_spread_ticks": min_spread_ticks,
+                            "entry_cooldown_bars": entry_cooldown_bars,
                             "skipped_trades": int(skipped_gate),
                             "skip_rate": float(blocked_gate / signals_flat_gate) if signals_flat_gate else 0.0,
                             "total_signals": int(total_signals_gate),
                             "signals_when_flat": int(signals_flat_gate),
                             "signals_in_position": int(signals_in_pos_gate),
+                            "signals_spread_suppressed": int(spread_supp_gate),
+                            "signals_session_suppressed": int(session_supp_gate),
+                            "signals_cooldown_suppressed": int(cooldown_supp_gate),
                             "eligible_signals": int(eligible_gate),
                             "blocked_signals": int(blocked_gate),
                             "entries_taken": int(entries_taken_gate),
@@ -933,6 +1027,10 @@ def main() -> None:
                             "date": day,
                             "W": gate_lookback_bars,
                             "gate_mode": gate_mode,
+                            "baseline_mode": baseline_mode,
+                            "trade_session": trade_session,
+                            "min_spread_ticks": min_spread_ticks,
+                            "entry_cooldown_bars": entry_cooldown_bars,
                             "baseline_pnl_ticks": base_stats["total_pnl_ticks"],
                             "gated_pnl_ticks": gate_stats["total_pnl_ticks"],
                             "baseline_final_pnl_ticks": base_stats["final_pnl_ticks"],
@@ -960,6 +1058,9 @@ def main() -> None:
                             "signals_when_flat": int(signals_flat_gate),
                             "signals_in_position": int(signals_in_pos_gate),
                             "entries_blocked_by_gate": int(blocked_gate),
+                            "signals_spread_suppressed": int(spread_supp_gate),
+                            "signals_session_suppressed": int(session_supp_gate),
+                            "signals_cooldown_suppressed": int(cooldown_supp_gate),
                         }
                     )
 
@@ -972,7 +1073,15 @@ def main() -> None:
                         f"[{day_index}/{day_count}] {instrument} {day} W={gate_lookback_bars} mode={gate_mode} "
                         f"baseline trades={len(trades_base)} pnl={base_stats['total_pnl_ticks']:.2f} "
                         f"gated trades={len(trades_gate)} pnl={gate_stats['total_pnl_ticks']:.2f} "
-                        f"skipped={skipped_gate} block_rate={gate_stats['block_rate']:.2%} coverage={gate_stats['coverage']:.2%}",
+                        f"skipped={skipped_gate} block_rate={gate_stats['block_rate']:.2%} coverage={gate_stats['coverage']:.2%} "
+                        f"spread_supp={spread_supp_gate} cooldown_supp={cooldown_supp_gate}",
+                        flush=True,
+                    )
+                    base_cooldown_reduction = cooldown_supp_base / max(1, (signals_flat_base + cooldown_supp_base))
+                    gate_cooldown_reduction = cooldown_supp_gate / max(1, (signals_flat_gate + cooldown_supp_gate))
+                    print(
+                        f"{instrument} {day} cooldown_reduction baseline={base_cooldown_reduction:.2%} "
+                        f"gated={gate_cooldown_reduction:.2%}",
                         flush=True,
                     )
                     print(
