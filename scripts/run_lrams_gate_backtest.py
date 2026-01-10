@@ -1020,6 +1020,25 @@ def main() -> None:
                             "block_rate": float(blocked_gate / signals_flat_gate) if signals_flat_gate else 0.0,
                         }
                     )
+                    drop_reasons = []
+                    if signals_flat_base == 0:
+                        drop_reasons.append("zero_signals_when_flat")
+                    if entries_taken_base == 0:
+                        drop_reasons.append("zero_baseline_trades")
+                    if entries_taken_gate == 0:
+                        drop_reasons.append("zero_gated_trades")
+                    if drop_reasons:
+                        print(
+                            f"DROP {instrument} {day} W={gate_lookback_bars} mode={gate_mode} "
+                            f"reasons={drop_reasons} signals_when_flat={signals_flat_base} "
+                            f"baseline_trades={entries_taken_base} gated_trades={entries_taken_gate} "
+                            f"entries_blocked_by_gate={blocked_gate} coverage={gate_stats['coverage']:.2%}",
+                            flush=True,
+                        )
+                        skipped_days.append(
+                            f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode}: {','.join(drop_reasons)}"
+                        )
+                        continue
                     summaries.extend([base_stats, gate_stats])
                     sweep_rows.append(
                         {
