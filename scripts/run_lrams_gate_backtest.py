@@ -1,6 +1,8 @@
 """
 LRAMS gate backtest: compare baseline vs baseline + LRAMS gate.
 
+Note: aggregate improvement stats are computed over all days, with improved/worsened medians reported separately.
+
 Env vars:
   DATA_DIR                root data dir (default: data/processed)
   OUTPUT_DIR              artifacts output dir (default: artifacts/lrams_gate)
@@ -308,12 +310,13 @@ def _simulate_day(
     gate_lookback_bars: int,
     gated: bool,
     gate_mode: str,
-) -> Tuple[pd.DataFrame, int, int, int, int, int, int, int, int, int, Dict[str, int]]:
+) -> Tuple[pd.DataFrame, float, int, int, int, int, int, int, int, int, int, Dict[str, int]]:
     bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
     ask = pd.to_numeric(df_day["ask_price_1"], errors="coerce").to_numpy()
     mid = 0.5 * (bid + ask)
     n = len(df_day)
     trades: List[Dict[str, float]] = []
+    pnl_ticks_total = 0.0
     skipped = 0
     total_signals = 0
     signals_when_flat = 0
@@ -394,6 +397,7 @@ def _simulate_day(
     in_position = False
     pos: Dict[str, object] = {}
     debug_trigger_printed = False
+    pnl_bound_printed = 0
     cooldown_until = -1
     i = lookback_bars
     max_i = n - 1
@@ -405,6 +409,9 @@ def _simulate_day(
             tp_level = float(pos["tp_level"])
             sl_level = float(pos["sl_level"])
             exit_bar = int(pos["exit_bar"])
+            exit_px = float("nan")
+            pnl_ticks = float("nan")
+            exit_reason = str(pos.get("exit_reason", "TIME"))
             desired_side = _signal(i)
             if desired_side is not None:
                 total_signals += 1
@@ -432,29 +439,70 @@ def _simulate_day(
                     raise RuntimeError("Non-finite exit price; check data integrity.")
                 exit_px = bid[exit_bar] if side == "long" else ask[exit_bar]
                 pnl_ticks = (exit_px - entry_px) / tick_size if side == "long" else (entry_px - exit_px) / tick_size
-                exit_reason = str(pos["exit_reason"])
+                exit_reason = str(pos.get("exit_reason", "TIME"))
                 eps = 1e-9
-                if pnl_ticks < -(sl_ticks + eps):
+                entry_spread = float(pos.get("entry_spread_ticks", 0.0))
+                floor_ticks = -(sl_ticks + entry_spread + eps)
+                if not np.isfinite(pnl_ticks):
+                    if pnl_bound_printed < 5:
+                        try:
+                            print(
+                                "PnL nan:",
+                                {
+                                    "side": side,
+                                    "reason": exit_reason,
+                                    "entry_time": str(pos["entry_time"]),
+                                    "exit_time": str(df_day["Time"].iloc[exit_bar]),
+                                    "entry_px": float(entry_px),
+                                    "exit_px": float(exit_px),
+                                },
+                                flush=True,
+                            )
+                        except OSError:
+                            pass
+                        pnl_bound_printed += 1
+                    in_position = False
+                    pos = {}
+                    i += 1
+                    continue
+                if pnl_ticks < floor_ticks and pnl_bound_printed < 5:
                     dt_ms = (df_day["Time"].iloc[exit_bar] - pos["entry_time"]).total_seconds() * 1000.0
-                    print(
-                        f"PnL below bound: pnl_ticks={pnl_ticks:.2f} entry={entry_px} exit={exit_px} "
-                        f"side={side} reason={exit_reason} entry_time={pos['entry_time']} "
-                        f"exit_time={df_day['Time'].iloc[exit_bar]} dt_ms={dt_ms:.1f}",
-                        flush=True,
-                    )
+                    try:
+                        print(
+                            "PnL below bound:",
+                            {
+                                "pnl_ticks": float(pnl_ticks),
+                                "floor_ticks": float(floor_ticks),
+                                "side": side,
+                                "reason": exit_reason,
+                                "entry_time": str(pos["entry_time"]),
+                                "exit_time": str(df_day["Time"].iloc[exit_bar]),
+                                "entry_px": float(entry_px),
+                                "exit_px": float(exit_px),
+                                "entry_spread_ticks": float(entry_spread),
+                                "dt_ms": float(dt_ms),
+                            },
+                            flush=True,
+                        )
+                    except OSError:
+                        pass
+                    pnl_bound_printed += 1
                 if not debug_trigger_printed and exit_reason in {"TP", "SL"}:
                     j0 = entry_bar + 1
                     j1 = min(entry_bar + 5, exit_bar)
                     series = (bid[j0 : j1 + 1] if side == "long" else ask[j0 : j1 + 1]).tolist()
-                    print(
-                        f"Exit trigger debug: side={side} entry_bar={entry_bar} exit_bar={exit_bar} "
-                        f"entry_time={pos['entry_time']} exit_time={df_day['Time'].iloc[exit_bar]} "
-                        f"entry_px={entry_px:.2f} exit_px={exit_px:.2f} tp_level={tp_level:.2f} sl_level={sl_level:.2f} "
-                        f"series={series} first_cross_bar={exit_bar} reason={exit_reason}",
-                        flush=True,
-                    )
+                    try:
+                        print(
+                            f"Exit trigger debug: side={side} entry_bar={entry_bar} exit_bar={exit_bar} "
+                            f"entry_time={pos['entry_time']} exit_time={df_day['Time'].iloc[exit_bar]} "
+                            f"entry_px={entry_px:.2f} exit_px={exit_px:.2f} tp_level={tp_level:.2f} sl_level={sl_level:.2f} "
+                            f"series={series} first_cross_bar={exit_bar} reason={exit_reason}",
+                            flush=True,
+                        )
+                    except OSError:
+                        pass
                     debug_trigger_printed = True
-            trades.append(
+                trades.append(
                     {
                         "entry_time": pos["entry_time"],
                         "exit_time": df_day["Time"].iloc[exit_bar],
@@ -466,12 +514,13 @@ def _simulate_day(
                         "exit_bar": int(exit_bar),
                         "exit_reason": exit_reason,
                     }
-            )
-            in_position = False
-            pos = {}
-            cooldown_until = exit_bar + entry_cooldown_bars
-            i += 1
-            continue
+                )
+                pnl_ticks_total += float(pnl_ticks)
+                in_position = False
+                pos = {}
+                cooldown_until = exit_bar + entry_cooldown_bars
+                i += 1
+                continue
 
         desired_side = _signal(i)
         if desired_side is None:
@@ -551,6 +600,7 @@ def _simulate_day(
                             continue
 
         entry_px = ask[entry_bar] if desired_side == "long" else bid[entry_bar]
+        entry_spread_ticks = float(spread_ticks[entry_bar])
         tp_level = entry_px + (tp_ticks * tick_size if desired_side == "long" else -tp_ticks * tick_size)
         sl_level = entry_px - (sl_ticks * tick_size if desired_side == "long" else -sl_ticks * tick_size)
         pos = {
@@ -561,6 +611,7 @@ def _simulate_day(
             "exit_reason": "TIME",
             "tp_level": float(tp_level),
             "sl_level": float(sl_level),
+            "entry_spread_ticks": entry_spread_ticks,
             "side": desired_side,
         }
         in_position = True
@@ -569,6 +620,7 @@ def _simulate_day(
 
     return (
         pd.DataFrame(trades),
+        float(pnl_ticks_total),
         skipped,
         total_signals,
         signals_when_flat,
@@ -793,6 +845,8 @@ def main() -> None:
     if not selected_days:
         raise ValueError("No days selected; check DATA_DIR and date filters.")
     print(f"Discovered {len(selected_days)} processed days: {selected_days}", flush=True)
+    if os.environ.get("USE_ALL_AVAILABLE_DAYS", "0").strip() == "1" and len(selected_days) < 5:
+        print("Warning: USE_ALL_AVAILABLE_DAYS selected fewer than 5 days; low-confidence results.", flush=True)
     if len(selected_days) < 3:
         print("Warning: fewer than 3 days selected; continuing.", flush=True)
     df = _load_data()
@@ -866,6 +920,7 @@ def main() -> None:
 
                     (
                         trades_base,
+                        pnl_total_base,
                         skipped_base,
                         total_signals_base,
                         signals_flat_base,
@@ -897,6 +952,7 @@ def main() -> None:
                     )
                     (
                         trades_gate,
+                        pnl_total_gate,
                         skipped_gate,
                         total_signals_gate,
                         signals_flat_gate,
@@ -957,6 +1013,8 @@ def main() -> None:
                         else:
                             print(f"{instrument} {day} baseline_trades=0 reason=unknown", flush=True)
 
+                    assert np.isfinite(pnl_total_base), "baseline pnl total is not finite"
+                    assert np.isfinite(pnl_total_gate), "gated pnl total is not finite"
                     trades_base["date"] = day
                     trades_base["Symbol"] = instrument
                     trades_gate["date"] = day
@@ -1036,52 +1094,80 @@ def main() -> None:
                             flush=True,
                         )
                         skipped_days.append(
-                            f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode}: {','.join(drop_reasons)}"
+                            f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode}: {','.join(drop_reasons)} "
+                            f"signals_when_flat={signals_flat_base} baseline_trades={entries_taken_base} "
+                            f"gated_trades={entries_taken_gate} entries_blocked_by_gate={blocked_gate} "
+                            f"coverage={gate_stats['coverage']:.2%}"
                         )
-                        continue
                     summaries.extend([base_stats, gate_stats])
-                    sweep_rows.append(
-                        {
-                            "Symbol": instrument,
-                            "date": day,
-                            "W": gate_lookback_bars,
-                            "gate_mode": gate_mode,
-                            "baseline_mode": baseline_mode,
-                            "trade_session": trade_session,
-                            "min_spread_ticks": min_spread_ticks,
-                            "entry_cooldown_bars": entry_cooldown_bars,
-                            "baseline_pnl_ticks": base_stats["total_pnl_ticks"],
-                            "gated_pnl_ticks": gate_stats["total_pnl_ticks"],
-                            "baseline_final_pnl_ticks": base_stats["final_pnl_ticks"],
-                            "gated_final_pnl_ticks": gate_stats["final_pnl_ticks"],
-                            "baseline_peak_equity_ticks": base_stats["peak_equity_ticks"],
-                            "gated_peak_equity_ticks": gate_stats["peak_equity_ticks"],
-                            "pnl_improvement_ticks": gate_stats["total_pnl_ticks"] - base_stats["total_pnl_ticks"],
-                            "blocked_signals": int(blocked_gate),
-                            "improvement_per_blocked": (gate_stats["total_pnl_ticks"] - base_stats["total_pnl_ticks"])
-                            / max(int(blocked_gate), 1),
-                            "baseline_max_dd_ticks": base_stats["max_drawdown_ticks"],
-                            "gated_max_dd_ticks": gate_stats["max_drawdown_ticks"],
-                            "dd_improvement": base_stats["max_drawdown_ticks"] - gate_stats["max_drawdown_ticks"],
-                            "baseline_worst_trade_ticks": base_stats["worst_trade_ticks"],
-                            "gated_worst_trade_ticks": gate_stats["worst_trade_ticks"],
-                            "baseline_p1_trade_ticks": base_stats["p1"],
-                            "gated_p1_trade_ticks": gate_stats["p1"],
-                            "baseline_p5_trade_ticks": base_stats["p5"],
-                            "gated_p5_trade_ticks": gate_stats["p5"],
-                            "baseline_mean_trade_ticks": base_stats["mean_pnl_ticks"],
-                            "gated_mean_trade_ticks": gate_stats["mean_pnl_ticks"],
-                            "coverage": gate_stats["coverage"],
-                            "block_rate": gate_stats["block_rate"],
-                            "signals_total": int(total_signals_gate),
-                            "signals_when_flat": int(signals_flat_gate),
-                            "signals_in_position": int(signals_in_pos_gate),
-                            "entries_blocked_by_gate": int(blocked_gate),
-                            "signals_spread_suppressed": int(spread_supp_gate),
-                            "signals_session_suppressed": int(session_supp_gate),
-                            "signals_cooldown_suppressed": int(cooldown_supp_gate),
-                        }
+                    row = {
+                        "Symbol": instrument,
+                        "date": day,
+                        "W": gate_lookback_bars,
+                        "gate_mode": gate_mode,
+                        "baseline_mode": baseline_mode,
+                        "trade_session": trade_session,
+                        "min_spread_ticks": min_spread_ticks,
+                        "entry_cooldown_bars": entry_cooldown_bars,
+                        "baseline_trades": int(len(trades_base)),
+                        "gated_trades": int(len(trades_gate)),
+                        "baseline_pnl_ticks": float(base_stats["total_pnl_ticks"]),
+                        "gated_pnl_ticks": float(gate_stats["total_pnl_ticks"]),
+                        "baseline_final_pnl_ticks": float(pnl_total_base),
+                        "gated_final_pnl_ticks": float(pnl_total_gate),
+                        "baseline_peak_equity_ticks": float(base_stats["peak_equity_ticks"]),
+                        "gated_peak_equity_ticks": float(gate_stats["peak_equity_ticks"]),
+                        "pnl_improvement_ticks": float(pnl_total_gate - pnl_total_base),
+                        "blocked_signals": int(blocked_gate),
+                        "improvement_per_blocked": float((pnl_total_gate - pnl_total_base) / max(int(blocked_gate), 1)),
+                        "baseline_max_dd_ticks": float(base_stats["max_drawdown_ticks"]),
+                        "gated_max_dd_ticks": float(gate_stats["max_drawdown_ticks"]),
+                        "dd_improvement": float(base_stats["max_drawdown_ticks"] - gate_stats["max_drawdown_ticks"]),
+                        "baseline_worst_trade_ticks": float(base_stats["worst_trade_ticks"]),
+                        "gated_worst_trade_ticks": float(gate_stats["worst_trade_ticks"]),
+                        "baseline_p1_trade_ticks": float(base_stats["p1"]),
+                        "gated_p1_trade_ticks": float(gate_stats["p1"]),
+                        "baseline_p5_trade_ticks": float(base_stats["p5"]),
+                        "gated_p5_trade_ticks": float(gate_stats["p5"]),
+                        "baseline_mean_trade_ticks": float(base_stats["mean_pnl_ticks"]),
+                        "gated_mean_trade_ticks": float(gate_stats["mean_pnl_ticks"]),
+                        "coverage": float(gate_stats["coverage"]),
+                        "block_rate": float(gate_stats["block_rate"]),
+                        "signals_total": int(total_signals_gate),
+                        "signals_when_flat": int(signals_flat_gate),
+                        "signals_in_position": int(signals_in_pos_gate),
+                        "entries_blocked_by_gate": int(blocked_gate),
+                        "entries_taken_gated": int(entries_taken_gate),
+                        "signals_spread_suppressed": int(spread_supp_gate),
+                        "signals_session_suppressed": int(session_supp_gate),
+                        "signals_cooldown_suppressed": int(cooldown_supp_gate),
+                    }
+                    row["is_improved"] = row["pnl_improvement_ticks"] > 0
+                    print(
+                        "DAY_ROW_HAS",
+                        "pnl_improvement_ticks" in row,
+                        row.get("pnl_improvement_ticks"),
+                        row.get("baseline_final_pnl_ticks"),
+                        row.get("gated_final_pnl_ticks"),
+                        flush=True,
                     )
+                    print(f"DAY_ROW_KEYS={sorted(row.keys())}", flush=True)
+                    print(
+                        "ROW "
+                        f"{row['Symbol']} {row['date']} W={row['W']} mode={row['gate_mode']} "
+                        f"baseline_trades={row['baseline_trades']} gated_trades={row['gated_trades']} "
+                        f"baseline_final={row['baseline_final_pnl_ticks']:.4f} gated_final={row['gated_final_pnl_ticks']:.4f} "
+                        f"pnl_improvement={row['pnl_improvement_ticks']:.4f} "
+                        f"baseline_max_dd={row['baseline_max_dd_ticks']:.4f} gated_max_dd={row['gated_max_dd_ticks']:.4f} "
+                        f"dd_improvement={row['dd_improvement']:.4f} "
+                        f"blocked={row['entries_blocked_by_gate']} "
+                        f"improvement_per_blocked={row['improvement_per_blocked']:.4f} "
+                        f"is_improved={row['is_improved']}",
+                        flush=True,
+                    )
+                    sweep_rows.append(row)
+                    if drop_reasons:
+                        continue
 
                     day_dir = out_dir_w / f"{instrument}_{day}"
                     day_dir.mkdir(parents=True, exist_ok=True)
@@ -1150,6 +1236,50 @@ def main() -> None:
     sweep_df = pd.DataFrame(sweep_rows)
     sweep_df.to_csv(out_dir / "summary_sweep.csv", index=False)
     if not sweep_df.empty:
+        numeric_cols = [
+            "baseline_pnl_ticks",
+            "gated_pnl_ticks",
+            "baseline_final_pnl_ticks",
+            "gated_final_pnl_ticks",
+            "baseline_peak_equity_ticks",
+            "gated_peak_equity_ticks",
+            "pnl_improvement_ticks",
+            "improvement_per_blocked",
+            "baseline_max_dd_ticks",
+            "gated_max_dd_ticks",
+            "dd_improvement",
+            "baseline_worst_trade_ticks",
+            "gated_worst_trade_ticks",
+            "baseline_p1_trade_ticks",
+            "gated_p1_trade_ticks",
+            "baseline_p5_trade_ticks",
+            "gated_p5_trade_ticks",
+            "baseline_mean_trade_ticks",
+            "gated_mean_trade_ticks",
+        ]
+        for col in numeric_cols:
+            if col in sweep_df.columns:
+                sweep_df[col] = pd.to_numeric(sweep_df[col], errors="coerce")
+        sweep_df.to_csv(out_dir / "summary_sweep.csv", index=False)
+    if not sweep_df.empty:
+        coverage_cols = [
+            "Symbol",
+            "date",
+            "W",
+            "gate_mode",
+            "baseline_trades",
+            "gated_trades",
+            "signals_when_flat",
+            "entries_blocked_by_gate",
+            "entries_taken_gated",
+            "coverage",
+            "block_rate",
+        ]
+        coverage_df = sweep_df[coverage_cols].copy()
+        coverage_df.to_csv(out_dir / "coverage_activity.csv", index=False)
+        print("Coverage/activity by day:", flush=True)
+        print(coverage_df.to_string(index=False), flush=True)
+    if not sweep_df.empty:
         dd_equal = np.isclose(
             sweep_df["baseline_max_dd_ticks"].astype(float),
             sweep_df["baseline_final_pnl_ticks"].abs().astype(float),
@@ -1167,20 +1297,51 @@ def main() -> None:
     if not sweep_df.empty:
         for (w, mode), g in sweep_df.groupby(["W", "gate_mode"], sort=False):
             days_count = int(g.shape[0])
-            pnl_imp = g["pnl_improvement_ticks"]
-            imp_per_block = g["improvement_per_blocked"]
-            dd_imp = g["dd_improvement"]
+            pnl_imp = pd.to_numeric(g["pnl_improvement_ticks"], errors="coerce")
+            imp_per_block = pd.to_numeric(g["improvement_per_blocked"], errors="coerce")
+            dd_imp = pd.to_numeric(g["dd_improvement"], errors="coerce")
             worst_imp = g["baseline_worst_trade_ticks"] - g["gated_worst_trade_ticks"]
             p1_imp = g["baseline_p1_trade_ticks"] - g["gated_p1_trade_ticks"]
             p5_imp = g["baseline_p5_trade_ticks"] - g["gated_p5_trade_ticks"]
+            pnl_values = pnl_imp.dropna().to_numpy()
+            pnl_values = pnl_values[np.isfinite(pnl_values)]
+            if pnl_values.size == 0:
+                print(
+                    f"Aggregate warning: empty pnl_improvement_ticks for W={w} mode={mode} "
+                    f"rows={days_count}",
+                    flush=True,
+                )
+                print(
+                    g[
+                        [
+                            "date",
+                            "baseline_final_pnl_ticks",
+                            "gated_final_pnl_ticks",
+                            "pnl_improvement_ticks",
+                        ]
+                    ]
+                    .head()
+                    .to_string(index=False),
+                    flush=True,
+                )
+            improved = pnl_values[pnl_values > 0]
+            worsened = pnl_values[pnl_values < 0]
+            median_all = float(np.median(pnl_values)) if pnl_values.size else None
+            mean_all = float(np.mean(pnl_values)) if pnl_values.size else None
+            median_improved = float(np.median(improved)) if improved.size else None
+            median_worsened = float(np.median(worsened)) if worsened.size else None
             agg_rows.append(
                 {
                     "W": w,
                     "gate_mode": mode,
                     "days_count": days_count,
-                    "pct_days_improved": float(np.mean(pnl_imp > 0)) if days_count else 0.0,
-                    "median_pnl_improvement_ticks": float(np.median(pnl_imp)) if days_count else np.nan,
-                    "mean_pnl_improvement_ticks": float(np.mean(pnl_imp)) if days_count else np.nan,
+                    "pct_days_improved": float(improved.size / days_count) if days_count else 0.0,
+                    "median_improvement_all_days": median_all,
+                    "mean_improvement_all_days": mean_all,
+                    "median_improvement_improved_days": median_improved,
+                    "median_improvement_worsened_days": median_worsened,
+                    "median_pnl_improvement_ticks": median_all,
+                    "mean_pnl_improvement_ticks": mean_all,
                     "median_improvement_per_blocked": float(np.median(imp_per_block)) if days_count else np.nan,
                     "mean_improvement_per_blocked": float(np.mean(imp_per_block)) if days_count else np.nan,
                     "median_dd_improvement": float(np.median(dd_imp)) if days_count else np.nan,
@@ -1199,13 +1360,22 @@ def main() -> None:
         print("Aggregate summary by W, gate_mode:", flush=True)
         print(agg_df.to_string(index=False), flush=True)
         for metric, label in [
-            ("median_pnl_improvement_ticks", "median pnl improvement"),
+            ("median_improvement_all_days", "median pnl improvement"),
             ("median_improvement_per_blocked", "median improvement per blocked"),
             ("median_dd_improvement", "median dd improvement"),
         ]:
-            top = agg_df.sort_values(metric, ascending=False).head(3)
+            top = agg_df.sort_values(metric, ascending=False, na_position="last").head(3)
             print(f"Top 3 by {label}:", flush=True)
             print(top[["W", "gate_mode", "days_count", "pct_days_improved", metric]].to_string(index=False), flush=True)
+        if bool((agg_df["pct_days_improved"] > 0).any()):
+            top = agg_df.sort_values("median_improvement_improved_days", ascending=False, na_position="last").head(3)
+            print("Top 3 by median improvement (improved days):", flush=True)
+            print(
+                top[
+                    ["W", "gate_mode", "days_count", "pct_days_improved", "median_improvement_improved_days"]
+                ].to_string(index=False),
+                flush=True,
+            )
 
     if skipped_days:
         skipped_path = out_dir / "skipped_days.txt"
