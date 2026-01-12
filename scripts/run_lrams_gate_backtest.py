@@ -20,8 +20,13 @@ Baseline:
   LOOKBACK_BARS           lookback L (default: 10)
   ENTRY_THRESHOLD_TICKS   entry threshold in ticks (default: 1)
   HOLD_BARS               holding horizon H (default: 20)
-  BASELINE_MODE           flat|not_awful (default: flat)
+  BASELINE_MODE           flat|not_awful|mmas (default: flat)
   BASELINE_K_BARS         window for not_awful (default: 5)
+  MMAS_K_BARS             window for MMAS (default: 5)
+  MMAS_MIN_DMID_TICKS     min dmid ticks for MMAS (default: 1)
+  MMAS_MIN_FLOW_ABS       min abs flow for MMAS (default: 20)
+  MMAS_REQUIRE_AGREE      require dmid/flow sign agreement (default: 1)
+  DEBUG_FIRST_MMAS        print first MMAS decision (default: 0)
   TRADE_SESSION           all|rth (default: all)
   MIN_SPREAD_TICKS        min spread ticks to allow entry (default: 0)
   ENTRY_COOLDOWN_BARS     bars to wait after exit (default: 10)
@@ -304,13 +309,18 @@ def _simulate_day(
     sl_ticks: int,
     baseline_mode: str,
     baseline_k_bars: int,
+    mmas_k_bars: int,
+    mmas_min_dmid_ticks: int,
+    mmas_min_flow_abs: float,
+    mmas_require_agree: bool,
+    debug_first_mmas: bool,
     trade_session: str,
     min_spread_ticks: int,
     entry_cooldown_bars: int,
     gate_lookback_bars: int,
     gated: bool,
     gate_mode: str,
-) -> Tuple[pd.DataFrame, float, int, int, int, int, int, int, int, int, int, Dict[str, int]]:
+) -> Tuple[pd.DataFrame, float, int, int, int, int, int, int, int, int, int, int, int, int, Dict[str, int]]:
     bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
     ask = pd.to_numeric(df_day["ask_price_1"], errors="coerce").to_numpy()
     mid = 0.5 * (bid + ask)
@@ -327,6 +337,10 @@ def _simulate_day(
     session_suppressed = 0
     cooldown_suppressed = 0
     entries_taken = 0
+    mmas_signals_checked = 0
+    mmas_passed_filters = 0
+    mmas_signaled = 0
+    mmas_entered = 0
     skip_reasons = {
         "gated_blocked": 0,
         "no_recent_event": 0,
@@ -370,6 +384,24 @@ def _simulate_day(
             if ret_ticks <= -entry_threshold_ticks:
                 return "short"
             return None
+    if baseline_mode == "mmas":
+        k = max(1, int(mmas_k_bars))
+        cs = np.concatenate([[0.0], np.cumsum(signed_vol)])
+
+        def _mmas_signal(i: int) -> Tuple[str | None, float, float, bool]:
+            if i < k or not np.isfinite(mid[i]) or not np.isfinite(mid[i - k]):
+                return None, float("nan"), 0.0, False
+            dmid_ticks = (mid[i] - mid[i - k]) / tick_size
+            flow = cs[i + 1] - cs[i + 1 - k]
+            if abs(dmid_ticks) < mmas_min_dmid_ticks or abs(flow) < mmas_min_flow_abs:
+                return None, float(dmid_ticks), float(flow), False
+            if mmas_require_agree and np.sign(dmid_ticks) != np.sign(flow):
+                return None, float(dmid_ticks), float(flow), False
+            if dmid_ticks > 0:
+                return "long", float(dmid_ticks), float(flow), True
+            if dmid_ticks < 0:
+                return "short", float(dmid_ticks), float(flow), True
+            return None, float(dmid_ticks), float(flow), False
 
     if events_day.empty:
         event_pos_all = np.array([], dtype=int)
@@ -397,6 +429,7 @@ def _simulate_day(
     in_position = False
     pos: Dict[str, object] = {}
     debug_trigger_printed = False
+    debug_mmas_printed = False
     pnl_bound_printed = 0
     cooldown_until = -1
     i = lookback_bars
@@ -522,7 +555,19 @@ def _simulate_day(
                 i += 1
                 continue
 
-        desired_side = _signal(i)
+        desired_side = None
+        dmid_ticks = float("nan")
+        flow = 0.0
+        mmas_passed = False
+        if baseline_mode == "mmas":
+            mmas_signals_checked += 1
+            desired_side, dmid_ticks, flow, mmas_passed = _mmas_signal(i)
+            if mmas_passed:
+                mmas_passed_filters += 1
+            if desired_side is not None:
+                mmas_signaled += 1
+        else:
+            desired_side = _signal(i)
         if desired_side is None:
             i += 1
             continue
@@ -533,6 +578,7 @@ def _simulate_day(
         if not np.isfinite(bid[entry_bar]) or not np.isfinite(ask[entry_bar]) or not np.isfinite(mid[entry_bar]):
             i += 1
             continue
+        cooldown_ok = i >= cooldown_until
         if entry_bar < len(session_ok) and not session_ok[entry_bar]:
             session_suppressed += 1
             i += 1
@@ -541,13 +587,15 @@ def _simulate_day(
             spread_suppressed += 1
             i += 1
             continue
-        if i < cooldown_until:
+        if not cooldown_ok:
             cooldown_suppressed += 1
             i += 1
             continue
         signals_when_flat += 1
 
         if gated:
+            gate_allowed = True
+            gate_reason = "allowed"
             if gate_mode == "side_matched":
                 if desired_side == "long":
                     event_pos = event_pos_buy
@@ -566,6 +614,23 @@ def _simulate_day(
                 skip_reasons["no_recent_event"] += 1
                 skipped += 1
                 blocked_signals += 1
+                gate_allowed = False
+                gate_reason = "no_recent_event"
+                if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
+                    print(
+                        "MMAS_DEBUG",
+                        {
+                            "t": int(i),
+                            "dmid_ticks": float(dmid_ticks),
+                            "flow": float(flow),
+                            "spread_ticks": float(spread_ticks[entry_bar]),
+                            "gate_allowed": False,
+                            "gate_reason": gate_reason,
+                            "side": desired_side,
+                        },
+                        flush=True,
+                    )
+                    debug_mmas_printed = True
                 i += 1
                 continue
             else:
@@ -574,12 +639,46 @@ def _simulate_day(
                     skip_reasons["no_recent_event"] += 1
                     skipped += 1
                     blocked_signals += 1
+                    gate_allowed = False
+                    gate_reason = "no_recent_event"
+                    if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
+                        print(
+                            "MMAS_DEBUG",
+                            {
+                                "t": int(i),
+                                "dmid_ticks": float(dmid_ticks),
+                                "flow": float(flow),
+                                "spread_ticks": float(spread_ticks[entry_bar]),
+                                "gate_allowed": False,
+                                "gate_reason": gate_reason,
+                                "side": desired_side,
+                            },
+                            flush=True,
+                        )
+                        debug_mmas_printed = True
                     i += 1
                     continue
                 elif event_pos[idx_pos] < entry_bar - gate_lookback_bars:
                     skip_reasons["no_event_in_window"] += 1
                     skipped += 1
                     blocked_signals += 1
+                    gate_allowed = False
+                    gate_reason = "no_event_in_window"
+                    if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
+                        print(
+                            "MMAS_DEBUG",
+                            {
+                                "t": int(i),
+                                "dmid_ticks": float(dmid_ticks),
+                                "flow": float(flow),
+                                "spread_ticks": float(spread_ticks[entry_bar]),
+                                "gate_allowed": False,
+                                "gate_reason": gate_reason,
+                                "side": desired_side,
+                            },
+                            flush=True,
+                        )
+                        debug_mmas_printed = True
                     i += 1
                     continue
                 else:
@@ -588,6 +687,23 @@ def _simulate_day(
                         skip_reasons["no_threshold_yet"] += 1
                         skipped += 1
                         blocked_signals += 1
+                        gate_allowed = False
+                        gate_reason = "no_threshold_yet"
+                        if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
+                            print(
+                                "MMAS_DEBUG",
+                                {
+                                    "t": int(i),
+                                    "dmid_ticks": float(dmid_ticks),
+                                    "flow": float(flow),
+                                    "spread_ticks": float(spread_ticks[entry_bar]),
+                                    "gate_allowed": False,
+                                    "gate_reason": gate_reason,
+                                    "side": desired_side,
+                                },
+                                flush=True,
+                            )
+                            debug_mmas_printed = True
                         i += 1
                         continue
                     else:
@@ -596,8 +712,57 @@ def _simulate_day(
                             skip_reasons["gated_blocked"] += 1
                             skipped += 1
                             blocked_signals += 1
+                            gate_allowed = False
+                            gate_reason = "gated_blocked"
+                            if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
+                                print(
+                                    "MMAS_DEBUG",
+                                    {
+                                        "t": int(i),
+                                        "dmid_ticks": float(dmid_ticks),
+                                        "flow": float(flow),
+                                        "spread_ticks": float(spread_ticks[entry_bar]),
+                                        "gate_allowed": False,
+                                        "gate_reason": gate_reason,
+                                        "side": desired_side,
+                                    },
+                                    flush=True,
+                                )
+                                debug_mmas_printed = True
                             i += 1
                             continue
+            if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
+                print(
+                    "MMAS_DEBUG",
+                    {
+                        "t": int(i),
+                        "dmid_ticks": float(dmid_ticks),
+                        "flow": float(flow),
+                        "spread_ticks": float(spread_ticks[entry_bar]),
+                        "cooldown_ok": bool(cooldown_ok),
+                        "gate_ok": bool(gate_allowed),
+                        "gate_reason": gate_reason,
+                        "side": desired_side,
+                    },
+                    flush=True,
+                )
+                debug_mmas_printed = True
+        elif baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
+            print(
+                "MMAS_DEBUG",
+                {
+                    "t": int(i),
+                    "dmid_ticks": float(dmid_ticks),
+                    "flow": float(flow),
+                    "spread_ticks": float(spread_ticks[entry_bar]),
+                    "cooldown_ok": bool(cooldown_ok),
+                    "gate_ok": True,
+                    "gate_reason": "not_gated",
+                    "side": desired_side,
+                },
+                flush=True,
+            )
+            debug_mmas_printed = True
 
         entry_px = ask[entry_bar] if desired_side == "long" else bid[entry_bar]
         entry_spread_ticks = float(spread_ticks[entry_bar])
@@ -616,6 +781,8 @@ def _simulate_day(
         }
         in_position = True
         entries_taken += 1
+        if baseline_mode == "mmas":
+            mmas_entered += 1
         i = entry_bar + 1
 
     return (
@@ -631,6 +798,10 @@ def _simulate_day(
         spread_suppressed,
         session_suppressed,
         cooldown_suppressed,
+        mmas_signals_checked,
+        mmas_passed_filters,
+        mmas_signaled,
+        mmas_entered,
         skip_reasons,
     )
 
@@ -808,6 +979,11 @@ def main() -> None:
     hold_bars = int(os.environ.get("HOLD_BARS", "20"))
     baseline_mode = os.environ.get("BASELINE_MODE", "flat").strip().lower()
     baseline_k_bars = int(os.environ.get("BASELINE_K_BARS", "5"))
+    mmas_k_bars = int(os.environ.get("MMAS_K_BARS", "5"))
+    mmas_min_dmid_ticks = int(os.environ.get("MMAS_MIN_DMID_TICKS", "1"))
+    mmas_min_flow_abs = float(os.environ.get("MMAS_MIN_FLOW_ABS", "20"))
+    mmas_require_agree = os.environ.get("MMAS_REQUIRE_AGREE", "1").strip() == "1"
+    debug_first_mmas = os.environ.get("DEBUG_FIRST_MMAS", "0").strip() == "1"
     trade_session = os.environ.get("TRADE_SESSION", "all").strip().lower()
     min_spread_ticks = int(os.environ.get("MIN_SPREAD_TICKS", "0"))
     entry_cooldown_bars = int(os.environ.get("ENTRY_COOLDOWN_BARS", "10"))
@@ -849,6 +1025,25 @@ def main() -> None:
         print("Warning: USE_ALL_AVAILABLE_DAYS selected fewer than 5 days; low-confidence results.", flush=True)
     if len(selected_days) < 3:
         print("Warning: fewer than 3 days selected; continuing.", flush=True)
+    print(
+        "Run config:",
+        {
+            "baseline_mode": baseline_mode,
+            "baseline_k_bars": baseline_k_bars,
+            "mmas_k_bars": mmas_k_bars,
+            "mmas_min_dmid_ticks": mmas_min_dmid_ticks,
+            "mmas_min_flow_abs": mmas_min_flow_abs,
+            "mmas_require_agree": mmas_require_agree,
+            "trade_session": trade_session,
+            "min_spread_ticks": min_spread_ticks,
+            "entry_cooldown_bars": entry_cooldown_bars,
+            "tp_ticks": tp_ticks,
+            "sl_ticks": sl_ticks,
+            "gate_mode_list": gate_modes,
+            "sweep_ws": sweep_ws,
+        },
+        flush=True,
+    )
     df = _load_data()
     df["date"] = df["Time"].dt.date.astype(str)
     df = df[(df["Symbol"] == instrument) & (df["date"].isin(selected_days))].reset_index(drop=True)
@@ -931,6 +1126,10 @@ def main() -> None:
                         spread_supp_base,
                         session_supp_base,
                         cooldown_supp_base,
+                        mmas_checked_base,
+                        mmas_passed_base,
+                        mmas_signaled_base,
+                        mmas_entered_base,
                         skip_base,
                     ) = _simulate_day(
                         df_day,
@@ -943,6 +1142,11 @@ def main() -> None:
                         sl_ticks=sl_ticks,
                         baseline_mode=baseline_mode,
                         baseline_k_bars=baseline_k_bars,
+                        mmas_k_bars=mmas_k_bars,
+                        mmas_min_dmid_ticks=mmas_min_dmid_ticks,
+                        mmas_min_flow_abs=mmas_min_flow_abs,
+                        mmas_require_agree=mmas_require_agree,
+                        debug_first_mmas=debug_first_mmas,
                         trade_session=trade_session,
                         min_spread_ticks=min_spread_ticks,
                         entry_cooldown_bars=entry_cooldown_bars,
@@ -963,6 +1167,10 @@ def main() -> None:
                         spread_supp_gate,
                         session_supp_gate,
                         cooldown_supp_gate,
+                        mmas_checked_gate,
+                        mmas_passed_gate,
+                        mmas_signaled_gate,
+                        mmas_entered_gate,
                         skip_gate,
                     ) = _simulate_day(
                         df_day,
@@ -975,6 +1183,11 @@ def main() -> None:
                         sl_ticks=sl_ticks,
                         baseline_mode=baseline_mode,
                         baseline_k_bars=baseline_k_bars,
+                        mmas_k_bars=mmas_k_bars,
+                        mmas_min_dmid_ticks=mmas_min_dmid_ticks,
+                        mmas_min_flow_abs=mmas_min_flow_abs,
+                        mmas_require_agree=mmas_require_agree,
+                        debug_first_mmas=debug_first_mmas,
                         trade_session=trade_session,
                         min_spread_ticks=min_spread_ticks,
                         entry_cooldown_bars=entry_cooldown_bars,
@@ -1049,6 +1262,10 @@ def main() -> None:
                             "entries_blocked_by_gate": 0,
                             "coverage": float(eligible_base / signals_flat_base) if signals_flat_base else 0.0,
                             "block_rate": 0.0,
+                            "mmas_signals_checked": int(mmas_checked_base),
+                            "mmas_passed_filters": int(mmas_passed_base),
+                            "mmas_signaled": int(mmas_signaled_base),
+                            "mmas_entered": int(mmas_entered_base),
                         }
                     )
                     gate_stats.update(
@@ -1076,6 +1293,10 @@ def main() -> None:
                             "entries_blocked_by_gate": int(blocked_gate),
                             "coverage": float(eligible_gate / signals_flat_gate) if signals_flat_gate else 0.0,
                             "block_rate": float(blocked_gate / signals_flat_gate) if signals_flat_gate else 0.0,
+                            "mmas_signals_checked": int(mmas_checked_gate),
+                            "mmas_passed_filters": int(mmas_passed_gate),
+                            "mmas_signaled": int(mmas_signaled_gate),
+                            "mmas_entered": int(mmas_entered_gate),
                         }
                     )
                     drop_reasons = []
@@ -1141,6 +1362,14 @@ def main() -> None:
                         "signals_spread_suppressed": int(spread_supp_gate),
                         "signals_session_suppressed": int(session_supp_gate),
                         "signals_cooldown_suppressed": int(cooldown_supp_gate),
+                        "mmas_signals_checked_base": int(mmas_checked_base),
+                        "mmas_passed_filters_base": int(mmas_passed_base),
+                        "mmas_signaled_base": int(mmas_signaled_base),
+                        "mmas_entered_base": int(mmas_entered_base),
+                        "mmas_signals_checked_gate": int(mmas_checked_gate),
+                        "mmas_passed_filters_gate": int(mmas_passed_gate),
+                        "mmas_signaled_gate": int(mmas_signaled_gate),
+                        "mmas_entered_gate": int(mmas_entered_gate),
                     }
                     row["is_improved"] = row["pnl_improvement_ticks"] > 0
                     print(
@@ -1191,6 +1420,13 @@ def main() -> None:
                     )
                     print(
                         f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode} skip_reasons={skip_gate}",
+                        flush=True,
+                    )
+                    print(
+                        f"{instrument} {day} MMAS base checked={mmas_checked_base} passed={mmas_passed_base} "
+                        f"signaled={mmas_signaled_base} entered={mmas_entered_base} | "
+                        f"gate checked={mmas_checked_gate} passed={mmas_passed_gate} "
+                        f"signaled={mmas_signaled_gate} entered={mmas_entered_gate}",
                         flush=True,
                     )
                     if sum(skip_gate.values()) != skipped_gate:
