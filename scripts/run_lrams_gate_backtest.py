@@ -22,6 +22,11 @@ Baseline:
   HOLD_BARS               holding horizon H (default: 20)
   BASELINE_MODE           flat|not_awful|mmas (default: flat)
   BASELINE_K_BARS         window for not_awful (default: 5)
+  STRATEGY_MODE           baseline_flat|micro_momo_v1 (default: micro_momo_v1)
+  MICRO_K_BARS            micro momentum window (default: 5)
+  MICRO_IMPULSE_TICKS     min impulse ticks (default: 1)
+  MICRO_FLOW_MIN          min abs flow (default: 0)
+  MAX_SPREAD_TICKS_FOR_ENTRY max spread ticks to allow entry (default: 2)
   MMAS_K_BARS             window for MMAS (default: 5)
   MMAS_MIN_DMID_TICKS     min dmid ticks for MMAS (default: 1)
   MMAS_MIN_FLOW_ABS       min abs flow for MMAS (default: 20)
@@ -309,6 +314,11 @@ def _simulate_day(
     sl_ticks: int,
     baseline_mode: str,
     baseline_k_bars: int,
+    strategy_mode: str,
+    micro_k_bars: int,
+    micro_impulse_ticks: int,
+    micro_flow_min: float,
+    max_spread_ticks_for_entry: int,
     mmas_k_bars: int,
     mmas_min_dmid_ticks: int,
     mmas_min_flow_abs: float,
@@ -320,7 +330,33 @@ def _simulate_day(
     gate_lookback_bars: int,
     gated: bool,
     gate_mode: str,
-) -> Tuple[pd.DataFrame, float, int, int, int, int, int, int, int, int, int, int, int, int, Dict[str, int]]:
+    debug_entry_print: bool,
+    debug_entry_limit: int,
+    debug_entry_tag: str,
+) -> Tuple[
+    pd.DataFrame,
+    float,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    float,
+    float,
+    int,
+    int,
+    int,
+    int,
+    Dict[str, int],
+]:
     bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
     ask = pd.to_numeric(df_day["ask_price_1"], errors="coerce").to_numpy()
     mid = 0.5 * (bid + ask)
@@ -337,6 +373,11 @@ def _simulate_day(
     session_suppressed = 0
     cooldown_suppressed = 0
     entries_taken = 0
+    strategy_long_signals = 0
+    strategy_short_signals = 0
+    entry_impulse_sum = 0.0
+    entry_flow_sum = 0.0
+    entry_count = 0
     mmas_signals_checked = 0
     mmas_passed_filters = 0
     mmas_signaled = 0
@@ -350,6 +391,9 @@ def _simulate_day(
 
     signed_vol = pd.to_numeric(df_day["signed_volume"], errors="coerce").fillna(0.0).to_numpy()
     spread_ticks = np.rint((ask - bid) / tick_size).astype(np.int64)
+    cs = np.concatenate([[0.0], np.cumsum(signed_vol)])
+    if tick_size <= 0:
+        raise ValueError("tick_size must be positive for micro_momo_v1.")
     if trade_session == "rth":
         times = pd.to_datetime(df_day["Time"], utc=True, errors="coerce")
         times_cst = times.dt.tz_convert("America/Chicago")
@@ -360,8 +404,6 @@ def _simulate_day(
 
     if baseline_mode == "not_awful":
         k = max(1, int(baseline_k_bars))
-        cs = np.concatenate([[0.0], np.cumsum(signed_vol)])
-
         def _signal(i: int) -> str | None:
             # Simple order-flow sign: take the side of recent signed volume.
             if i + 1 < k:
@@ -386,8 +428,6 @@ def _simulate_day(
             return None
     if baseline_mode == "mmas":
         k = max(1, int(mmas_k_bars))
-        cs = np.concatenate([[0.0], np.cumsum(signed_vol)])
-
         def _mmas_signal(i: int) -> Tuple[str | None, float, float, bool]:
             if i < k or not np.isfinite(mid[i]) or not np.isfinite(mid[i - k]):
                 return None, float("nan"), 0.0, False
@@ -434,6 +474,7 @@ def _simulate_day(
     cooldown_until = -1
     i = lookback_bars
     max_i = n - 1
+    entry_debug_printed = 0
     while i <= max_i:
         if in_position:
             entry_bar = int(pos["entry_bar"])
@@ -557,9 +598,20 @@ def _simulate_day(
 
         desired_side = None
         dmid_ticks = float("nan")
+        impulse_ticks = float("nan")
         flow = 0.0
         mmas_passed = False
-        if baseline_mode == "mmas":
+        if strategy_mode == "micro_momo_v1":
+            k = max(1, int(micro_k_bars))
+            if i >= k and np.isfinite(mid[i]) and np.isfinite(mid[i - k]):
+                dmid = mid[i] - mid[i - k]
+                impulse_ticks = dmid / tick_size
+                flow = cs[i + 1] - cs[i + 1 - k]
+                if impulse_ticks >= micro_impulse_ticks and flow >= micro_flow_min:
+                    desired_side = "long"
+                elif impulse_ticks <= -micro_impulse_ticks and flow <= -micro_flow_min:
+                    desired_side = "short"
+        elif baseline_mode == "mmas":
             mmas_signals_checked += 1
             desired_side, dmid_ticks, flow, mmas_passed = _mmas_signal(i)
             if mmas_passed:
@@ -568,6 +620,11 @@ def _simulate_day(
                 mmas_signaled += 1
         else:
             desired_side = _signal(i)
+            if desired_side is not None and i >= lookback_bars and np.isfinite(mid[i]) and np.isfinite(mid[i - lookback_bars]):
+                dmid = mid[i] - mid[i - lookback_bars]
+                dmid_ticks = dmid / tick_size
+                impulse_ticks = dmid_ticks
+                flow = cs[i + 1] - cs[i + 1 - lookback_bars]
         if desired_side is None:
             i += 1
             continue
@@ -587,11 +644,30 @@ def _simulate_day(
             spread_suppressed += 1
             i += 1
             continue
+        if max_spread_ticks_for_entry > 0 and spread_ticks[entry_bar] > max_spread_ticks_for_entry:
+            spread_suppressed += 1
+            i += 1
+            continue
         if not cooldown_ok:
             cooldown_suppressed += 1
             i += 1
             continue
         signals_when_flat += 1
+        if desired_side == "long":
+            strategy_long_signals += 1
+        else:
+            strategy_short_signals += 1
+        if strategy_mode == "micro_momo_v1" and micro_impulse_ticks > 0:
+            if desired_side == "long" and impulse_ticks < (micro_impulse_ticks - 1e-9):
+                raise RuntimeError(
+                    f"micro_momo_v1 impulse below threshold for long: t={i} impulse={impulse_ticks} "
+                    f"thr={micro_impulse_ticks}"
+                )
+            if desired_side == "short" and impulse_ticks > (-micro_impulse_ticks + 1e-9):
+                raise RuntimeError(
+                    f"micro_momo_v1 impulse above threshold for short: t={i} impulse={impulse_ticks} "
+                    f"thr={-micro_impulse_ticks}"
+                )
 
         if gated:
             gate_allowed = True
@@ -731,7 +807,11 @@ def _simulate_day(
                                 debug_mmas_printed = True
                             i += 1
                             continue
-            if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
+            if (
+                debug_first_mmas
+                and (not debug_mmas_printed)
+                and ((baseline_mode == "mmas" and mmas_passed) or (strategy_mode == "micro_momo_v1"))
+            ):
                 print(
                     "MMAS_DEBUG",
                     {
@@ -747,7 +827,11 @@ def _simulate_day(
                     flush=True,
                 )
                 debug_mmas_printed = True
-        elif baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
+        elif (
+            debug_first_mmas
+            and (not debug_mmas_printed)
+            and ((baseline_mode == "mmas" and mmas_passed) or (strategy_mode == "micro_momo_v1"))
+        ):
             print(
                 "MMAS_DEBUG",
                 {
@@ -781,8 +865,25 @@ def _simulate_day(
         }
         in_position = True
         entries_taken += 1
+        impulse_for_entry = impulse_ticks if np.isfinite(impulse_ticks) else dmid_ticks
+        entry_impulse_sum += float(impulse_for_entry) if np.isfinite(impulse_for_entry) else 0.0
+        entry_flow_sum += float(flow) if np.isfinite(flow) else 0.0
+        entry_count += 1
         if baseline_mode == "mmas":
             mmas_entered += 1
+        if debug_entry_print and entry_debug_printed < debug_entry_limit:
+            try:
+                print(
+                    f"ENTRY_DEBUG {debug_entry_tag} t={i} side={desired_side} "
+                    f"mid_t={mid[i]:.4f} mid_tk={mid[i - max(1, int(micro_k_bars))]:.4f} "
+                    f"dmid={(mid[i] - mid[i - max(1, int(micro_k_bars))]):.4f} "
+                    f"impulse_ticks={impulse_for_entry:.4f} flow={flow:.2f} "
+                    f"spread_ticks={spread_ticks[entry_bar]}",
+                    flush=True,
+                )
+            except OSError:
+                pass
+            entry_debug_printed += 1
         i = entry_bar + 1
 
     return (
@@ -798,6 +899,11 @@ def _simulate_day(
         spread_suppressed,
         session_suppressed,
         cooldown_suppressed,
+        strategy_long_signals,
+        strategy_short_signals,
+        float(entry_impulse_sum),
+        float(entry_flow_sum),
+        int(entry_count),
         mmas_signals_checked,
         mmas_passed_filters,
         mmas_signaled,
@@ -977,8 +1083,15 @@ def main() -> None:
     lookback_bars = int(os.environ.get("LOOKBACK_BARS", "10"))
     entry_threshold_ticks = int(os.environ.get("ENTRY_THRESHOLD_TICKS", "1"))
     hold_bars = int(os.environ.get("HOLD_BARS", "20"))
+    strategy_mode = os.environ.get("STRATEGY_MODE", "").strip().lower()
     baseline_mode = os.environ.get("BASELINE_MODE", "flat").strip().lower()
+    if not strategy_mode:
+        strategy_mode = "micro_momo_v1"
     baseline_k_bars = int(os.environ.get("BASELINE_K_BARS", "5"))
+    micro_k_bars = int(os.environ.get("MICRO_K_BARS", "5"))
+    micro_impulse_ticks = int(os.environ.get("MICRO_IMPULSE_TICKS", "1"))
+    micro_flow_min = float(os.environ.get("MICRO_FLOW_MIN", "0"))
+    max_spread_ticks_for_entry = int(os.environ.get("MAX_SPREAD_TICKS_FOR_ENTRY", "2"))
     mmas_k_bars = int(os.environ.get("MMAS_K_BARS", "5"))
     mmas_min_dmid_ticks = int(os.environ.get("MMAS_MIN_DMID_TICKS", "1"))
     mmas_min_flow_abs = float(os.environ.get("MMAS_MIN_FLOW_ABS", "20"))
@@ -1028,8 +1141,13 @@ def main() -> None:
     print(
         "Run config:",
         {
+            "strategy_mode": strategy_mode,
             "baseline_mode": baseline_mode,
             "baseline_k_bars": baseline_k_bars,
+            "micro_k_bars": micro_k_bars,
+            "micro_impulse_ticks": micro_impulse_ticks,
+            "micro_flow_min": micro_flow_min,
+            "max_spread_ticks_for_entry": max_spread_ticks_for_entry,
             "mmas_k_bars": mmas_k_bars,
             "mmas_min_dmid_ticks": mmas_min_dmid_ticks,
             "mmas_min_flow_abs": mmas_min_flow_abs,
@@ -1077,6 +1195,7 @@ def main() -> None:
             all_base = []
             all_gated = []
             all_events = []
+            strategy_rows = []
 
             day_index = 0
             sample_printed = False
@@ -1113,6 +1232,7 @@ def main() -> None:
                         flush=True,
                     )
 
+                    debug_entry = strategy_mode == "micro_momo_v1" and day == selected_days[0]
                     (
                         trades_base,
                         pnl_total_base,
@@ -1126,6 +1246,11 @@ def main() -> None:
                         spread_supp_base,
                         session_supp_base,
                         cooldown_supp_base,
+                        strategy_long_base,
+                        strategy_short_base,
+                        entry_impulse_sum_base,
+                        entry_flow_sum_base,
+                        entry_count_base,
                         mmas_checked_base,
                         mmas_passed_base,
                         mmas_signaled_base,
@@ -1142,6 +1267,11 @@ def main() -> None:
                         sl_ticks=sl_ticks,
                         baseline_mode=baseline_mode,
                         baseline_k_bars=baseline_k_bars,
+                        strategy_mode=strategy_mode,
+                        micro_k_bars=micro_k_bars,
+                        micro_impulse_ticks=micro_impulse_ticks,
+                        micro_flow_min=micro_flow_min,
+                        max_spread_ticks_for_entry=max_spread_ticks_for_entry,
                         mmas_k_bars=mmas_k_bars,
                         mmas_min_dmid_ticks=mmas_min_dmid_ticks,
                         mmas_min_flow_abs=mmas_min_flow_abs,
@@ -1153,6 +1283,9 @@ def main() -> None:
                         gate_lookback_bars=gate_lookback_bars,
                         gated=False,
                         gate_mode=gate_mode,
+                        debug_entry_print=debug_entry,
+                        debug_entry_limit=5,
+                        debug_entry_tag="baseline",
                     )
                     (
                         trades_gate,
@@ -1167,6 +1300,11 @@ def main() -> None:
                         spread_supp_gate,
                         session_supp_gate,
                         cooldown_supp_gate,
+                        strategy_long_gate,
+                        strategy_short_gate,
+                        entry_impulse_sum_gate,
+                        entry_flow_sum_gate,
+                        entry_count_gate,
                         mmas_checked_gate,
                         mmas_passed_gate,
                         mmas_signaled_gate,
@@ -1183,6 +1321,11 @@ def main() -> None:
                         sl_ticks=sl_ticks,
                         baseline_mode=baseline_mode,
                         baseline_k_bars=baseline_k_bars,
+                        strategy_mode=strategy_mode,
+                        micro_k_bars=micro_k_bars,
+                        micro_impulse_ticks=micro_impulse_ticks,
+                        micro_flow_min=micro_flow_min,
+                        max_spread_ticks_for_entry=max_spread_ticks_for_entry,
                         mmas_k_bars=mmas_k_bars,
                         mmas_min_dmid_ticks=mmas_min_dmid_ticks,
                         mmas_min_flow_abs=mmas_min_flow_abs,
@@ -1194,6 +1337,9 @@ def main() -> None:
                         gate_lookback_bars=gate_lookback_bars,
                         gated=True,
                         gate_mode=gate_mode,
+                        debug_entry_print=debug_entry,
+                        debug_entry_limit=5,
+                        debug_entry_tag="gated",
                     )
 
                     if not sample_printed and day == selected_days[0]:
@@ -1245,6 +1391,7 @@ def main() -> None:
                             "W": gate_lookback_bars,
                             "gate_mode": gate_mode,
                             "baseline_mode": baseline_mode,
+                            "strategy_mode": strategy_mode,
                             "trade_session": trade_session,
                             "min_spread_ticks": min_spread_ticks,
                             "entry_cooldown_bars": entry_cooldown_bars,
@@ -1276,6 +1423,7 @@ def main() -> None:
                             "W": gate_lookback_bars,
                             "gate_mode": gate_mode,
                             "baseline_mode": baseline_mode,
+                            "strategy_mode": strategy_mode,
                             "trade_session": trade_session,
                             "min_spread_ticks": min_spread_ticks,
                             "entry_cooldown_bars": entry_cooldown_bars,
@@ -1327,6 +1475,7 @@ def main() -> None:
                         "W": gate_lookback_bars,
                         "gate_mode": gate_mode,
                         "baseline_mode": baseline_mode,
+                        "strategy_mode": strategy_mode,
                         "trade_session": trade_session,
                         "min_spread_ticks": min_spread_ticks,
                         "entry_cooldown_bars": entry_cooldown_bars,
@@ -1429,6 +1578,30 @@ def main() -> None:
                         f"signaled={mmas_signaled_gate} entered={mmas_entered_gate}",
                         flush=True,
                     )
+                    strategy_rows.append(
+                        {
+                            "Symbol": instrument,
+                            "date": day,
+                            "W": gate_lookback_bars,
+                            "gate_mode": gate_mode,
+                            "strategy_mode": strategy_mode,
+                            "strategy_signals_when_flat": int(signals_flat_base),
+                            "strategy_long_signals": int(strategy_long_base),
+                            "strategy_short_signals": int(strategy_short_base),
+                            "avg_impulse_ticks_entry_base": float(entry_impulse_sum_base / entry_count_base)
+                            if entry_count_base
+                            else 0.0,
+                            "avg_flow_entry_base": float(entry_flow_sum_base / entry_count_base)
+                            if entry_count_base
+                            else 0.0,
+                            "avg_impulse_ticks_entry_gate": float(entry_impulse_sum_gate / entry_count_gate)
+                            if entry_count_gate
+                            else 0.0,
+                            "avg_flow_entry_gate": float(entry_flow_sum_gate / entry_count_gate)
+                            if entry_count_gate
+                            else 0.0,
+                        }
+                    )
                     if sum(skip_gate.values()) != skipped_gate:
                         raise RuntimeError(
                             f"Skip reasons mismatch: sum={sum(skip_gate.values())} skipped={skipped_gate} "
@@ -1468,6 +1641,11 @@ def main() -> None:
 
             with open(out_dir_w / "summary.json", "w", encoding="utf-8") as f:
                 json.dump(summaries, f, indent=2)
+            if strategy_rows:
+                strategy_df = pd.DataFrame(strategy_rows)
+                strategy_df.to_csv(out_dir_w / "strategy_diagnostics.csv", index=False)
+                print("Strategy diagnostics by day:", flush=True)
+                print(strategy_df.to_string(index=False), flush=True)
 
     sweep_df = pd.DataFrame(sweep_rows)
     sweep_df.to_csv(out_dir / "summary_sweep.csv", index=False)
