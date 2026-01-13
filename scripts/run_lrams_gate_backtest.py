@@ -56,7 +56,11 @@ Impulse confirm entry (strategy_mode=impulse_confirm_v1):
   AFR_FT_BARS             AFR v2 follow-through bars (default: 1)
   AFR_FT_MIN_TICKS        AFR v2 follow-through min ticks (default: 0)
   AFR_FT_NO_BACKTRACK     AFR v2 block if price backtracks (default: 1)
-  AFR_ENTER_ON            AFR v2 entry timing: ft|break (default: ft)
+  AFR_ENTER_ON            AFR v2 entry timing: break|ft|both (default: break)
+  AFR_BREAK_QUALITY_MIN_FLOW_ABS AFR v2 min abs flow for break quality (default: 80)
+  AFR_BREAK_QUALITY_MAX_SPREAD_TICKS AFR v2 max spread for break quality (default: 1)
+  AFR_SNAPBACK_BARS       AFR v2 snapback lookahead bars (default: 2)
+  AFR_SNAPBACK_BAND_TICKS AFR v2 snapback band in ticks (default: 1)
   AFR3_BREAK_MIN_FLOW_ABS AFR v3 min abs flow on break bar (default: 100)
   AFR3_BREAK_MAX_SPREAD_TICKS AFR v3 max spread on break bar (default: 2)
   AFR3_SNAPBACK_CHECK     AFR v3 require no snapback on next bar (default: 1)
@@ -65,6 +69,14 @@ Impulse confirm entry (strategy_mode=impulse_confirm_v1):
   AFR_SL_TICKS            override SL ticks for AFR modes (default: unset)
   AFR_MAX_HOLD_BARS       override max hold bars for AFR modes (default: unset)
   AFR_BREAKEVEN_AFTER_TICKS move SL to breakeven after MFE ticks (default: unset)
+  AFR_ENTER_MODE         break_first|ft_only (default: break_first)
+  AFR_FLOW_ALIGN_BARS     flow alignment window (default: 5)
+  AFR_MIN_FLOW_ABS_ALIGN  min abs flow for alignment (default: 40)
+  AFR_REARM_BAND_TICKS    rearm band around absorption level (default: 1)
+  AFR_REARM_MAX_BARS      max bars to keep rearm active (default: 5)
+  AFR_REARM_STOP_MAX_BARS allow rearm if stop within bars (default: 3)
+  AFR_MOMENTUM_DECAY_BARS consecutive bars of weak flow to exit (default: 3)
+  AFR_MOMENTUM_DECAY_MIN_FLOW min aligned flow to avoid decay exit (default: 0)
 
 Gate:
   GATE_LOOKBACK_BARS      event lookback W (default: 10)
@@ -383,6 +395,10 @@ def _simulate_day(
     afr_ft_min_ticks: int,
     afr_ft_no_backtrack: bool,
     afr_enter_on: str,
+    afr_break_quality_min_flow_abs: float,
+    afr_break_quality_max_spread_ticks: int,
+    afr_snapback_bars: int,
+    afr_snapback_band_ticks: int,
     debug_first_afr: bool,
     debug_first_afr2: bool,
     afr3_break_min_flow_abs: float,
@@ -393,12 +409,28 @@ def _simulate_day(
     afr_sl_ticks: int | None,
     afr_max_hold_bars: int | None,
     afr_breakeven_after_ticks: int | None,
+    afr_enter_mode: str,
+    afr_flow_align_bars: int,
+    afr_min_flow_abs_align: float,
+    afr_rearm_band_ticks: int,
+    afr_rearm_max_bars: int,
+    afr_rearm_stop_max_bars: int,
+    afr_momentum_decay_bars: int,
+    afr_momentum_decay_min_flow: float,
     debug_entry_print: bool,
     debug_entry_limit: int,
     debug_entry_tag: str,
 ) -> Tuple[object, ...]:
     bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
     ask = pd.to_numeric(df_day["ask_price_1"], errors="coerce").to_numpy()
+    if "top_bid_depth" in df_day.columns:
+        top_bid_depth = pd.to_numeric(df_day["top_bid_depth"], errors="coerce").to_numpy()
+    else:
+        top_bid_depth = np.full(len(df_day), np.nan, dtype=float)
+    if "top_ask_depth" in df_day.columns:
+        top_ask_depth = pd.to_numeric(df_day["top_ask_depth"], errors="coerce").to_numpy()
+    else:
+        top_ask_depth = np.full(len(df_day), np.nan, dtype=float)
     mid = 0.5 * (bid + ask)
     n = len(df_day)
     trades: List[Dict[str, float]] = []
@@ -435,6 +467,18 @@ def _simulate_day(
     entry_spread_sum = 0.0
     afr_be_armed = 0
     afr_be_triggered = 0
+    absorption_level_long = float("nan")
+    absorption_level_short = float("nan")
+    absorption_bar_long = -1
+    absorption_bar_short = -1
+    rearm_used_long = False
+    rearm_used_short = False
+    rearm_active_long = False
+    rearm_active_short = False
+    rearm_expiry_long = -1
+    rearm_expiry_short = -1
+    break_bar_long = -1
+    break_bar_short = -1
     afr_checked = 0
     afr_absorption_pass = 0
     afr_break_pass = 0
@@ -444,6 +488,9 @@ def _simulate_day(
     afr2_break_pass = 0
     afr2_ft_pass = 0
     afr2_entered = 0
+    afr2_break_quality_pass = 0
+    afr2_snapback_fail = 0
+    afr2_break_quality_entries = 0
     afr3_checked = 0
     afr3_absorption_pass = 0
     afr3_break_pass = 0
@@ -483,6 +530,27 @@ def _simulate_day(
     impulse_ticks_series = np.full(n, np.nan, dtype=float)
     if n > impulse_lb:
         impulse_ticks_series[impulse_lb:] = (mid[impulse_lb:] - mid[:-impulse_lb]) / tick_size
+
+    def _flow_sum_at(idx: int, bars: int) -> float:
+        if bars <= 0:
+            return 0.0
+        start = max(0, idx - bars + 1)
+        if start > idx:
+            return 0.0
+        return float(np.sum(afr_flow_series[start : idx + 1]))
+
+    def _arm_rearm(direction: str, abs_bar: int) -> None:
+        nonlocal rearm_active_long, rearm_active_short, rearm_expiry_long, rearm_expiry_short
+        if abs_bar < 0:
+            return
+        if direction == "long":
+            if not rearm_used_long:
+                rearm_active_long = True
+                rearm_expiry_long = abs_bar + afr_rearm_max_bars
+        else:
+            if not rearm_used_short:
+                rearm_active_short = True
+                rearm_expiry_short = abs_bar + afr_rearm_max_bars
 
     def _print_impulse_debug(
         t_idx: int,
@@ -732,6 +800,10 @@ def _simulate_day(
             if i >= entry_bar + 1:
                 mark_px = bid[i] if side == "long" else ask[i]
                 if np.isfinite(mark_px):
+                    pnl_mark = (mark_px - entry_px) / tick_size if side == "long" else (entry_px - mark_px) / tick_size
+                    if np.isfinite(pnl_mark):
+                        pos["mfe_ticks"] = max(float(pos.get("mfe_ticks", 0.0)), float(pnl_mark))
+                        pos["mae_ticks"] = min(float(pos.get("mae_ticks", 0.0)), float(pnl_mark))
                     breakeven_ticks = pos.get("breakeven_ticks")
                     if breakeven_ticks is not None and not pos.get("breakeven_set", False):
                         mfe_ticks = (mark_px - entry_px) / tick_size if side == "long" else (entry_px - mark_px) / tick_size
@@ -754,6 +826,24 @@ def _simulate_day(
                         elif mark_px >= sl_level:
                             pos["exit_bar"] = i
                             pos["exit_reason"] = "SL"
+                if strategy_mode.startswith("absorption_failure") and pos.get("exit_reason") == "TIME":
+                    flow_sum = _flow_sum_at(i, afr_flow_align_bars)
+                    decay_count = int(pos.get("decay_count", 0))
+                    if side == "long":
+                        if flow_sum <= afr_momentum_decay_min_flow:
+                            decay_count += 1
+                        else:
+                            decay_count = 0
+                    else:
+                        if flow_sum >= -afr_momentum_decay_min_flow:
+                            decay_count += 1
+                        else:
+                            decay_count = 0
+                    pos["decay_count"] = decay_count
+                    if decay_count >= afr_momentum_decay_bars:
+                        pos["exit_bar"] = i
+                        pos["exit_reason"] = "DECAY"
+                        pos["exit_on_decay"] = True
             if i >= int(pos["exit_bar"]):
                 exit_bar = int(pos["exit_bar"])
                 if not np.isfinite(bid[exit_bar]) or not np.isfinite(ask[exit_bar]):
@@ -763,6 +853,21 @@ def _simulate_day(
                 exit_reason = str(pos.get("exit_reason", "TIME"))
                 if bool(pos.get("breakeven_triggered", False)):
                     afr_be_triggered += 1
+                if strategy_mode.startswith("absorption_failure"):
+                    if exit_reason == "TP":
+                        exit_reason = "tp"
+                    elif exit_reason == "SL":
+                        if bool(pos.get("breakeven_set", False)):
+                            exit_reason = "breakeven"
+                            pos["exit_on_be"] = True
+                        else:
+                            exit_reason = "sl"
+                    elif exit_reason == "TIME":
+                        exit_reason = "max_hold"
+                    elif exit_reason == "DECAY":
+                        exit_reason = "momentum_decay"
+                    if exit_bar - entry_bar <= afr_rearm_stop_max_bars:
+                        _arm_rearm(side, int(pos.get("absorption_bar", -1)))
                 eps = 1e-9
                 entry_spread = float(pos.get("entry_spread_ticks", 0.0))
                 floor_ticks = -(sl_ticks_local + entry_spread + eps)
@@ -836,6 +941,15 @@ def _simulate_day(
                         "entry_bar": int(pos["entry_bar"]),
                         "exit_bar": int(exit_bar),
                         "exit_reason": exit_reason,
+                        "entry_reason": pos.get("entry_reason"),
+                        "absorption_level": float(pos.get("absorption_level", float("nan"))),
+                        "break_level": float(pos.get("break_level", float("nan"))),
+                        "flow_align_sum_at_entry": float(pos.get("flow_align_sum_at_entry", 0.0)),
+                        "bars_from_absorption_to_entry": int(pos.get("bars_from_absorption", -1)),
+                        "mae_ticks": float(pos.get("mae_ticks", 0.0)),
+                        "mfe_ticks": float(pos.get("mfe_ticks", 0.0)),
+                        "exit_on_decay": bool(pos.get("exit_on_decay", False)),
+                        "exit_on_be": bool(pos.get("exit_on_be", False)),
                     }
                 )
                 pnl_ticks_total += float(pnl_ticks)
@@ -969,82 +1083,284 @@ def _simulate_day(
             afr2_checked += 1
             k = max(1, int(afr_k_bars))
             ft_bars = max(1, int(afr_ft_bars))
-            enter_on = afr_enter_on.strip().lower()
-            if enter_on not in {"ft", "break"}:
-                enter_on = "ft"
-            if enter_on == "ft":
-                afr_tf_idx = entry_bar
-                afr_t_idx = afr_tf_idx - ft_bars
-            else:
-                afr_t_idx = entry_bar
-                afr_tf_idx = entry_bar + ft_bars
-            if afr_t_idx < k or afr_t_idx - 1 < 0:
-                i += 1
-                continue
+            enter_on = afr_enter_on
+            allow_break = enter_on in {"break", "both"}
+            allow_ft = enter_on in {"ft", "both"}
+            entry_reason = None
             if afr_use_mid_for_stall:
                 stall_series = mid
             elif "last_price" in df_day.columns:
                 stall_series = pd.to_numeric(df_day["last_price"], errors="coerce").fillna(np.nan).to_numpy()
             else:
                 stall_series = mid
-            if not np.isfinite(stall_series[afr_t_idx - 1]) or not np.isfinite(stall_series[afr_t_idx - k]):
-                i += 1
-                continue
-            flow = float(np.sum(afr_flow_series[afr_t_idx - k : afr_t_idx]))
-            stall_ticks = float((stall_series[afr_t_idx - 1] - stall_series[afr_t_idx - k]) / tick_size)
-            if abs(flow) < afr_min_flow_abs or abs(stall_ticks) > afr_stall_ticks:
-                i += 1
-                continue
-            afr2_absorption_pass += 1
-            if not np.isfinite(mid[afr_t_idx]) or not np.isfinite(mid[afr_t_idx - 1]):
-                i += 1
-                continue
-            break_ticks = float((mid[afr_t_idx] - mid[afr_t_idx - 1]) / tick_size)
-            if abs(break_ticks) < afr_break_ticks or break_ticks == 0:
-                i += 1
-                continue
-            afr2_break_pass += 1
-            if afr_require_flow_sign and np.sign(flow) != np.sign(break_ticks):
-                i += 1
-                continue
-            if break_ticks > 0:
-                desired_side = "long"
-            elif break_ticks < 0:
-                desired_side = "short"
-            else:
-                i += 1
-                continue
-            ft_ok = True
-            if 0 <= afr_tf_idx < n and np.isfinite(mid[afr_tf_idx]) and np.isfinite(mid[afr_t_idx]):
-                ft_progress_ticks = float((mid[afr_tf_idx] - mid[afr_t_idx]) / tick_size)
-                if desired_side == "long":
-                    if ft_progress_ticks < afr_ft_min_ticks:
-                        ft_ok = False
+            if i >= k and i - 1 >= 0 and np.isfinite(stall_series[i - 1]) and np.isfinite(stall_series[i - k]):
+                flow_setup = float(np.sum(afr_flow_series[i - k : i]))
+                stall_ticks = float((stall_series[i - 1] - stall_series[i - k]) / tick_size)
+                if abs(flow_setup) >= afr_min_flow_abs and abs(stall_ticks) <= afr_stall_ticks:
+                    afr2_absorption_pass += 1
+                    if flow_setup > 0:
+                        absorption_level_long = float(stall_series[i - 1])
+                        absorption_bar_long = i - 1
+                        rearm_used_long = False
+                        rearm_active_long = False
+                        rearm_expiry_long = -1
+                    elif flow_setup < 0:
+                        absorption_level_short = float(stall_series[i - 1])
+                        absorption_bar_short = i - 1
+                        rearm_used_short = False
+                        rearm_active_short = False
+                        rearm_expiry_short = -1
+
+            def _check_break(direction: str) -> Tuple[bool, float, float, int]:
+                if direction == "long":
+                    level = absorption_level_long
+                    abs_bar = absorption_bar_long
+                    if not np.isfinite(level) or abs_bar < 0:
+                        return False, float("nan"), float("nan"), -1
+                    break_level = level + afr_break_ticks * tick_size
+                    triggered = np.isfinite(mid[entry_bar]) and mid[entry_bar] >= break_level
+                    return bool(triggered), level, break_level, abs_bar
+                level = absorption_level_short
+                abs_bar = absorption_bar_short
+                if not np.isfinite(level) or abs_bar < 0:
+                    return False, float("nan"), float("nan"), -1
+                break_level = level - afr_break_ticks * tick_size
+                triggered = np.isfinite(mid[entry_bar]) and mid[entry_bar] <= break_level
+                return bool(triggered), level, break_level, abs_bar
+
+            def _align_ok(direction: str, idx: int) -> Tuple[bool, float]:
+                flow_sum = _flow_sum_at(idx, afr_flow_align_bars)
+                if direction == "long":
+                    return bool(flow_sum >= afr_min_flow_abs_align), flow_sum
+                return bool(flow_sum <= -afr_min_flow_abs_align), flow_sum
+
+            def _afr2_entry_intent() -> Dict[str, object] | None:
+                nonlocal break_bar_long
+                nonlocal break_bar_short
+                nonlocal break_ticks
+                nonlocal ft_progress_ticks
+                nonlocal afr_t_idx
+                nonlocal afr_tf_idx
+                nonlocal afr2_absorption_pass
+                nonlocal afr2_break_pass
+                nonlocal afr2_ft_pass
+                nonlocal afr2_break_quality_pass
+                nonlocal afr2_snapback_fail
+                nonlocal afr2_break_quality_entries
+                nonlocal rearm_active_long
+                nonlocal rearm_active_short
+                nonlocal rearm_used_long
+                nonlocal rearm_used_short
+
+                missed_break = False
+                entry_reason_local = None
+                absorption_level_local = float("nan")
+                break_level_local = float("nan")
+                absorption_bar_local = -1
+                flow_align_sum_local = 0.0
+                desired_side_local = None
+                rearm_used_local = False
+                break_quality_ok = False
+                snapback_fail = False
+
+                if rearm_active_long:
+                    if entry_bar > rearm_expiry_long or (
+                        np.isfinite(absorption_level_long)
+                        and np.isfinite(mid[entry_bar])
+                        and abs(mid[entry_bar] - absorption_level_long) > afr_rearm_band_ticks * tick_size
+                    ):
+                        rearm_active_long = False
+                if rearm_active_short:
+                    if entry_bar > rearm_expiry_short or (
+                        np.isfinite(absorption_level_short)
+                        and np.isfinite(mid[entry_bar])
+                        and abs(mid[entry_bar] - absorption_level_short) > afr_rearm_band_ticks * tick_size
+                    ):
+                        rearm_active_short = False
+
+                long_break, long_abs_level, long_break_level, long_abs_bar = _check_break("long")
+                short_break, short_abs_level, short_break_level, short_abs_bar = _check_break("short")
+                if allow_ft:
+                    if long_break:
+                        break_bar_long = entry_bar
+                    if short_break:
+                        break_bar_short = entry_bar
+
+                # Primary break entry (break or both).
+                if allow_break:
+                    if long_break:
+                        break_ticks = float((mid[entry_bar] - mid[entry_bar - 1]) / tick_size)
+                        afr2_break_pass += 1
+                        afr_t_idx = entry_bar
+                        afr_tf_idx = entry_bar + ft_bars
+                        ok, flow_align_sum_local = _align_ok("long", entry_bar)
+                        if ok:
+                            break_quality_ok = (
+                                abs(flow_align_sum_local) >= afr_break_quality_min_flow_abs
+                                and spread_ticks[entry_bar] <= afr_break_quality_max_spread_ticks
+                            )
+                            if break_quality_ok:
+                                afr2_break_quality_pass += 1
+                                if np.isfinite(absorption_level_long) and afr_snapback_bars > 0:
+                                    end_idx = min(entry_bar + afr_snapback_bars, n - 1)
+                                    for j in range(entry_bar + 1, end_idx + 1):
+                                        if np.isfinite(mid[j]) and abs(mid[j] - absorption_level_long) <= afr_snapback_band_ticks * tick_size:
+                                            snapback_fail = True
+                                            break
+                                    if snapback_fail:
+                                        afr2_snapback_fail += 1
+                            if not break_quality_ok or snapback_fail:
+                                missed_break = True
+                            else:
+                                desired_side_local = "long"
+                                absorption_level_local = long_abs_level
+                                break_level_local = long_break_level
+                                absorption_bar_local = long_abs_bar
+                                entry_reason_local = "break"
+                                if rearm_active_long:
+                                    rearm_used_local = True
+                        else:
+                            missed_break = True
+                    elif short_break:
+                        break_ticks = float((mid[entry_bar] - mid[entry_bar - 1]) / tick_size)
+                        afr2_break_pass += 1
+                        afr_t_idx = entry_bar
+                        afr_tf_idx = entry_bar + ft_bars
+                        ok, flow_align_sum_local = _align_ok("short", entry_bar)
+                        if ok:
+                            break_quality_ok = (
+                                abs(flow_align_sum_local) >= afr_break_quality_min_flow_abs
+                                and spread_ticks[entry_bar] <= afr_break_quality_max_spread_ticks
+                            )
+                            if break_quality_ok:
+                                afr2_break_quality_pass += 1
+                                if np.isfinite(absorption_level_short) and afr_snapback_bars > 0:
+                                    end_idx = min(entry_bar + afr_snapback_bars, n - 1)
+                                    for j in range(entry_bar + 1, end_idx + 1):
+                                        if np.isfinite(mid[j]) and abs(mid[j] - absorption_level_short) <= afr_snapback_band_ticks * tick_size:
+                                            snapback_fail = True
+                                            break
+                                    if snapback_fail:
+                                        afr2_snapback_fail += 1
+                            if not break_quality_ok or snapback_fail:
+                                missed_break = True
+                            else:
+                                desired_side_local = "short"
+                                absorption_level_local = short_abs_level
+                                break_level_local = short_break_level
+                                absorption_bar_local = short_abs_bar
+                                entry_reason_local = "break"
+                                if rearm_active_short:
+                                    rearm_used_local = True
+                        else:
+                            missed_break = True
                 else:
-                    if ft_progress_ticks > -afr_ft_min_ticks:
-                        ft_ok = False
-                if afr_ft_no_backtrack:
-                    ref_mid_pre = mid[afr_t_idx - 1]
-                    window = mid[afr_t_idx : afr_tf_idx + 1]
-                    if desired_side == "long":
-                        if np.nanmin(window) < ref_mid_pre:
-                            ft_ok = False
+                    if long_break or short_break:
+                        afr2_break_pass += 1
+
+                if desired_side_local is None and allow_ft:
+                    # Allow FT entry only if enabled and FT bar is reached.
+                    if break_bar_long >= 0 and entry_bar == break_bar_long + ft_bars:
+                        ft_progress_ticks = float((mid[entry_bar] - mid[break_bar_long]) / tick_size)
+                        ok, flow_align_sum_local = _align_ok("long", entry_bar)
+                        ft_ok = ok and ft_progress_ticks >= afr_ft_min_ticks
+                        if ft_ok:
+                            afr2_ft_pass += 1
+                            desired_side_local = "long"
+                            absorption_level_local = absorption_level_long
+                            break_level_local = absorption_level_long + afr_break_ticks * tick_size
+                            absorption_bar_local = absorption_bar_long
+                            afr_t_idx = break_bar_long
+                            afr_tf_idx = entry_bar
+                            if break_bar_long - 1 >= 0 and np.isfinite(mid[break_bar_long]) and np.isfinite(mid[break_bar_long - 1]):
+                                break_ticks = float((mid[break_bar_long] - mid[break_bar_long - 1]) / tick_size)
+                            entry_reason_local = "ft"
+                            if rearm_active_long:
+                                rearm_used_local = True
+                    elif break_bar_short >= 0 and entry_bar == break_bar_short + ft_bars:
+                        ft_progress_ticks = float((mid[entry_bar] - mid[break_bar_short]) / tick_size)
+                        ok, flow_align_sum_local = _align_ok("short", entry_bar)
+                        ft_ok = ok and ft_progress_ticks <= -afr_ft_min_ticks
+                        if ft_ok:
+                            afr2_ft_pass += 1
+                            desired_side_local = "short"
+                            absorption_level_local = absorption_level_short
+                            break_level_local = absorption_level_short - afr_break_ticks * tick_size
+                            absorption_bar_local = absorption_bar_short
+                            afr_t_idx = break_bar_short
+                            afr_tf_idx = entry_bar
+                            if break_bar_short - 1 >= 0 and np.isfinite(mid[break_bar_short]) and np.isfinite(mid[break_bar_short - 1]):
+                                break_ticks = float((mid[break_bar_short] - mid[break_bar_short - 1]) / tick_size)
+                            entry_reason_local = "ft"
+                            if rearm_active_short:
+                                rearm_used_local = True
+
+                if desired_side_local is None and missed_break:
+                    # Missed entry: allow one rearm per direction.
+                    if long_break:
+                        _arm_rearm("long", absorption_bar_long)
+                    if short_break:
+                        _arm_rearm("short", absorption_bar_short)
+                    return None
+
+                if desired_side_local is None:
+                    return None
+
+                # Flow alignment check for FT entry bar.
+                if desired_side_local == "long":
+                    align_ok, flow_align_sum_local = _align_ok("long", entry_bar)
+                    if not align_ok:
+                        missed_break = True
+                else:
+                    align_ok, flow_align_sum_local = _align_ok("short", entry_bar)
+                    if not align_ok:
+                        missed_break = True
+                if missed_break:
+                    if desired_side_local == "long":
+                        _arm_rearm("long", absorption_bar_long)
+                    if desired_side_local == "short":
+                        _arm_rearm("short", absorption_bar_short)
+                    return None
+
+                if rearm_used_local:
+                    if desired_side_local == "long":
+                        rearm_used_long = True
+                        rearm_active_long = False
                     else:
-                        if np.nanmax(window) > ref_mid_pre:
-                            ft_ok = False
-            else:
-                ft_ok = False
-            if ft_ok:
-                afr2_ft_pass += 1
-            if enter_on == "ft":
-                if not ft_ok:
-                    i += 1
-                    continue
-                signals_when_flat += 1
-                total_signals += 1
-            else:
-                signals_when_flat += 1
-                total_signals += 1
+                        rearm_used_short = True
+                        rearm_active_short = False
+                if entry_reason_local == "break":
+                    if desired_side_local == "long":
+                        break_bar_long = -1
+                    else:
+                        break_bar_short = -1
+                    if break_quality_ok and not snapback_fail:
+                        afr2_break_quality_entries += 1
+
+                return {
+                    "desired_side": desired_side_local,
+                    "entry_reason": entry_reason_local,
+                    "absorption_level": absorption_level_local,
+                    "break_level": break_level_local,
+                    "absorption_bar": absorption_bar_local,
+                    "flow_align_sum": flow_align_sum_local,
+                    "rearm_used": rearm_used_local,
+                }
+
+            afr2_intent = _afr2_entry_intent()
+            if afr2_intent is None:
+                i += 1
+                continue
+
+            desired_side = afr2_intent["desired_side"]
+            entry_reason = afr2_intent["entry_reason"]
+            absorption_level = float(afr2_intent["absorption_level"])
+            break_level = float(afr2_intent["break_level"])
+            absorption_bar = int(afr2_intent["absorption_bar"])
+            flow_align_sum = float(afr2_intent["flow_align_sum"])
+
+            signals_when_flat += 1
+            total_signals += 1
         elif strategy_mode == "absorption_failure_v3":
             afr3_checked += 1
             k = max(1, int(afr_k_bars))
@@ -1297,6 +1613,8 @@ def _simulate_day(
                         flush=True,
                     )
                     debug_mmas_printed = True
+                if strategy_mode.startswith("absorption_failure") and desired_side is not None:
+                    _arm_rearm(desired_side, absorption_bar)
                 i += 1
                 continue
             else:
@@ -1431,6 +1749,8 @@ def _simulate_day(
                             flush=True,
                         )
                         debug_mmas_printed = True
+                    if strategy_mode.startswith("absorption_failure") and desired_side is not None:
+                        _arm_rearm(desired_side, absorption_bar)
                     i += 1
                     continue
                 elif event_pos[idx_pos] < entry_bar - gate_lookback_bars:
@@ -1527,6 +1847,8 @@ def _simulate_day(
                             flush=True,
                         )
                         debug_mmas_printed = True
+                    if strategy_mode.startswith("absorption_failure") and desired_side is not None:
+                        _arm_rearm(desired_side, absorption_bar)
                     i += 1
                     continue
                 else:
@@ -1643,6 +1965,8 @@ def _simulate_day(
                                 flush=True,
                             )
                             debug_mmas_printed = True
+                        if strategy_mode.startswith("absorption_failure") and desired_side is not None:
+                            _arm_rearm(desired_side, absorption_bar)
                         i += 1
                         continue
                     else:
@@ -1759,6 +2083,8 @@ def _simulate_day(
                                     flush=True,
                                 )
                                 debug_mmas_printed = True
+                            if strategy_mode.startswith("absorption_failure") and desired_side is not None:
+                                _arm_rearm(desired_side, absorption_bar)
                             i += 1
                             continue
             if (
@@ -1924,6 +2250,16 @@ def _simulate_day(
             "breakeven_ticks": breakeven_ticks_local,
             "breakeven_set": False,
             "breakeven_triggered": False,
+            "entry_reason": entry_reason,
+            "absorption_level": float(absorption_level) if np.isfinite(absorption_level) else float("nan"),
+            "break_level": float(break_level) if np.isfinite(break_level) else float("nan"),
+            "flow_align_sum_at_entry": float(flow_align_sum),
+            "bars_from_absorption": int(entry_bar - absorption_bar) if absorption_bar >= 0 else -1,
+            "absorption_bar": int(absorption_bar),
+            "mae_ticks": 0.0,
+            "mfe_ticks": 0.0,
+            "exit_on_decay": False,
+            "exit_on_be": False,
             "side": desired_side,
         }
         in_position = True
@@ -2031,6 +2367,9 @@ def _simulate_day(
         afr2_break_pass,
         afr2_ft_pass,
         afr2_entered,
+        afr2_break_quality_pass,
+        afr2_snapback_fail,
+        afr2_break_quality_entries,
         afr3_checked,
         afr3_absorption_pass,
         afr3_break_pass,
@@ -2234,6 +2573,14 @@ def main() -> None:
     parser.add_argument("--afr-ft-min-ticks", type=int, dest="afr_ft_min_ticks")
     parser.add_argument("--afr-ft-no-backtrack", type=int, dest="afr_ft_no_backtrack")
     parser.add_argument("--afr-enter-on", dest="afr_enter_on")
+    parser.add_argument("--afr-enter-mode", dest="afr_enter_mode")
+    parser.add_argument("--afr-flow-align-bars", type=int, dest="afr_flow_align_bars")
+    parser.add_argument("--afr-min-flow-abs-align", type=float, dest="afr_min_flow_abs_align")
+    parser.add_argument("--afr-rearm-band-ticks", type=int, dest="afr_rearm_band_ticks")
+    parser.add_argument("--afr-rearm-max-bars", type=int, dest="afr_rearm_max_bars")
+    parser.add_argument("--afr-rearm-stop-max-bars", type=int, dest="afr_rearm_stop_max_bars")
+    parser.add_argument("--afr-momentum-decay-bars", type=int, dest="afr_momentum_decay_bars")
+    parser.add_argument("--afr-momentum-decay-min-flow", type=float, dest="afr_momentum_decay_min_flow")
     args, _ = parser.parse_known_args()
 
     def _arg_or_env(name: str, env_name: str, default: str) -> str:
@@ -2275,6 +2622,20 @@ def main() -> None:
     afr_ft_min_ticks = int(_arg_or_env("afr_ft_min_ticks", "AFR_FT_MIN_TICKS", "0"))
     afr_ft_no_backtrack = _arg_or_env("afr_ft_no_backtrack", "AFR_FT_NO_BACKTRACK", "1").strip() == "1"
     afr_enter_on = _arg_or_env("afr_enter_on", "AFR_ENTER_ON", "break").strip().lower()
+    if afr_enter_on not in {"break", "ft", "both"}:
+        raise ValueError(f"Invalid AFR_ENTER_ON: {afr_enter_on}")
+    afr_break_quality_min_flow_abs = float(os.environ.get("AFR_BREAK_QUALITY_MIN_FLOW_ABS", "80"))
+    afr_break_quality_max_spread_ticks = int(os.environ.get("AFR_BREAK_QUALITY_MAX_SPREAD_TICKS", "1"))
+    afr_snapback_bars = int(os.environ.get("AFR_SNAPBACK_BARS", "2"))
+    afr_snapback_band_ticks = int(os.environ.get("AFR_SNAPBACK_BAND_TICKS", "1"))
+    afr_enter_mode = _arg_or_env("afr_enter_mode", "AFR_ENTER_MODE", "break_first").strip().lower()
+    afr_flow_align_bars = int(_arg_or_env("afr_flow_align_bars", "AFR_FLOW_ALIGN_BARS", "5"))
+    afr_min_flow_abs_align = float(_arg_or_env("afr_min_flow_abs_align", "AFR_MIN_FLOW_ABS_ALIGN", "40"))
+    afr_rearm_band_ticks = int(_arg_or_env("afr_rearm_band_ticks", "AFR_REARM_BAND_TICKS", "1"))
+    afr_rearm_max_bars = int(_arg_or_env("afr_rearm_max_bars", "AFR_REARM_MAX_BARS", "5"))
+    afr_rearm_stop_max_bars = int(_arg_or_env("afr_rearm_stop_max_bars", "AFR_REARM_STOP_MAX_BARS", "3"))
+    afr_momentum_decay_bars = int(_arg_or_env("afr_momentum_decay_bars", "AFR_MOMENTUM_DECAY_BARS", "3"))
+    afr_momentum_decay_min_flow = float(_arg_or_env("afr_momentum_decay_min_flow", "AFR_MOMENTUM_DECAY_MIN_FLOW", "0"))
     afr3_break_min_flow_abs = float(os.environ.get("AFR3_BREAK_MIN_FLOW_ABS", "100"))
     afr3_break_max_spread_ticks = int(os.environ.get("AFR3_BREAK_MAX_SPREAD_TICKS", "2"))
     afr3_snapback_check = os.environ.get("AFR3_SNAPBACK_CHECK", "1").strip() == "1"
@@ -2383,12 +2744,21 @@ def main() -> None:
             "afr_sl_ticks": afr_sl_ticks,
             "afr_max_hold_bars": afr_max_hold_bars,
             "afr_breakeven_after_ticks": afr_breakeven_after_ticks,
+            "afr_enter_mode": afr_enter_mode,
+            "afr_flow_align_bars": afr_flow_align_bars,
+            "afr_min_flow_abs_align": afr_min_flow_abs_align,
+            "afr_rearm_band_ticks": afr_rearm_band_ticks,
+            "afr_rearm_max_bars": afr_rearm_max_bars,
+            "afr_rearm_stop_max_bars": afr_rearm_stop_max_bars,
+            "afr_momentum_decay_bars": afr_momentum_decay_bars,
+            "afr_momentum_decay_min_flow": afr_momentum_decay_min_flow,
             "trade_session": trade_session,
             "min_spread_ticks": min_spread_ticks,
             "entry_cooldown_bars": entry_cooldown_bars,
         },
         flush=True,
     )
+    print(f"AFR_ENTER_ON={afr_enter_on} strategy_mode={strategy_mode}", flush=True)
     if run_mode == "gated_only":
         print("RUN_MODE: gated_only (no baseline)", flush=True)
     else:
@@ -2435,7 +2805,19 @@ def main() -> None:
                 "afr_ft_min_ticks": afr_ft_min_ticks,
                 "afr_ft_no_backtrack": afr_ft_no_backtrack,
                 "afr_enter_on": afr_enter_on,
+                "afr_break_quality_min_flow_abs": afr_break_quality_min_flow_abs,
+                "afr_break_quality_max_spread_ticks": afr_break_quality_max_spread_ticks,
+                "afr_snapback_bars": afr_snapback_bars,
+                "afr_snapback_band_ticks": afr_snapback_band_ticks,
                 "debug_first_afr2": debug_first_afr2,
+                "afr_enter_mode": afr_enter_mode,
+                "afr_flow_align_bars": afr_flow_align_bars,
+                "afr_min_flow_abs_align": afr_min_flow_abs_align,
+                "afr_rearm_band_ticks": afr_rearm_band_ticks,
+                "afr_rearm_max_bars": afr_rearm_max_bars,
+                "afr_rearm_stop_max_bars": afr_rearm_stop_max_bars,
+                "afr_momentum_decay_bars": afr_momentum_decay_bars,
+                "afr_momentum_decay_min_flow": afr_momentum_decay_min_flow,
             },
             flush=True,
         )
@@ -2623,6 +3005,9 @@ def main() -> None:
                             afr2_break_pass_base,
                             afr2_ft_pass_base,
                             afr2_entered_base,
+                            afr2_break_quality_pass_base,
+                            afr2_snapback_fail_base,
+                            afr2_break_quality_entries_base,
                             afr3_checked_base,
                             afr3_absorption_pass_base,
                             afr3_break_pass_base,
@@ -2682,6 +3067,10 @@ def main() -> None:
                             afr_ft_min_ticks=afr_ft_min_ticks,
                             afr_ft_no_backtrack=afr_ft_no_backtrack,
                             afr_enter_on=afr_enter_on,
+                            afr_break_quality_min_flow_abs=afr_break_quality_min_flow_abs,
+                            afr_break_quality_max_spread_ticks=afr_break_quality_max_spread_ticks,
+                            afr_snapback_bars=afr_snapback_bars,
+                            afr_snapback_band_ticks=afr_snapback_band_ticks,
                             debug_first_afr=debug_first_afr,
                             debug_first_afr2=debug_first_afr2,
                             afr3_break_min_flow_abs=afr3_break_min_flow_abs,
@@ -2692,6 +3081,14 @@ def main() -> None:
                             afr_sl_ticks=afr_sl_ticks,
                             afr_max_hold_bars=afr_max_hold_bars,
                             afr_breakeven_after_ticks=afr_breakeven_after_ticks,
+                            afr_enter_mode=afr_enter_mode,
+                            afr_flow_align_bars=afr_flow_align_bars,
+                            afr_min_flow_abs_align=afr_min_flow_abs_align,
+                            afr_rearm_band_ticks=afr_rearm_band_ticks,
+                            afr_rearm_max_bars=afr_rearm_max_bars,
+                            afr_rearm_stop_max_bars=afr_rearm_stop_max_bars,
+                            afr_momentum_decay_bars=afr_momentum_decay_bars,
+                            afr_momentum_decay_min_flow=afr_momentum_decay_min_flow,
                             debug_entry_print=debug_entry,
                             debug_entry_limit=5,
                             debug_entry_tag="baseline",
@@ -2740,6 +3137,9 @@ def main() -> None:
                         afr2_break_pass_base = 0
                         afr2_ft_pass_base = 0
                         afr2_entered_base = 0
+                        afr2_break_quality_pass_base = 0
+                        afr2_snapback_fail_base = 0
+                        afr2_break_quality_entries_base = 0
                         afr3_checked_base = 0
                         afr3_absorption_pass_base = 0
                         afr3_break_pass_base = 0
@@ -2799,6 +3199,9 @@ def main() -> None:
                         afr2_break_pass_gate,
                         afr2_ft_pass_gate,
                         afr2_entered_gate,
+                        afr2_break_quality_pass_gate,
+                        afr2_snapback_fail_gate,
+                        afr2_break_quality_entries_gate,
                         afr3_checked_gate,
                         afr3_absorption_pass_gate,
                         afr3_break_pass_gate,
@@ -2858,6 +3261,10 @@ def main() -> None:
                         afr_ft_min_ticks=afr_ft_min_ticks,
                         afr_ft_no_backtrack=afr_ft_no_backtrack,
                         afr_enter_on=afr_enter_on,
+                        afr_break_quality_min_flow_abs=afr_break_quality_min_flow_abs,
+                        afr_break_quality_max_spread_ticks=afr_break_quality_max_spread_ticks,
+                        afr_snapback_bars=afr_snapback_bars,
+                        afr_snapback_band_ticks=afr_snapback_band_ticks,
                         debug_first_afr=debug_first_afr,
                         debug_first_afr2=debug_first_afr2,
                         afr3_break_min_flow_abs=afr3_break_min_flow_abs,
@@ -2868,6 +3275,14 @@ def main() -> None:
                         afr_sl_ticks=afr_sl_ticks,
                         afr_max_hold_bars=afr_max_hold_bars,
                         afr_breakeven_after_ticks=afr_breakeven_after_ticks,
+                        afr_enter_mode=afr_enter_mode,
+                        afr_flow_align_bars=afr_flow_align_bars,
+                        afr_min_flow_abs_align=afr_min_flow_abs_align,
+                        afr_rearm_band_ticks=afr_rearm_band_ticks,
+                        afr_rearm_max_bars=afr_rearm_max_bars,
+                        afr_rearm_stop_max_bars=afr_rearm_stop_max_bars,
+                        afr_momentum_decay_bars=afr_momentum_decay_bars,
+                        afr_momentum_decay_min_flow=afr_momentum_decay_min_flow,
                         debug_entry_print=debug_entry,
                         debug_entry_limit=5,
                         debug_entry_tag="gated",
@@ -3175,6 +3590,33 @@ def main() -> None:
                             f"entered={afr3_entered_gate}",
                             flush=True,
                         )
+                    base_entry_reason = trades_base["entry_reason"] if "entry_reason" in trades_base.columns else pd.Series(dtype=object)
+                    gate_entry_reason = trades_gate["entry_reason"] if "entry_reason" in trades_gate.columns else pd.Series(dtype=object)
+                    base_exit_reason = trades_base["exit_reason"] if "exit_reason" in trades_base.columns else pd.Series(dtype=object)
+                    gate_exit_reason = trades_gate["exit_reason"] if "exit_reason" in trades_gate.columns else pd.Series(dtype=object)
+                    base_mae = trades_base["mae_ticks"] if "mae_ticks" in trades_base.columns else pd.Series(dtype=float)
+                    base_mfe = trades_base["mfe_ticks"] if "mfe_ticks" in trades_base.columns else pd.Series(dtype=float)
+                    gate_mae = trades_gate["mae_ticks"] if "mae_ticks" in trades_gate.columns else pd.Series(dtype=float)
+                    gate_mfe = trades_gate["mfe_ticks"] if "mfe_ticks" in trades_gate.columns else pd.Series(dtype=float)
+                    count_break_entries_base = int(base_entry_reason.isin(["break", "rearm_break"]).sum())
+                    count_ft_entries_base = int(base_entry_reason.isin(["ft", "rearm_ft"]).sum())
+                    count_rearms_base = int(base_entry_reason.str.startswith("rearm").sum()) if not base_entry_reason.empty else 0
+                    count_break_entries_gate = int(gate_entry_reason.isin(["break", "rearm_break"]).sum())
+                    count_ft_entries_gate = int(gate_entry_reason.isin(["ft", "rearm_ft"]).sum())
+                    count_rearms_gate = int(gate_entry_reason.str.startswith("rearm").sum()) if not gate_entry_reason.empty else 0
+                    if strategy_mode == "absorption_failure_v2":
+                        if afr_enter_on == "break" and (count_ft_entries_base > 0 or count_ft_entries_gate > 0):
+                            raise RuntimeError("AFR_ENTER_ON=break but FT entries were recorded.")
+                        if afr_enter_on == "ft" and (count_break_entries_base > 0 or count_break_entries_gate > 0):
+                            raise RuntimeError("AFR_ENTER_ON=ft but break entries were recorded.")
+                    pct_exit_on_decay_base = float((base_exit_reason == "momentum_decay").mean()) if len(base_exit_reason) else 0.0
+                    pct_exit_on_decay_gate = float((gate_exit_reason == "momentum_decay").mean()) if len(gate_exit_reason) else 0.0
+                    pct_exit_on_be_base = float((base_exit_reason == "breakeven").mean()) if len(base_exit_reason) else 0.0
+                    pct_exit_on_be_gate = float((gate_exit_reason == "breakeven").mean()) if len(gate_exit_reason) else 0.0
+                    median_mfe_base = float(np.nanmedian(base_mfe)) if len(base_mfe) else 0.0
+                    median_mae_base = float(np.nanmedian(base_mae)) if len(base_mae) else 0.0
+                    median_mfe_gate = float(np.nanmedian(gate_mfe)) if len(gate_mfe) else 0.0
+                    median_mae_gate = float(np.nanmedian(gate_mae)) if len(gate_mae) else 0.0
                     strategy_rows.append(
                         {
                             "Symbol": instrument,
@@ -3206,11 +3648,17 @@ def main() -> None:
                             "afr2_break_pass_base": int(afr2_break_pass_base),
                             "afr2_ft_pass_base": int(afr2_ft_pass_base),
                             "afr2_entered_base": int(afr2_entered_base),
+                            "afr2_break_quality_pass_base": int(afr2_break_quality_pass_base),
+                            "afr2_snapback_fail_base": int(afr2_snapback_fail_base),
+                            "afr2_break_quality_entries_base": int(afr2_break_quality_entries_base),
                             "afr2_checked_gate": int(afr2_checked_gate),
                             "afr2_absorption_pass_gate": int(afr2_absorption_pass_gate),
                             "afr2_break_pass_gate": int(afr2_break_pass_gate),
                             "afr2_ft_pass_gate": int(afr2_ft_pass_gate),
                             "afr2_entered_gate": int(afr2_entered_gate),
+                            "afr2_break_quality_pass_gate": int(afr2_break_quality_pass_gate),
+                            "afr2_snapback_fail_gate": int(afr2_snapback_fail_gate),
+                            "afr2_break_quality_entries_gate": int(afr2_break_quality_entries_gate),
                             "afr3_checked_base": int(afr3_checked_base),
                             "afr3_absorption_pass_base": int(afr3_absorption_pass_base),
                             "afr3_break_pass_base": int(afr3_break_pass_base),
@@ -3227,6 +3675,21 @@ def main() -> None:
                             "afr_be_triggered_base": int(afr_be_triggered_base),
                             "afr_be_armed_gate": int(afr_be_armed_gate),
                             "afr_be_triggered_gate": int(afr_be_triggered_gate),
+                            "count_break_entries_base": int(count_break_entries_base),
+                            "count_ft_entries_base": int(count_ft_entries_base),
+                            "count_rearms_base": int(count_rearms_base),
+                            "count_break_entries_gate": int(count_break_entries_gate),
+                            "count_ft_entries_gate": int(count_ft_entries_gate),
+                            "count_rearms_gate": int(count_rearms_gate),
+                            "afr_enter_on_used": afr_enter_on,
+                            "pct_exit_on_decay_base": float(pct_exit_on_decay_base),
+                            "pct_exit_on_decay_gate": float(pct_exit_on_decay_gate),
+                            "pct_exit_on_be_base": float(pct_exit_on_be_base),
+                            "pct_exit_on_be_gate": float(pct_exit_on_be_gate),
+                            "median_mfe_ticks_base": float(median_mfe_base),
+                            "median_mae_ticks_base": float(median_mae_base),
+                            "median_mfe_ticks_gate": float(median_mfe_gate),
+                            "median_mae_ticks_gate": float(median_mae_gate),
                             "avg_impulse_ticks_entry_base": float(entry_impulse_sum_base / entry_count_base)
                             if entry_count_base
                             else 0.0,
