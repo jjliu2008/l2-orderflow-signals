@@ -22,7 +22,7 @@ Baseline:
   HOLD_BARS               holding horizon H (default: 20)
   BASELINE_MODE           flat|not_awful|mmas (default: flat)
   BASELINE_K_BARS         window for not_awful (default: 5)
-  STRATEGY_MODE           baseline_flat|micro_momo_v1|impulse_confirm_v1|absorption_failure_v1|absorption_failure_v2 (default: micro_momo_v1)
+  STRATEGY_MODE           baseline_flat|micro_momo_v1|impulse_confirm_v1|absorption_failure_v1|absorption_failure_v2|absorption_failure_v3 (default: micro_momo_v1)
   MICRO_K_BARS            micro momentum window (default: 5)
   MICRO_IMPULSE_TICKS     min impulse ticks (default: 1)
   MICRO_FLOW_MIN          min abs flow (default: 0)
@@ -57,6 +57,10 @@ Impulse confirm entry (strategy_mode=impulse_confirm_v1):
   AFR_FT_MIN_TICKS        AFR v2 follow-through min ticks (default: 0)
   AFR_FT_NO_BACKTRACK     AFR v2 block if price backtracks (default: 1)
   AFR_ENTER_ON            AFR v2 entry timing: ft|break (default: ft)
+  AFR3_BREAK_MIN_FLOW_ABS AFR v3 min abs flow on break bar (default: 100)
+  AFR3_BREAK_MAX_SPREAD_TICKS AFR v3 max spread on break bar (default: 2)
+  AFR3_SNAPBACK_CHECK     AFR v3 require no snapback on next bar (default: 1)
+  DEBUG_FIRST_AFR3        print first AFR v3 candidate (default: 0)
   AFR_TP_TICKS            override TP ticks for AFR modes (default: unset)
   AFR_SL_TICKS            override SL ticks for AFR modes (default: unset)
   AFR_MAX_HOLD_BARS       override max hold bars for AFR modes (default: unset)
@@ -381,6 +385,10 @@ def _simulate_day(
     afr_enter_on: str,
     debug_first_afr: bool,
     debug_first_afr2: bool,
+    afr3_break_min_flow_abs: float,
+    afr3_break_max_spread_ticks: int,
+    afr3_snapback_check: bool,
+    debug_first_afr3: bool,
     afr_tp_ticks: int | None,
     afr_sl_ticks: int | None,
     afr_max_hold_bars: int | None,
@@ -388,34 +396,7 @@ def _simulate_day(
     debug_entry_print: bool,
     debug_entry_limit: int,
     debug_entry_tag: str,
-) -> Tuple[
-    pd.DataFrame,
-    float,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    float,
-    float,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    Dict[str, int],
-]:
+) -> Tuple[object, ...]:
     bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
     ask = pd.to_numeric(df_day["ask_price_1"], errors="coerce").to_numpy()
     mid = 0.5 * (bid + ask)
@@ -451,6 +432,7 @@ def _simulate_day(
     entry_break_sum_short = 0.0
     entry_ft_sum = 0.0
     entry_ft_abs_sum = 0.0
+    entry_spread_sum = 0.0
     afr_be_armed = 0
     afr_be_triggered = 0
     afr_checked = 0
@@ -462,6 +444,12 @@ def _simulate_day(
     afr2_break_pass = 0
     afr2_ft_pass = 0
     afr2_entered = 0
+    afr3_checked = 0
+    afr3_absorption_pass = 0
+    afr3_break_pass = 0
+    afr3_break_quality_pass = 0
+    afr3_snapback_pass = 0
+    afr3_entered = 0
     mmas_signals_checked = 0
     mmas_passed_filters = 0
     mmas_signaled = 0
@@ -606,6 +594,43 @@ def _simulate_day(
             },
             flush=True,
         )
+
+    def _print_afr3_debug(
+        t_idx: int,
+        flow_val: float,
+        spread_val: float,
+        cooldown_ok_val: bool,
+        session_ok_val: bool,
+        gate_allowed_val: bool | None,
+        gate_reason_val: str,
+        desired_side_val: str | None,
+        absorption_pass_val: bool,
+        break_pass_val: bool,
+        break_quality_pass_val: bool,
+        snapback_pass_val: bool,
+        entry_taken_val: bool,
+        entry_action_val: str,
+    ) -> None:
+        print(
+            "AFR3_DEBUG",
+            {
+                "t": int(t_idx),
+                "flow_k": float(flow_val),
+                "spread_ticks": float(spread_val),
+                "cooldown_ok": bool(cooldown_ok_val),
+                "session_ok": bool(session_ok_val),
+                "gate_allowed": gate_allowed_val,
+                "gate_reason": gate_reason_val,
+                "desired_side": desired_side_val,
+                "absorption_pass": bool(absorption_pass_val),
+                "break_pass": bool(break_pass_val),
+                "break_quality_pass": bool(break_quality_pass_val),
+                "snapback_pass": bool(snapback_pass_val),
+                "entry_taken": bool(entry_taken_val),
+                "entry_action": entry_action_val,
+            },
+            flush=True,
+        )
     if trade_session == "rth":
         times = pd.to_datetime(df_day["Time"], utc=True, errors="coerce")
         times_cst = times.dt.tz_convert("America/Chicago")
@@ -682,6 +707,7 @@ def _simulate_day(
     pos: Dict[str, object] = {}
     debug_trigger_printed = False
     debug_mmas_printed = False
+    debug_afr3_printed = False
     pnl_bound_printed = 0
     cooldown_until = -1
     i = lookback_bars
@@ -828,6 +854,8 @@ def _simulate_day(
         ft_progress_ticks = float("nan")
         afr_t_idx = -1
         afr_tf_idx = -1
+        afr3_candidate = False
+        afr3_debug_info: Dict[str, object] = {}
         mmas_passed = False
         entry_bar = i + 1
         if strategy_mode == "absorption_failure_v2":
@@ -1017,6 +1045,80 @@ def _simulate_day(
             else:
                 signals_when_flat += 1
                 total_signals += 1
+        elif strategy_mode == "absorption_failure_v3":
+            afr3_checked += 1
+            k = max(1, int(afr_k_bars))
+            if i < k or i - 1 < 0:
+                i += 1
+                continue
+            if afr_use_mid_for_stall:
+                stall_series = mid
+            elif "last_price" in df_day.columns:
+                stall_series = pd.to_numeric(df_day["last_price"], errors="coerce").fillna(np.nan).to_numpy()
+            else:
+                stall_series = mid
+            if (
+                not np.isfinite(stall_series[i - 1])
+                or not np.isfinite(stall_series[i - k])
+                or not np.isfinite(mid[i])
+                or not np.isfinite(mid[i - 1])
+                or not np.isfinite(bid[i])
+                or not np.isfinite(ask[i])
+            ):
+                i += 1
+                continue
+            flow = float(np.sum(afr_flow_series[i - k + 1 : i + 1]))
+            stall_ticks = float((stall_series[i - 1] - stall_series[i - k]) / tick_size)
+            if abs(flow) < afr_min_flow_abs or abs(stall_ticks) > afr_stall_ticks:
+                i += 1
+                continue
+            afr3_absorption_pass += 1
+            break_ticks = float((mid[i] - mid[i - 1]) / tick_size)
+            if abs(break_ticks) < afr_break_ticks or break_ticks == 0:
+                i += 1
+                continue
+            afr3_break_pass += 1
+            if abs(flow) < afr3_break_min_flow_abs or spread_ticks[i] > afr3_break_max_spread_ticks:
+                i += 1
+                continue
+            afr3_break_quality_pass += 1
+            if break_ticks > 0:
+                desired_side = "long"
+            elif break_ticks < 0:
+                desired_side = "short"
+            else:
+                i += 1
+                continue
+            if afr_require_flow_sign and np.sign(flow) != np.sign(break_ticks):
+                i += 1
+                continue
+            snapback_ok = True
+            if afr3_snapback_check:
+                if i + 1 >= n or not np.isfinite(mid[i + 1]):
+                    snapback_ok = False
+                elif desired_side == "long":
+                    if mid[i + 1] < mid[i]:
+                        snapback_ok = False
+                else:
+                    if mid[i + 1] > mid[i]:
+                        snapback_ok = False
+            if not snapback_ok:
+                i += 1
+                continue
+            afr3_snapback_pass += 1
+            afr3_candidate = True
+            afr3_debug_info = {
+                "t": int(i),
+                "absorption_pass": True,
+                "break_pass": True,
+                "break_quality_pass": True,
+                "flow_k": float(flow),
+                "spread_ticks": int(spread_ticks[i]),
+                "snapback_pass": True,
+                "side": desired_side,
+            }
+            signals_when_flat += 1
+            total_signals += 1
         elif strategy_mode == "micro_momo_v1":
             k = max(1, int(micro_k_bars))
             if i >= k and np.isfinite(mid[i]) and np.isfinite(mid[i - k]):
@@ -1162,6 +1264,24 @@ def _simulate_day(
                         entry_action_val="blocked",
                     )
                     entry_debug_printed += 1
+                if strategy_mode == "absorption_failure_v3" and debug_first_afr3 and entry_debug_printed == 0 and afr3_candidate:
+                    _print_afr3_debug(
+                        t_idx=i,
+                        flow_val=flow,
+                        spread_val=spread_ticks[i],
+                        cooldown_ok_val=cooldown_ok,
+                        session_ok_val=bool(session_ok[entry_bar]),
+                        gate_allowed_val=False,
+                        gate_reason_val=gate_reason,
+                        desired_side_val=desired_side,
+                        absorption_pass_val=True,
+                        break_pass_val=True,
+                        break_quality_pass_val=True,
+                        snapback_pass_val=True,
+                        entry_taken_val=False,
+                        entry_action_val="blocked",
+                    )
+                    entry_debug_printed += 1
                 if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
                     print(
                         "MMAS_DEBUG",
@@ -1257,6 +1377,42 @@ def _simulate_day(
                             sl_ticks_val=int(afr_sl_ticks) if afr_sl_ticks is not None else int(sl_ticks),
                             hold_bars_val=int(afr_max_hold_bars) if afr_max_hold_bars is not None else int(hold_bars),
                             breakeven_ticks_val=afr_breakeven_after_ticks,
+                            entry_action_val="blocked",
+                        )
+                        entry_debug_printed += 1
+                    if strategy_mode == "absorption_failure_v3" and debug_first_afr3 and entry_debug_printed == 0 and afr3_candidate:
+                        _print_afr3_debug(
+                            t_idx=i,
+                            flow_val=flow,
+                            spread_val=spread_ticks[i],
+                            cooldown_ok_val=cooldown_ok,
+                            session_ok_val=bool(session_ok[entry_bar]),
+                            gate_allowed_val=False,
+                            gate_reason_val=gate_reason,
+                            desired_side_val=desired_side,
+                            absorption_pass_val=True,
+                            break_pass_val=True,
+                            break_quality_pass_val=True,
+                            snapback_pass_val=True,
+                            entry_taken_val=False,
+                            entry_action_val="blocked",
+                        )
+                        entry_debug_printed += 1
+                    if strategy_mode == "absorption_failure_v3" and debug_first_afr3 and entry_debug_printed == 0 and afr3_candidate:
+                        _print_afr3_debug(
+                            t_idx=i,
+                            flow_val=flow,
+                            spread_val=spread_ticks[i],
+                            cooldown_ok_val=cooldown_ok,
+                            session_ok_val=bool(session_ok[entry_bar]),
+                            gate_allowed_val=False,
+                            gate_reason_val=gate_reason,
+                            desired_side_val=desired_side,
+                            absorption_pass_val=True,
+                            break_pass_val=True,
+                            break_quality_pass_val=True,
+                            snapback_pass_val=True,
+                            entry_taken_val=False,
                             entry_action_val="blocked",
                         )
                         entry_debug_printed += 1
@@ -1454,6 +1610,24 @@ def _simulate_day(
                                 entry_action_val="blocked",
                             )
                             entry_debug_printed += 1
+                        if strategy_mode == "absorption_failure_v3" and debug_first_afr3 and entry_debug_printed == 0 and afr3_candidate:
+                            _print_afr3_debug(
+                                t_idx=i,
+                                flow_val=flow,
+                                spread_val=spread_ticks[i],
+                                cooldown_ok_val=cooldown_ok,
+                                session_ok_val=bool(session_ok[entry_bar]),
+                                gate_allowed_val=False,
+                                gate_reason_val=gate_reason,
+                                desired_side_val=desired_side,
+                                absorption_pass_val=True,
+                                break_pass_val=True,
+                                break_quality_pass_val=True,
+                                snapback_pass_val=True,
+                                entry_taken_val=False,
+                                entry_action_val="blocked",
+                            )
+                            entry_debug_printed += 1
                         if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
                             print(
                                 "MMAS_DEBUG",
@@ -1549,6 +1723,24 @@ def _simulate_day(
                                     sl_ticks_val=int(afr_sl_ticks) if afr_sl_ticks is not None else int(sl_ticks),
                                     hold_bars_val=int(afr_max_hold_bars) if afr_max_hold_bars is not None else int(hold_bars),
                                     breakeven_ticks_val=afr_breakeven_after_ticks,
+                                    entry_action_val="blocked",
+                                )
+                                entry_debug_printed += 1
+                            if strategy_mode == "absorption_failure_v3" and debug_first_afr3 and entry_debug_printed == 0 and afr3_candidate:
+                                _print_afr3_debug(
+                                    t_idx=i,
+                                    flow_val=flow,
+                                    spread_val=spread_ticks[i],
+                                    cooldown_ok_val=cooldown_ok,
+                                    session_ok_val=bool(session_ok[entry_bar]),
+                                    gate_allowed_val=False,
+                                    gate_reason_val=gate_reason,
+                                    desired_side_val=desired_side,
+                                    absorption_pass_val=True,
+                                    break_pass_val=True,
+                                    break_quality_pass_val=True,
+                                    snapback_pass_val=True,
+                                    entry_taken_val=False,
                                     entry_action_val="blocked",
                                 )
                                 entry_debug_printed += 1
@@ -1661,6 +1853,24 @@ def _simulate_day(
                 entry_action_val="entered",
             )
             entry_debug_printed += 1
+        if strategy_mode == "absorption_failure_v3" and debug_first_afr3 and entry_debug_printed == 0 and afr3_candidate:
+            _print_afr3_debug(
+                t_idx=i,
+                flow_val=flow,
+                spread_val=spread_ticks[i],
+                cooldown_ok_val=cooldown_ok,
+                session_ok_val=bool(session_ok[entry_bar]),
+                gate_allowed_val=True if disable_gate and gated else gate_allowed,
+                gate_reason_val="disabled" if disable_gate and gated else gate_reason,
+                desired_side_val=desired_side,
+                absorption_pass_val=True,
+                break_pass_val=True,
+                break_quality_pass_val=True,
+                snapback_pass_val=True,
+                entry_taken_val=True,
+                entry_action_val="entered",
+            )
+            entry_debug_printed += 1
         if strategy_mode == "absorption_failure_v2" and debug_first_afr and entry_debug_printed == 0:
             _print_afr_debug(
                 t_idx=entry_bar,
@@ -1724,6 +1934,8 @@ def _simulate_day(
             afr_entered += 1
         if strategy_mode == "absorption_failure_v2":
             afr2_entered += 1
+        if strategy_mode == "absorption_failure_v3":
+            afr3_entered += 1
         impulse_for_entry = impulse_ticks if np.isfinite(impulse_ticks) else dmid_ticks
         if np.isfinite(impulse_for_entry):
             entry_impulse_sum += float(impulse_for_entry)
@@ -1749,6 +1961,8 @@ def _simulate_day(
                 entry_flow_sum_long += float(flow)
             else:
                 entry_flow_sum_short += float(flow)
+        if np.isfinite(spread_ticks[entry_bar]):
+            entry_spread_sum += float(spread_ticks[entry_bar])
         entry_count += 1
         if desired_side == "long":
             entry_count_long += 1
@@ -1805,6 +2019,7 @@ def _simulate_day(
         float(entry_break_sum_short),
         float(entry_ft_sum),
         float(entry_ft_abs_sum),
+        float(entry_spread_sum),
         afr_be_armed,
         afr_be_triggered,
         afr_checked,
@@ -1816,6 +2031,12 @@ def _simulate_day(
         afr2_break_pass,
         afr2_ft_pass,
         afr2_entered,
+        afr3_checked,
+        afr3_absorption_pass,
+        afr3_break_pass,
+        afr3_break_quality_pass,
+        afr3_snapback_pass,
+        afr3_entered,
         mmas_signals_checked,
         mmas_passed_filters,
         mmas_signaled,
@@ -2042,6 +2263,7 @@ def main() -> None:
     disable_gate = args.disable_gate or os.environ.get("DISABLE_GATE", "0").strip() == "1"
     debug_first_afr = os.environ.get("DEBUG_FIRST_AFR", "0").strip() == "1"
     debug_first_afr2 = os.environ.get("DEBUG_FIRST_AFR2", "0").strip() == "1"
+    debug_first_afr3 = os.environ.get("DEBUG_FIRST_AFR3", "0").strip() == "1"
     afr_k_bars = int(_arg_or_env("afr_k_bars", "AFR_K_BARS", "10"))
     afr_min_flow_abs = float(_arg_or_env("afr_min_flow_abs", "AFR_MIN_FLOW_ABS", "40"))
     afr_stall_ticks = int(_arg_or_env("afr_stall_ticks", "AFR_STALL_TICKS", "0"))
@@ -2053,6 +2275,9 @@ def main() -> None:
     afr_ft_min_ticks = int(_arg_or_env("afr_ft_min_ticks", "AFR_FT_MIN_TICKS", "0"))
     afr_ft_no_backtrack = _arg_or_env("afr_ft_no_backtrack", "AFR_FT_NO_BACKTRACK", "1").strip() == "1"
     afr_enter_on = _arg_or_env("afr_enter_on", "AFR_ENTER_ON", "break").strip().lower()
+    afr3_break_min_flow_abs = float(os.environ.get("AFR3_BREAK_MIN_FLOW_ABS", "100"))
+    afr3_break_max_spread_ticks = int(os.environ.get("AFR3_BREAK_MAX_SPREAD_TICKS", "2"))
+    afr3_snapback_check = os.environ.get("AFR3_SNAPBACK_CHECK", "1").strip() == "1"
     afr_tp_env = os.environ.get("AFR_TP_TICKS", "").strip()
     afr_sl_env = os.environ.get("AFR_SL_TICKS", "").strip()
     afr_hold_env = os.environ.get("AFR_MAX_HOLD_BARS", "").strip()
@@ -2128,6 +2353,9 @@ def main() -> None:
             "entry_cooldown_bars": entry_cooldown_bars,
             "tp_ticks": tp_ticks,
             "sl_ticks": sl_ticks,
+            "afr3_break_min_flow_abs": afr3_break_min_flow_abs,
+            "afr3_break_max_spread_ticks": afr3_break_max_spread_ticks,
+            "afr3_snapback_check": afr3_snapback_check,
             "gate_mode_list": gate_modes,
             "sweep_ws": sweep_ws,
         },
@@ -2208,6 +2436,24 @@ def main() -> None:
                 "afr_ft_no_backtrack": afr_ft_no_backtrack,
                 "afr_enter_on": afr_enter_on,
                 "debug_first_afr2": debug_first_afr2,
+            },
+            flush=True,
+        )
+    if strategy_mode == "absorption_failure_v3":
+        print(
+            "AFR3 config:",
+            {
+                "afr_k_bars": afr_k_bars,
+                "afr_min_flow_abs": afr_min_flow_abs,
+                "afr_stall_ticks": afr_stall_ticks,
+                "afr_break_ticks": afr_break_ticks,
+                "afr_require_flow_sign": afr_require_flow_sign,
+                "afr_use_mid_for_stall": afr_use_mid_for_stall,
+                "afr_use_signed_volume": afr_use_signed_volume,
+                "afr3_break_min_flow_abs": afr3_break_min_flow_abs,
+                "afr3_break_max_spread_ticks": afr3_break_max_spread_ticks,
+                "afr3_snapback_check": afr3_snapback_check,
+                "debug_first_afr3": debug_first_afr3,
             },
             flush=True,
         )
@@ -2359,23 +2605,30 @@ def main() -> None:
                             entry_count_base,
                             entry_count_long_base,
                             entry_count_short_base,
-                        entry_break_sum_base,
-                        entry_break_abs_sum_base,
-                        entry_break_sum_long_base,
-                        entry_break_sum_short_base,
-                        entry_ft_sum_base,
-                        entry_ft_abs_sum_base,
-                        afr_be_armed_base,
-                        afr_be_triggered_base,
-                        afr_checked_base,
-                        afr_absorption_pass_base,
-                        afr_break_pass_base,
-                        afr_entered_base,
+                            entry_break_sum_base,
+                            entry_break_abs_sum_base,
+                            entry_break_sum_long_base,
+                            entry_break_sum_short_base,
+                            entry_ft_sum_base,
+                            entry_ft_abs_sum_base,
+                            entry_spread_sum_base,
+                            afr_be_armed_base,
+                            afr_be_triggered_base,
+                            afr_checked_base,
+                            afr_absorption_pass_base,
+                            afr_break_pass_base,
+                            afr_entered_base,
                             afr2_checked_base,
                             afr2_absorption_pass_base,
                             afr2_break_pass_base,
                             afr2_ft_pass_base,
                             afr2_entered_base,
+                            afr3_checked_base,
+                            afr3_absorption_pass_base,
+                            afr3_break_pass_base,
+                            afr3_break_quality_pass_base,
+                            afr3_snapback_pass_base,
+                            afr3_entered_base,
                             mmas_checked_base,
                             mmas_passed_base,
                             mmas_signaled_base,
@@ -2431,6 +2684,10 @@ def main() -> None:
                             afr_enter_on=afr_enter_on,
                             debug_first_afr=debug_first_afr,
                             debug_first_afr2=debug_first_afr2,
+                            afr3_break_min_flow_abs=afr3_break_min_flow_abs,
+                            afr3_break_max_spread_ticks=afr3_break_max_spread_ticks,
+                            afr3_snapback_check=afr3_snapback_check,
+                            debug_first_afr3=debug_first_afr3,
                             afr_tp_ticks=afr_tp_ticks,
                             afr_sl_ticks=afr_sl_ticks,
                             afr_max_hold_bars=afr_max_hold_bars,
@@ -2471,6 +2728,9 @@ def main() -> None:
                         entry_break_sum_short_base = 0.0
                         entry_ft_sum_base = 0.0
                         entry_ft_abs_sum_base = 0.0
+                        entry_spread_sum_base = 0.0
+                        afr_be_armed_base = 0
+                        afr_be_triggered_base = 0
                         afr_checked_base = 0
                         afr_absorption_pass_base = 0
                         afr_break_pass_base = 0
@@ -2480,6 +2740,12 @@ def main() -> None:
                         afr2_break_pass_base = 0
                         afr2_ft_pass_base = 0
                         afr2_entered_base = 0
+                        afr3_checked_base = 0
+                        afr3_absorption_pass_base = 0
+                        afr3_break_pass_base = 0
+                        afr3_break_quality_pass_base = 0
+                        afr3_snapback_pass_base = 0
+                        afr3_entered_base = 0
                         mmas_checked_base = 0
                         mmas_passed_base = 0
                         mmas_signaled_base = 0
@@ -2521,6 +2787,7 @@ def main() -> None:
                         entry_break_sum_short_gate,
                         entry_ft_sum_gate,
                         entry_ft_abs_sum_gate,
+                        entry_spread_sum_gate,
                         afr_be_armed_gate,
                         afr_be_triggered_gate,
                         afr_checked_gate,
@@ -2532,6 +2799,12 @@ def main() -> None:
                         afr2_break_pass_gate,
                         afr2_ft_pass_gate,
                         afr2_entered_gate,
+                        afr3_checked_gate,
+                        afr3_absorption_pass_gate,
+                        afr3_break_pass_gate,
+                        afr3_break_quality_pass_gate,
+                        afr3_snapback_pass_gate,
+                        afr3_entered_gate,
                         mmas_checked_gate,
                         mmas_passed_gate,
                         mmas_signaled_gate,
@@ -2587,6 +2860,10 @@ def main() -> None:
                         afr_enter_on=afr_enter_on,
                         debug_first_afr=debug_first_afr,
                         debug_first_afr2=debug_first_afr2,
+                        afr3_break_min_flow_abs=afr3_break_min_flow_abs,
+                        afr3_break_max_spread_ticks=afr3_break_max_spread_ticks,
+                        afr3_snapback_check=afr3_snapback_check,
+                        debug_first_afr3=debug_first_afr3,
                         afr_tp_ticks=afr_tp_ticks,
                         afr_sl_ticks=afr_sl_ticks,
                         afr_max_hold_bars=afr_max_hold_bars,
@@ -2887,6 +3164,17 @@ def main() -> None:
                             f"entered={afr2_entered_gate}",
                             flush=True,
                         )
+                    if strategy_mode == "absorption_failure_v3":
+                        print(
+                            f"{instrument} {day} AFR3 base checked={afr3_checked_base} "
+                            f"absorb={afr3_absorption_pass_base} break={afr3_break_pass_base} "
+                            f"quality={afr3_break_quality_pass_base} snap={afr3_snapback_pass_base} "
+                            f"entered={afr3_entered_base} | gate checked={afr3_checked_gate} "
+                            f"absorb={afr3_absorption_pass_gate} break={afr3_break_pass_gate} "
+                            f"quality={afr3_break_quality_pass_gate} snap={afr3_snapback_pass_gate} "
+                            f"entered={afr3_entered_gate}",
+                            flush=True,
+                        )
                     strategy_rows.append(
                         {
                             "Symbol": instrument,
@@ -2923,6 +3211,18 @@ def main() -> None:
                             "afr2_break_pass_gate": int(afr2_break_pass_gate),
                             "afr2_ft_pass_gate": int(afr2_ft_pass_gate),
                             "afr2_entered_gate": int(afr2_entered_gate),
+                            "afr3_checked_base": int(afr3_checked_base),
+                            "afr3_absorption_pass_base": int(afr3_absorption_pass_base),
+                            "afr3_break_pass_base": int(afr3_break_pass_base),
+                            "afr3_break_quality_pass_base": int(afr3_break_quality_pass_base),
+                            "afr3_snapback_pass_base": int(afr3_snapback_pass_base),
+                            "afr3_entered_base": int(afr3_entered_base),
+                            "afr3_checked_gate": int(afr3_checked_gate),
+                            "afr3_absorption_pass_gate": int(afr3_absorption_pass_gate),
+                            "afr3_break_pass_gate": int(afr3_break_pass_gate),
+                            "afr3_break_quality_pass_gate": int(afr3_break_quality_pass_gate),
+                            "afr3_snapback_pass_gate": int(afr3_snapback_pass_gate),
+                            "afr3_entered_gate": int(afr3_entered_gate),
                             "afr_be_armed_base": int(afr_be_armed_base),
                             "afr_be_triggered_base": int(afr_be_triggered_base),
                             "afr_be_armed_gate": int(afr_be_armed_gate),
@@ -2961,6 +3261,9 @@ def main() -> None:
                             if entry_count_base
                             else 0.0,
                             "avg_abs_flow_entry_base": float(entry_flow_abs_sum_base / entry_count_base)
+                            if entry_count_base
+                            else 0.0,
+                            "avg_spread_ticks_entry_base": float(entry_spread_sum_base / entry_count_base)
                             if entry_count_base
                             else 0.0,
                             "avg_flow_entry_long_base": float(entry_flow_sum_long_base / entry_count_long_base)
@@ -3003,6 +3306,9 @@ def main() -> None:
                             if entry_count_gate
                             else 0.0,
                             "avg_abs_flow_entry_gate": float(entry_flow_abs_sum_gate / entry_count_gate)
+                            if entry_count_gate
+                            else 0.0,
+                            "avg_spread_ticks_entry_gate": float(entry_spread_sum_gate / entry_count_gate)
                             if entry_count_gate
                             else 0.0,
                             "avg_flow_entry_long_gate": float(entry_flow_sum_long_gate / entry_count_long_gate)
