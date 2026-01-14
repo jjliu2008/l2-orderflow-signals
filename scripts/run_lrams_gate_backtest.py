@@ -22,7 +22,7 @@ Baseline:
   HOLD_BARS               holding horizon H (default: 20)
   BASELINE_MODE           flat|not_awful|mmas (default: flat)
   BASELINE_K_BARS         window for not_awful (default: 5)
-  STRATEGY_MODE           baseline_flat|micro_momo_v1|impulse_confirm_v1|absorption_failure_v1|absorption_failure_v2|absorption_failure_v3 (default: micro_momo_v1)
+  STRATEGY_MODE           baseline_flat|micro_momo_v1|impulse_confirm_v1|absorption_failure_v1|absorption_failure_v2|absorption_failure_v3|lrams_breakout_v1 (default: micro_momo_v1)
   MICRO_K_BARS            micro momentum window (default: 5)
   MICRO_IMPULSE_TICKS     min impulse ticks (default: 1)
   MICRO_FLOW_MIN          min abs flow (default: 0)
@@ -56,6 +56,7 @@ Impulse confirm entry (strategy_mode=impulse_confirm_v1):
   AFR_USE_SIGNED_VOLUME   use signed_volume for flow (default: 1)
   AFR_FT_BARS             AFR v2 follow-through bars (default: 2)
   AFR_FT_BARS_SWEEP       comma list for AFR FT bars sweep (default: unset)
+  RUN_AFR2_SWEEP          force AFR2 sweep logging/artifacts (default: 0)
   AFR_FT_MIN_TICKS        AFR v2 follow-through min ticks (default: 1)
   AFR_FT_NO_BACKTRACK     AFR v2 block if price backtracks (default: 1)
   AFR_ENTER_ON            AFR v2 entry timing: break|ft|both (default: ft)
@@ -65,6 +66,36 @@ Impulse confirm entry (strategy_mode=impulse_confirm_v1):
   AFR_SNAPBACK_BAND_TICKS AFR v2 snapback band in ticks (default: 1)
   AFR_SCRATCH_BARS        AFR v2 scratch after N bars (default: 3)
   AFR_SCRATCH_MIN_PROGRESS_TICKS min progress before scratch (default: 1)
+  LBO_BREAK_TICKS         LRAMS breakout break ticks (default: 1)
+  LBO_CONFIRM_BARS        LRAMS breakout confirm window (default: 2)
+  LBO_MIN_FLOW_ABS        LRAMS breakout min abs flow for confirm (default: 20)
+  LBO_MAX_SPREAD_TICKS    LRAMS breakout max spread for confirm (default: 2)
+  LBO_FT_BARS             LRAMS breakout FT window bars (default: 2)
+  LBO_FT_MIN_TICKS        LRAMS breakout FT min ticks beyond break (default: 1)
+  LBO_REARM_ENABLED       LRAMS breakout allow rearm (default: 0)
+  LBO_REARM_BAND_TICKS    LRAMS breakout rearm band ticks (default: 1)
+  LBO_REARM_MAX_BARS      LRAMS breakout rearm max bars (default: 5)
+  LBO_TP_TICKS            LRAMS breakout TP ticks (default: 4)
+  LBO_SL_TICKS            LRAMS breakout SL ticks (default: 3)
+  LBO_MAX_HOLD_BARS       LRAMS breakout max hold bars (default: 15)
+  LBO_SCRATCH_BARS        LRAMS breakout scratch after N bars (default: 3)
+  LBO_SCRATCH_MIN_PROGRESS_TICKS min progress before scratch (default: 1)
+  LBO_DECAY_BARS          LRAMS breakout decay bars (default: 3)
+  LBO_BREAKEVEN_AFTER_TICKS LRAMS breakout breakeven ticks (default: unset)
+  LBO_IGNORE_THR          LRAMS breakout ignore asym <= thr (default: 0)
+  LBO_FLIP_DIRECTION      LRAMS breakout invert weak_side mapping (default: 0)
+  LBO_FLIP_MAPPING        LRAMS breakout invert weak_side mapping (default: 0)
+  LBO_CONFIRM_MODE        LRAMS breakout confirm mode none|confirm_ticks|pullback (default: none)
+  LBO_CONFIRM_TICKS       LRAMS breakout confirm ticks (default: 1)
+  LBO_CONFIRM_MAX_BARS    LRAMS breakout confirm max bars (default: 5)
+  LBO_CONFIRM_USE_MID     LRAMS breakout confirm uses mid (default: 1)
+  LBO_CONFIRM_REQUIRE_FLOW_ALIGN require flow alignment for confirm (default: 0)
+  LBO_CONFIRM_FLOW_ALIGN_BARS flow align window for confirm (default: 5)
+  LBO_CONFIRM_MIN_FLOW_ABS_ALIGN min abs flow for confirm align (default: 40)
+  LBO_PULLBACK_TICKS      LRAMS breakout pullback ticks (default: 1)
+  LBO_PULLBACK_MAX_BARS   LRAMS breakout pullback max bars (default: 10)
+  LBO_RESUME_TICKS        LRAMS breakout resume ticks (default: 1)
+  LBO_RESUME_MAX_BARS     LRAMS breakout resume max bars (default: 5)
   AFR3_BREAK_MIN_FLOW_ABS AFR v3 min abs flow on break bar (default: 100)
   AFR3_BREAK_MAX_SPREAD_TICKS AFR v3 max spread on break bar (default: 2)
   AFR3_SNAPBACK_CHECK     AFR v3 require no snapback on next bar (default: 1)
@@ -403,6 +434,35 @@ def _simulate_day(
     afr_break_quality_max_spread_ticks: int,
     afr_snapback_bars: int,
     afr_snapback_band_ticks: int,
+    lbo_break_ticks: int,
+    lbo_confirm_bars: int,
+    lbo_min_flow_abs: float,
+    lbo_max_spread_ticks: int,
+    lbo_ft_bars: int,
+    lbo_ft_min_ticks: int,
+    lbo_rearm_enabled: bool,
+    lbo_rearm_band_ticks: int,
+    lbo_rearm_max_bars: int,
+    lbo_tp_ticks: int,
+    lbo_sl_ticks: int,
+    lbo_max_hold_bars: int,
+    lbo_scratch_bars: int,
+    lbo_scratch_min_progress_ticks: int,
+    lbo_decay_bars: int,
+    lbo_breakeven_after_ticks: int | None,
+    lbo_ignore_thr: bool,
+    lbo_flip_direction: bool,
+    lbo_confirm_mode: str,
+    lbo_confirm_ticks: int,
+    lbo_confirm_max_bars: int,
+    lbo_confirm_use_mid: bool,
+    lbo_confirm_require_flow_align: bool,
+    lbo_confirm_flow_align_bars: int,
+    lbo_confirm_min_flow_abs_align: float,
+    lbo_pullback_max_bars: int,
+    lbo_pullback_ticks: int,
+    lbo_resume_ticks: int,
+    lbo_resume_max_bars: int,
     debug_first_afr: bool,
     debug_first_afr2: bool,
     afr_scratch_bars: int,
@@ -438,6 +498,12 @@ def _simulate_day(
     else:
         top_ask_depth = np.full(len(df_day), np.nan, dtype=float)
     mid = 0.5 * (bid + ask)
+    if lbo_confirm_use_mid:
+        lbo_confirm_price = mid
+    elif "last_price" in df_day.columns:
+        lbo_confirm_price = pd.to_numeric(df_day["last_price"], errors="coerce").fillna(np.nan).to_numpy()
+    else:
+        lbo_confirm_price = mid
     n = len(df_day)
     trades: List[Dict[str, float]] = []
     pnl_ticks_total = 0.0
@@ -485,6 +551,56 @@ def _simulate_day(
     rearm_expiry_short = -1
     break_bar_long = -1
     break_bar_short = -1
+    lbo_absorption_level_long = float("nan")
+    lbo_absorption_level_short = float("nan")
+    lbo_absorption_bar_long = -1
+    lbo_absorption_bar_short = -1
+    lbo_break_blocked_bar_long = -1
+    lbo_break_blocked_bar_short = -1
+    lbo_break_blocked_abs_level_long = float("nan")
+    lbo_break_blocked_abs_level_short = float("nan")
+    lbo_break_blocked_break_level_long = float("nan")
+    lbo_break_blocked_break_level_short = float("nan")
+    lbo_break_blocked_abs_bar_long = -1
+    lbo_break_blocked_abs_bar_short = -1
+    lbo_rearm_used_long = False
+    lbo_rearm_used_short = False
+    lbo_rearm_active_long = False
+    lbo_rearm_active_short = False
+    lbo_rearm_expiry_long = -1
+    lbo_rearm_expiry_short = -1
+    lbo_weak_none = 0
+    lbo_weak_ask = 0
+    lbo_weak_bid = 0
+    lbo_weak_none_blocked = 0
+    lbo_rej_empty = 0
+    lbo_rej_before_lookback = 0
+    lbo_rej_thr_nan = 0
+    lbo_rej_asym_below_thr = 0
+    lbo_missing_both = 0
+    lbo_only_buy = 0
+    lbo_only_sell = 0
+    lbo_both_fail_thr = 0
+    lbo_pending_started = 0
+    lbo_confirm_entered = 0
+    lbo_confirm_expired = 0
+    lbo_pull_triggered = 0
+    lbo_pull_pulled_back = 0
+    lbo_pull_resumed_entered = 0
+    lbo_pull_expired = 0
+    lbo_confirm_pending = False
+    lbo_confirm_dir = 0
+    lbo_confirm_t0 = -1
+    lbo_confirm_trigger_level = float("nan")
+    lbo_confirm_expiry = -1
+    lbo_confirm_absorption_level = float("nan")
+    lbo_confirm_absorption_bar = -1
+    lbo_pull_triggered_state = False
+    lbo_pull_trigger_bar = -1
+    lbo_pull_trigger_price = float("nan")
+    lbo_pull_pulled_back_state = False
+    lbo_pullback_bar = -1
+    lbo_pullback_price = float("nan")
     afr_checked = 0
     afr_absorption_pass = 0
     afr_break_pass = 0
@@ -718,6 +834,98 @@ def _simulate_day(
             break_bar_long = entry_bar_val
         if side_val == "short" and not rearm_used_short:
             break_bar_short = entry_bar_val
+
+    def _lbo_latest_event_idx(
+        event_pos: np.ndarray,
+        event_asym: np.ndarray,
+        event_thr: np.ndarray,
+        entry_bar_val: int,
+    ) -> Tuple[int | None, str | None]:
+        nonlocal lbo_rej_empty
+        nonlocal lbo_rej_before_lookback
+        nonlocal lbo_rej_thr_nan
+        nonlocal lbo_rej_asym_below_thr
+        if event_pos.size == 0:
+            lbo_rej_empty += 1
+            return None, "empty"
+        idx_pos = np.searchsorted(event_pos, entry_bar_val, side="right") - 1
+        if idx_pos < 0:
+            lbo_rej_empty += 1
+            return None, "empty"
+        if event_pos[idx_pos] < entry_bar_val - gate_lookback_bars:
+            lbo_rej_before_lookback += 1
+            return None, "before_lookback"
+        thr_val = event_thr[idx_pos]
+        if not np.isfinite(thr_val):
+            lbo_rej_thr_nan += 1
+            return None, "thr_nan"
+        if not lbo_ignore_thr and event_asym[idx_pos] <= thr_val:
+            lbo_rej_asym_below_thr += 1
+            return None, "asym_below_thr"
+        return int(idx_pos), None
+
+    def _lbo_weak_side(entry_bar_val: int) -> str | None:
+        nonlocal lbo_missing_both
+        nonlocal lbo_only_buy
+        nonlocal lbo_only_sell
+        nonlocal lbo_both_fail_thr
+        if gate_mode == "side_matched":
+            idx_buy, rej_buy = _lbo_latest_event_idx(event_pos_buy, event_asym_buy, event_thr_buy, entry_bar_val)
+            idx_sell, rej_sell = _lbo_latest_event_idx(event_pos_sell, event_asym_sell, event_thr_sell, entry_bar_val)
+            if idx_buy is None and idx_sell is None:
+                lbo_missing_both += 1
+                if (
+                    rej_buy in {"thr_nan", "asym_below_thr"}
+                    and rej_sell in {"thr_nan", "asym_below_thr"}
+                ):
+                    lbo_both_fail_thr += 1
+                return None
+            if idx_sell is None:
+                lbo_only_buy += 1
+                return "ask_weak"
+            if idx_buy is None:
+                lbo_only_sell += 1
+                return "bid_weak"
+            pos_buy = event_pos_buy[idx_buy]
+            pos_sell = event_pos_sell[idx_sell]
+            return "ask_weak" if pos_buy >= pos_sell else "bid_weak"
+        idx_all, _ = _lbo_latest_event_idx(event_pos_all, event_asym_all, event_thr_all, entry_bar_val)
+        if idx_all is None:
+            return None
+        if event_side_all[idx_all] == "buy":
+            return "ask_weak"
+        return "bid_weak"
+
+    def _mark_lbo_break_for_ft_on_block(
+        entry_reason_val: str | None,
+        side_val: str | None,
+        entry_bar_val: int,
+        absorption_level_val: float,
+        absorption_bar_val: int,
+        break_level_val: float,
+    ) -> None:
+        nonlocal lbo_break_blocked_bar_long
+        nonlocal lbo_break_blocked_bar_short
+        nonlocal lbo_break_blocked_abs_level_long
+        nonlocal lbo_break_blocked_abs_level_short
+        nonlocal lbo_break_blocked_break_level_long
+        nonlocal lbo_break_blocked_break_level_short
+        nonlocal lbo_break_blocked_abs_bar_long
+        nonlocal lbo_break_blocked_abs_bar_short
+        if strategy_mode != "lrams_breakout_v1":
+            return
+        if entry_reason_val != "break":
+            return
+        if side_val == "long":
+            lbo_break_blocked_bar_long = entry_bar_val
+            lbo_break_blocked_abs_level_long = float(absorption_level_val)
+            lbo_break_blocked_break_level_long = float(break_level_val)
+            lbo_break_blocked_abs_bar_long = int(absorption_bar_val)
+        if side_val == "short":
+            lbo_break_blocked_bar_short = entry_bar_val
+            lbo_break_blocked_abs_level_short = float(absorption_level_val)
+            lbo_break_blocked_break_level_short = float(break_level_val)
+            lbo_break_blocked_abs_bar_short = int(absorption_bar_val)
     if trade_session == "rth":
         times = pd.to_datetime(df_day["Time"], utc=True, errors="coerce")
         times_cst = times.dt.tz_convert("America/Chicago")
@@ -771,6 +979,7 @@ def _simulate_day(
         event_pos_all = np.array([], dtype=int)
         event_asym_all = np.array([], dtype=float)
         event_thr_all = np.array([], dtype=float)
+        event_side_all = np.array([], dtype=object)
         event_pos_buy = event_pos_all
         event_asym_buy = event_asym_all
         event_thr_buy = event_thr_all
@@ -781,6 +990,7 @@ def _simulate_day(
         event_pos_all = events_day["event_pos"].to_numpy(dtype=int)
         event_asym_all = events_day["asym"].to_numpy(dtype=float)
         event_thr_all = events_day["asym_threshold"].to_numpy(dtype=float)
+        event_side_all = events_day["side"].astype(str).to_numpy()
         buy_mask = events_day["side"] == "buy"
         sell_mask = events_day["side"] == "sell"
         event_pos_buy = event_pos_all[buy_mask.to_numpy()]
@@ -830,6 +1040,13 @@ def _simulate_day(
                             and float(pos.get("mfe_ticks", 0.0)) >= float(afr_scratch_min_progress_ticks)
                         ):
                             pos["bars_to_progress"] = int(i - entry_bar)
+                        if (
+                            strategy_mode == "lrams_breakout_v1"
+                            and lbo_scratch_min_progress_ticks > 0
+                            and float(pos.get("bars_to_progress", -1)) < 0
+                            and float(pos.get("mfe_ticks", 0.0)) >= float(lbo_scratch_min_progress_ticks)
+                        ):
+                            pos["bars_to_progress"] = int(i - entry_bar)
                     breakeven_ticks = pos.get("breakeven_ticks")
                     if breakeven_ticks is not None and not pos.get("breakeven_set", False):
                         mfe_ticks = (mark_px - entry_px) / tick_size if side == "long" else (entry_px - mark_px) / tick_size
@@ -861,6 +1078,15 @@ def _simulate_day(
                 ):
                     pos["exit_bar"] = i
                     pos["exit_reason"] = "SCRATCH"
+                if (
+                    strategy_mode == "lrams_breakout_v1"
+                    and pos.get("exit_reason") == "TIME"
+                    and lbo_scratch_bars > 0
+                    and (i - entry_bar) >= int(lbo_scratch_bars)
+                    and float(pos.get("mfe_ticks", 0.0)) < float(lbo_scratch_min_progress_ticks)
+                ):
+                    pos["exit_bar"] = i
+                    pos["exit_reason"] = "SCRATCH"
                 if strategy_mode.startswith("absorption_failure") and pos.get("exit_reason") == "TIME":
                     flow_sum = _flow_sum_at(i, afr_flow_align_bars)
                     decay_count = int(pos.get("decay_count", 0))
@@ -876,6 +1102,24 @@ def _simulate_day(
                             decay_count = 0
                     pos["decay_count"] = decay_count
                     if decay_count >= afr_momentum_decay_bars:
+                        pos["exit_bar"] = i
+                        pos["exit_reason"] = "DECAY"
+                        pos["exit_on_decay"] = True
+                if strategy_mode == "lrams_breakout_v1" and pos.get("exit_reason") == "TIME":
+                    flow_sum = _flow_sum_at(i, lbo_confirm_bars)
+                    decay_count = int(pos.get("decay_count", 0))
+                    if side == "long":
+                        if flow_sum < lbo_min_flow_abs:
+                            decay_count += 1
+                        else:
+                            decay_count = 0
+                    else:
+                        if flow_sum > -lbo_min_flow_abs:
+                            decay_count += 1
+                        else:
+                            decay_count = 0
+                    pos["decay_count"] = decay_count
+                    if decay_count >= lbo_decay_bars:
                         pos["exit_bar"] = i
                         pos["exit_reason"] = "DECAY"
                         pos["exit_on_decay"] = True
@@ -930,6 +1174,36 @@ def _simulate_day(
                     else:
                         if exit_bar - entry_bar <= afr_rearm_stop_max_bars:
                             _arm_rearm(side, int(pos.get("absorption_bar", -1)))
+                elif strategy_mode == "lrams_breakout_v1":
+                    if exit_reason == "TP":
+                        exit_reason = "tp"
+                    elif exit_reason == "SL":
+                        if bool(pos.get("breakeven_set", False)):
+                            exit_reason = "be"
+                            pos["exit_on_be"] = True
+                        else:
+                            exit_reason = "sl"
+                    elif exit_reason == "SCRATCH":
+                        exit_reason = "scratch"
+                    elif exit_reason == "TIME":
+                        exit_reason = "max_hold"
+                    elif exit_reason == "DECAY":
+                        exit_reason = "decay"
+                    abs_bar = int(pos.get("absorption_bar", -1))
+                    if lbo_rearm_enabled and exit_reason in {"scratch", "be"}:
+                        if side == "long":
+                            if not lbo_rearm_used_long:
+                                lbo_rearm_active_long = True
+                                lbo_rearm_expiry_long = abs_bar + lbo_rearm_max_bars
+                        else:
+                            if not lbo_rearm_used_short:
+                                lbo_rearm_active_short = True
+                                lbo_rearm_expiry_short = abs_bar + lbo_rearm_max_bars
+                    if exit_reason in {"tp", "sl"}:
+                        if side == "long":
+                            lbo_rearm_used_long = True
+                        else:
+                            lbo_rearm_used_short = True
                 eps = 1e-9
                 entry_spread = float(pos.get("entry_spread_ticks", 0.0))
                 floor_ticks = -(sl_ticks_local + entry_spread + eps)
@@ -1010,10 +1284,16 @@ def _simulate_day(
                         "bars_from_absorption_to_entry": int(pos.get("bars_from_absorption", -1)),
                         "bars_from_absorption": int(pos.get("bars_from_absorption", -1)),
                         "bars_to_progress": int(pos.get("bars_to_progress", -1)),
+                        "confirm_bars_waited": int(pos.get("confirm_bars_waited", 0)),
+                        "confirm_price_ref": float(pos.get("confirm_price_ref", float("nan"))),
                         "mae_ticks": float(pos.get("mae_ticks", 0.0)),
                         "mfe_ticks": float(pos.get("mfe_ticks", 0.0)),
                         "exit_on_decay": bool(pos.get("exit_on_decay", False)),
                         "exit_on_be": bool(pos.get("exit_on_be", False)),
+                        "lbo_direction": str(pos.get("lbo_direction", "")),
+                        "lbo_weak_side": str(pos.get("lbo_weak_side", "")),
+                        "lbo_break_ticks": float(pos.get("lbo_break_ticks", float("nan"))),
+                        "lbo_flow_align_sum": float(pos.get("lbo_flow_align_sum", 0.0)),
                     }
                 )
                 pnl_ticks_total += float(pnl_ticks)
@@ -1027,9 +1307,20 @@ def _simulate_day(
         dmid_ticks = float("nan")
         impulse_ticks = float("nan")
         flow = 0.0
+        flow_align_sum = 0.0
         stall_ticks = float("nan")
         break_ticks = float("nan")
         ft_progress_ticks = float("nan")
+        break_level = float("nan")
+        lbo_break_ticks_entry = float("nan")
+        lbo_flow_align_sum = 0.0
+        lbo_direction = ""
+        lbo_weak_side = ""
+        entry_reason = None
+        entry_reason_label = None
+        confirm_bars_waited = 0
+        confirm_price_ref = float("nan")
+        lbo_entry_mode = ""
         afr_t_idx = -1
         afr_tf_idx = -1
         afr3_candidate = False
@@ -1037,6 +1328,8 @@ def _simulate_day(
         mmas_passed = False
         entry_bar = i + 1
         if strategy_mode == "absorption_failure_v2":
+            entry_bar = i
+        if strategy_mode == "lrams_breakout_v1":
             entry_bar = i
         if entry_bar >= n:
             break
@@ -1602,6 +1895,298 @@ def _simulate_day(
             }
             signals_when_flat += 1
             total_signals += 1
+        elif strategy_mode == "lrams_breakout_v1":
+            k = max(1, int(afr_k_bars))
+            if afr_use_mid_for_stall:
+                stall_series = mid
+            elif "last_price" in df_day.columns:
+                stall_series = pd.to_numeric(df_day["last_price"], errors="coerce").fillna(np.nan).to_numpy()
+            else:
+                stall_series = mid
+            if i >= k and i - 1 >= 0 and np.isfinite(stall_series[i - 1]) and np.isfinite(stall_series[i - k]):
+                flow_setup = float(np.sum(afr_flow_series[i - k : i]))
+                stall_ticks = float((stall_series[i - 1] - stall_series[i - k]) / tick_size)
+                if abs(flow_setup) >= afr_min_flow_abs and abs(stall_ticks) <= afr_stall_ticks:
+                    if flow_setup > 0:
+                        lbo_absorption_level_long = float(stall_series[i - 1])
+                        lbo_absorption_bar_long = i - 1
+                        if lbo_rearm_enabled:
+                            lbo_rearm_used_long = False
+                            lbo_rearm_active_long = False
+                            lbo_rearm_expiry_long = -1
+                    elif flow_setup < 0:
+                        lbo_absorption_level_short = float(stall_series[i - 1])
+                        lbo_absorption_bar_short = i - 1
+                        if lbo_rearm_enabled:
+                            lbo_rearm_used_short = False
+                            lbo_rearm_active_short = False
+                            lbo_rearm_expiry_short = -1
+
+            if lbo_rearm_enabled:
+                if lbo_rearm_active_long:
+                    if entry_bar > lbo_rearm_expiry_long or (
+                        np.isfinite(lbo_absorption_level_long)
+                        and np.isfinite(mid[entry_bar])
+                        and abs(mid[entry_bar] - lbo_absorption_level_long) > lbo_rearm_band_ticks * tick_size
+                    ):
+                        lbo_rearm_active_long = False
+                if lbo_rearm_active_short:
+                    if entry_bar > lbo_rearm_expiry_short or (
+                        np.isfinite(lbo_absorption_level_short)
+                        and np.isfinite(mid[entry_bar])
+                        and abs(mid[entry_bar] - lbo_absorption_level_short) > lbo_rearm_band_ticks * tick_size
+                    ):
+                        lbo_rearm_active_short = False
+
+            if lbo_break_blocked_bar_long >= 0 and entry_bar > lbo_break_blocked_bar_long + lbo_ft_bars:
+                lbo_break_blocked_bar_long = -1
+            if lbo_break_blocked_bar_short >= 0 and entry_bar > lbo_break_blocked_bar_short + lbo_ft_bars:
+                lbo_break_blocked_bar_short = -1
+
+            lbo_weak_side = _lbo_weak_side(entry_bar)
+            if lbo_weak_side == "ask_weak":
+                lbo_weak_ask += 1
+                desired_side = "short" if lbo_flip_direction else "long"
+                lbo_direction = desired_side
+            elif lbo_weak_side == "bid_weak":
+                lbo_weak_bid += 1
+                desired_side = "long" if lbo_flip_direction else "short"
+                lbo_direction = desired_side
+            else:
+                lbo_weak_none += 1
+                lbo_weak_none_blocked += 1
+                desired_side = None
+
+            if desired_side is not None:
+                if desired_side == "long":
+                    absorption_level = lbo_absorption_level_long
+                    absorption_bar = lbo_absorption_bar_long
+                else:
+                    absorption_level = lbo_absorption_level_short
+                    absorption_bar = lbo_absorption_bar_short
+                if not np.isfinite(absorption_level) or absorption_bar < 0:
+                    desired_side = None
+
+            weak_side_dir = desired_side
+            if lbo_confirm_mode != "none":
+                desired_side = None
+                if lbo_confirm_pending:
+                    confirm_flow_sum = (
+                        _flow_sum_at(entry_bar, lbo_confirm_flow_align_bars)
+                        if lbo_confirm_flow_align_bars > 0
+                        else float(afr_flow_series[entry_bar])
+                    )
+                    flow_align_ok = True
+                    if lbo_confirm_require_flow_align:
+                        if lbo_confirm_dir > 0:
+                            flow_align_ok = confirm_flow_sum >= lbo_confirm_min_flow_abs_align
+                        else:
+                            flow_align_ok = confirm_flow_sum <= -lbo_confirm_min_flow_abs_align
+                    if entry_bar > lbo_confirm_t0 and entry_bar <= lbo_confirm_expiry:
+                        progress_ticks = lbo_confirm_dir * (
+                            lbo_confirm_price[entry_bar] - lbo_confirm_trigger_level
+                        ) / tick_size
+                        if not lbo_pull_triggered_state and progress_ticks >= lbo_confirm_ticks and flow_align_ok:
+                            if lbo_confirm_mode == "confirm_ticks":
+                                entry_reason = "confirm"
+                                entry_reason_label = "lbo_confirm"
+                                desired_side = "long" if lbo_confirm_dir > 0 else "short"
+                                confirm_bars_waited = entry_bar - lbo_confirm_t0
+                                confirm_price_ref = lbo_confirm_trigger_level
+                                lbo_flow_align_sum = confirm_flow_sum
+                                absorption_level = lbo_confirm_absorption_level
+                                absorption_bar = lbo_confirm_absorption_bar
+                                if np.isfinite(absorption_level):
+                                    lbo_break_ticks_entry = (mid[entry_bar] - absorption_level) / tick_size
+                                    break_level = (
+                                        absorption_level + lbo_break_ticks * tick_size
+                                        if desired_side == "long"
+                                        else absorption_level - lbo_break_ticks * tick_size
+                                    )
+                                lbo_entry_mode = "confirm"
+                                lbo_confirm_pending = False
+                            else:
+                                lbo_pull_triggered_state = True
+                                lbo_pull_trigger_bar = entry_bar
+                                lbo_pull_trigger_price = float(lbo_confirm_price[entry_bar])
+                                lbo_pullback_expiry = entry_bar + lbo_pullback_max_bars
+                                lbo_pull_triggered += 1
+                        if lbo_confirm_mode == "confirm_ticks" and entry_reason is None:
+                            desired_side = None
+                    if lbo_confirm_mode == "pullback" and lbo_pull_triggered_state:
+                        if entry_bar > lbo_pullback_expiry:
+                            lbo_pull_expired += 1
+                            lbo_confirm_pending = False
+                        elif not lbo_pull_pulled_back_state:
+                            retrace_ticks = lbo_confirm_dir * (
+                                lbo_confirm_price[entry_bar] - lbo_pull_trigger_price
+                            ) / tick_size
+                            if retrace_ticks <= -lbo_pullback_ticks:
+                                lbo_pull_pulled_back_state = True
+                                lbo_pullback_bar = entry_bar
+                                lbo_pullback_price = float(lbo_confirm_price[entry_bar])
+                                lbo_pull_pulled_back += 1
+                                lbo_resume_expiry = entry_bar + lbo_resume_max_bars
+                        else:
+                            if entry_bar > lbo_resume_expiry:
+                                lbo_pull_expired += 1
+                                lbo_confirm_pending = False
+                            else:
+                                resume_ticks = lbo_confirm_dir * (
+                                    lbo_confirm_price[entry_bar] - lbo_pull_trigger_price
+                                ) / tick_size
+                                if resume_ticks >= lbo_resume_ticks:
+                                    entry_reason = "pullback"
+                                    entry_reason_label = "lbo_pullback"
+                                    desired_side = "long" if lbo_confirm_dir > 0 else "short"
+                                    confirm_bars_waited = entry_bar - lbo_confirm_t0
+                                    confirm_price_ref = lbo_confirm_trigger_level
+                                    lbo_flow_align_sum = confirm_flow_sum
+                                    absorption_level = lbo_confirm_absorption_level
+                                    absorption_bar = lbo_confirm_absorption_bar
+                                    break_level = lbo_pull_trigger_price
+                                    if np.isfinite(absorption_level):
+                                        lbo_break_ticks_entry = (mid[entry_bar] - absorption_level) / tick_size
+                                    lbo_entry_mode = "pullback"
+                                    lbo_confirm_pending = False
+                                else:
+                                    desired_side = None
+                    if (
+                        lbo_confirm_mode == "confirm_ticks"
+                        and entry_bar > lbo_confirm_expiry
+                        and lbo_confirm_pending
+                        and not lbo_pull_triggered_state
+                    ):
+                        lbo_confirm_expired += 1
+                        lbo_confirm_pending = False
+                    if (
+                        lbo_confirm_mode == "pullback"
+                        and entry_bar > lbo_confirm_expiry
+                        and lbo_confirm_pending
+                        and not lbo_pull_triggered_state
+                    ):
+                        lbo_pull_expired += 1
+                        lbo_confirm_pending = False
+                if not lbo_confirm_pending and entry_reason is None and weak_side_dir is not None:
+                    lbo_confirm_pending = True
+                    lbo_confirm_dir = 1 if weak_side_dir == "long" else -1
+                    lbo_confirm_t0 = entry_bar
+                    lbo_confirm_trigger_level = float(lbo_confirm_price[entry_bar])
+                    lbo_confirm_absorption_level = float(absorption_level)
+                    lbo_confirm_absorption_bar = int(absorption_bar)
+                    lbo_confirm_expiry = entry_bar + lbo_confirm_max_bars
+                    lbo_pending_started += 1
+                    lbo_pull_triggered_state = False
+                    lbo_pull_pulled_back_state = False
+                    lbo_pull_trigger_bar = -1
+                    lbo_pullback_bar = -1
+                    lbo_pull_trigger_price = float("nan")
+                    lbo_pullback_price = float("nan")
+                    lbo_pullback_expiry = -1
+                    lbo_resume_expiry = -1
+                if entry_reason is None:
+                    desired_side = None
+            else:
+                if desired_side is None:
+                    i += 1
+                    continue
+
+                break_level = (
+                    absorption_level + lbo_break_ticks * tick_size
+                    if desired_side == "long"
+                    else absorption_level - lbo_break_ticks * tick_size
+                )
+                break_trigger = False
+                if np.isfinite(mid[entry_bar]):
+                    if desired_side == "long":
+                        break_trigger = mid[entry_bar] >= break_level
+                    else:
+                        break_trigger = mid[entry_bar] <= break_level
+
+                flow_align_sum = (
+                    _flow_sum_at(entry_bar, lbo_confirm_bars) if lbo_confirm_bars > 0 else float(afr_flow_series[entry_bar])
+                )
+                confirm_ok = True
+                if lbo_confirm_bars > 0:
+                    if desired_side == "long":
+                        confirm_ok = flow_align_sum >= lbo_min_flow_abs
+                    else:
+                        confirm_ok = flow_align_sum <= -lbo_min_flow_abs
+                if spread_ticks[entry_bar] > lbo_max_spread_ticks:
+                    confirm_ok = False
+
+                if break_trigger and confirm_ok:
+                    entry_reason = "rearm" if (lbo_rearm_enabled and (lbo_rearm_active_long if desired_side == "long" else lbo_rearm_active_short)) else "break"
+                    entry_reason_label = "lbo_now"
+                    lbo_break_ticks_entry = (mid[entry_bar] - absorption_level) / tick_size
+                    lbo_flow_align_sum = flow_align_sum
+                    lbo_entry_mode = "now"
+                    if entry_reason == "rearm":
+                        if desired_side == "long":
+                            lbo_rearm_used_long = True
+                            lbo_rearm_active_long = False
+                        else:
+                            lbo_rearm_used_short = True
+                            lbo_rearm_active_short = False
+                    if desired_side == "long":
+                        lbo_break_blocked_bar_long = -1
+                    else:
+                        lbo_break_blocked_bar_short = -1
+                elif lbo_ft_bars > 0:
+                    ft_ok = False
+                    if desired_side == "long" and lbo_break_blocked_bar_long >= 0:
+                        if entry_bar <= lbo_break_blocked_bar_long + lbo_ft_bars:
+                            ft_level = lbo_break_blocked_break_level_long + lbo_ft_min_ticks * tick_size
+                            abs_level = lbo_break_blocked_abs_level_long
+                            if np.isfinite(mid[entry_bar]) and mid[entry_bar] >= ft_level and mid[entry_bar] >= abs_level:
+                                if lbo_confirm_bars > 0:
+                                    ft_ok = flow_align_sum >= lbo_min_flow_abs
+                                else:
+                                    ft_ok = True
+                                if spread_ticks[entry_bar] > lbo_max_spread_ticks:
+                                    ft_ok = False
+                                if ft_ok:
+                                    entry_reason = "ft"
+                                    entry_reason_label = "lbo_now"
+                                    absorption_level = lbo_break_blocked_abs_level_long
+                                    absorption_bar = lbo_break_blocked_abs_bar_long
+                                    break_level = lbo_break_blocked_break_level_long
+                                    lbo_break_ticks_entry = (mid[entry_bar] - absorption_level) / tick_size
+                                    lbo_flow_align_sum = flow_align_sum
+                                    lbo_entry_mode = "now"
+                                    lbo_break_blocked_bar_long = -1
+                        else:
+                            lbo_break_blocked_bar_long = -1
+                    elif desired_side == "short" and lbo_break_blocked_bar_short >= 0:
+                        if entry_bar <= lbo_break_blocked_bar_short + lbo_ft_bars:
+                            ft_level = lbo_break_blocked_break_level_short - lbo_ft_min_ticks * tick_size
+                            abs_level = lbo_break_blocked_abs_level_short
+                            if np.isfinite(mid[entry_bar]) and mid[entry_bar] <= ft_level and mid[entry_bar] <= abs_level:
+                                if lbo_confirm_bars > 0:
+                                    ft_ok = flow_align_sum <= -lbo_min_flow_abs
+                                else:
+                                    ft_ok = True
+                                if spread_ticks[entry_bar] > lbo_max_spread_ticks:
+                                    ft_ok = False
+                                if ft_ok:
+                                    entry_reason = "ft"
+                                    entry_reason_label = "lbo_now"
+                                    absorption_level = lbo_break_blocked_abs_level_short
+                                    absorption_bar = lbo_break_blocked_abs_bar_short
+                                    break_level = lbo_break_blocked_break_level_short
+                                    lbo_break_ticks_entry = (mid[entry_bar] - absorption_level) / tick_size
+                                    lbo_flow_align_sum = flow_align_sum
+                                    lbo_entry_mode = "now"
+                                    lbo_break_blocked_bar_short = -1
+                        else:
+                            lbo_break_blocked_bar_short = -1
+
+            if entry_reason is not None and np.isfinite(lbo_break_ticks_entry):
+                break_ticks = float(lbo_break_ticks_entry)
+                flow = float(lbo_flow_align_sum)
+                flow_align_sum = float(lbo_flow_align_sum)
+            if entry_reason is None:
+                desired_side = None
         elif strategy_mode == "micro_momo_v1":
             k = max(1, int(micro_k_bars))
             if i >= k and np.isfinite(mid[i]) and np.isfinite(mid[i - k]):
@@ -1765,6 +2350,15 @@ def _simulate_day(
                         entry_action_val="blocked",
                     )
                     entry_debug_printed += 1
+                if strategy_mode == "lrams_breakout_v1":
+                    _mark_lbo_break_for_ft_on_block(
+                        entry_reason,
+                        desired_side,
+                        entry_bar,
+                        absorption_level,
+                        absorption_bar,
+                        break_level,
+                    )
                 _mark_break_for_ft_on_block(entry_reason, desired_side, entry_bar)
                 if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
                     print(
@@ -1902,6 +2496,15 @@ def _simulate_day(
                             entry_action_val="blocked",
                         )
                         entry_debug_printed += 1
+                    if strategy_mode == "lrams_breakout_v1":
+                        _mark_lbo_break_for_ft_on_block(
+                            entry_reason,
+                            desired_side,
+                            entry_bar,
+                            absorption_level,
+                            absorption_bar,
+                            break_level,
+                        )
                     _mark_break_for_ft_on_block(entry_reason, desired_side, entry_bar)
                     if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
                         print(
@@ -2119,6 +2722,15 @@ def _simulate_day(
                                 entry_action_val="blocked",
                             )
                             entry_debug_printed += 1
+                        if strategy_mode == "lrams_breakout_v1":
+                            _mark_lbo_break_for_ft_on_block(
+                                entry_reason,
+                                desired_side,
+                                entry_bar,
+                                absorption_level,
+                                absorption_bar,
+                                break_level,
+                            )
                         _mark_break_for_ft_on_block(entry_reason, desired_side, entry_bar)
                         if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
                             print(
@@ -2238,6 +2850,15 @@ def _simulate_day(
                                     entry_action_val="blocked",
                                 )
                                 entry_debug_printed += 1
+                            if strategy_mode == "lrams_breakout_v1":
+                                _mark_lbo_break_for_ft_on_block(
+                                    entry_reason,
+                                    desired_side,
+                                    entry_bar,
+                                    absorption_level,
+                                    absorption_bar,
+                                    break_level,
+                                )
                             _mark_break_for_ft_on_block(entry_reason, desired_side, entry_bar)
                             if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
                                 print(
@@ -2406,6 +3027,12 @@ def _simulate_day(
                 hold_bars_local = afr_max_hold_bars
             if afr_breakeven_after_ticks is not None:
                 breakeven_ticks_local = afr_breakeven_after_ticks
+        if strategy_mode == "lrams_breakout_v1":
+            tp_ticks_local = lbo_tp_ticks
+            sl_ticks_local = lbo_sl_ticks
+            hold_bars_local = lbo_max_hold_bars
+            if lbo_breakeven_after_ticks is not None:
+                breakeven_ticks_local = lbo_breakeven_after_ticks
         tp_level = entry_px + (tp_ticks_local * tick_size if desired_side == "long" else -tp_ticks_local * tick_size)
         sl_level = entry_px - (sl_ticks_local * tick_size if desired_side == "long" else -sl_ticks_local * tick_size)
         pos = {
@@ -2421,17 +3048,23 @@ def _simulate_day(
             "breakeven_ticks": breakeven_ticks_local,
             "breakeven_set": False,
             "breakeven_triggered": False,
-            "entry_reason": entry_reason,
+            "entry_reason": entry_reason_label if entry_reason_label is not None else entry_reason,
             "absorption_level": float(absorption_level) if np.isfinite(absorption_level) else float("nan"),
             "break_level": float(break_level) if np.isfinite(break_level) else float("nan"),
             "flow_align_sum_at_entry": float(flow_align_sum),
             "bars_from_absorption": int(entry_bar - absorption_bar) if absorption_bar >= 0 else -1,
             "bars_to_progress": -1,
             "absorption_bar": int(absorption_bar),
+            "confirm_bars_waited": int(confirm_bars_waited),
+            "confirm_price_ref": float(confirm_price_ref) if np.isfinite(confirm_price_ref) else float("nan"),
             "mae_ticks": 0.0,
             "mfe_ticks": 0.0,
             "exit_on_decay": False,
             "exit_on_be": False,
+            "lbo_direction": lbo_direction,
+            "lbo_weak_side": lbo_weak_side,
+            "lbo_break_ticks": float(lbo_break_ticks_entry) if np.isfinite(lbo_break_ticks_entry) else float("nan"),
+            "lbo_flow_align_sum": float(lbo_flow_align_sum),
             "side": desired_side,
         }
         in_position = True
@@ -2444,6 +3077,11 @@ def _simulate_day(
             afr2_entered += 1
         if strategy_mode == "absorption_failure_v3":
             afr3_entered += 1
+        if strategy_mode == "lrams_breakout_v1":
+            if lbo_entry_mode == "confirm":
+                lbo_confirm_entered += 1
+            elif lbo_entry_mode == "pullback":
+                lbo_pull_resumed_entered += 1
         impulse_for_entry = impulse_ticks if np.isfinite(impulse_ticks) else dmid_ticks
         if np.isfinite(impulse_for_entry):
             entry_impulse_sum += float(impulse_for_entry)
@@ -2548,6 +3186,25 @@ def _simulate_day(
         afr3_break_quality_pass,
         afr3_snapback_pass,
         afr3_entered,
+        lbo_weak_none,
+        lbo_weak_ask,
+        lbo_weak_bid,
+        lbo_weak_none_blocked,
+        lbo_rej_empty,
+        lbo_rej_before_lookback,
+        lbo_rej_thr_nan,
+        lbo_rej_asym_below_thr,
+        lbo_missing_both,
+        lbo_only_buy,
+        lbo_only_sell,
+        lbo_both_fail_thr,
+        lbo_pending_started,
+        lbo_confirm_entered,
+        lbo_confirm_expired,
+        lbo_pull_triggered,
+        lbo_pull_pulled_back,
+        lbo_pull_resumed_entered,
+        lbo_pull_expired,
         mmas_signals_checked,
         mmas_passed_filters,
         mmas_signaled,
@@ -2769,6 +3426,7 @@ def main() -> None:
     baseline_mode = os.environ.get("BASELINE_MODE", "flat").strip().lower()
     if not strategy_mode:
         strategy_mode = "micro_momo_v1"
+    run_afr2_sweep = strategy_mode.startswith("absorption_failure") or os.environ.get("RUN_AFR2_SWEEP", "0").strip() == "1"
     baseline_k_bars = int(os.environ.get("BASELINE_K_BARS", "5"))
     micro_k_bars = int(os.environ.get("MICRO_K_BARS", "5"))
     micro_impulse_ticks = int(os.environ.get("MICRO_IMPULSE_TICKS", "1"))
@@ -2821,6 +3479,41 @@ def main() -> None:
     afr_sl_ticks = int(afr_sl_env) if afr_sl_env else None
     afr_max_hold_bars = int(afr_hold_env) if afr_hold_env else None
     afr_breakeven_after_ticks = int(afr_be_env) if afr_be_env else None
+    lbo_break_ticks = int(os.environ.get("LBO_BREAK_TICKS", "1"))
+    lbo_confirm_bars = int(os.environ.get("LBO_CONFIRM_BARS", "2"))
+    lbo_min_flow_abs = float(os.environ.get("LBO_MIN_FLOW_ABS", "20"))
+    lbo_max_spread_ticks = int(os.environ.get("LBO_MAX_SPREAD_TICKS", "2"))
+    lbo_ft_bars = int(os.environ.get("LBO_FT_BARS", "2"))
+    lbo_ft_min_ticks = int(os.environ.get("LBO_FT_MIN_TICKS", "1"))
+    lbo_rearm_enabled = os.environ.get("LBO_REARM_ENABLED", "0").strip() == "1"
+    lbo_rearm_band_ticks = int(os.environ.get("LBO_REARM_BAND_TICKS", "1"))
+    lbo_rearm_max_bars = int(os.environ.get("LBO_REARM_MAX_BARS", "5"))
+    lbo_tp_ticks = int(os.environ.get("LBO_TP_TICKS", "4"))
+    lbo_sl_ticks = int(os.environ.get("LBO_SL_TICKS", "3"))
+    lbo_max_hold_bars = int(os.environ.get("LBO_MAX_HOLD_BARS", "15"))
+    lbo_scratch_bars = int(os.environ.get("LBO_SCRATCH_BARS", "3"))
+    lbo_scratch_min_progress_ticks = int(os.environ.get("LBO_SCRATCH_MIN_PROGRESS_TICKS", "1"))
+    lbo_decay_bars = int(os.environ.get("LBO_DECAY_BARS", "3"))
+    lbo_be_env = os.environ.get("LBO_BREAKEVEN_AFTER_TICKS", "").strip()
+    lbo_breakeven_after_ticks = int(lbo_be_env) if lbo_be_env else None
+    lbo_ignore_thr = os.environ.get("LBO_IGNORE_THR", "0").strip() == "1"
+    lbo_flip_direction = os.environ.get("LBO_FLIP_DIRECTION", "0").strip() == "1"
+    lbo_flip_mapping_env = os.environ.get("LBO_FLIP_MAPPING", "").strip()
+    if lbo_flip_mapping_env:
+        lbo_flip_direction = lbo_flip_mapping_env == "1"
+    lbo_confirm_mode = os.environ.get("LBO_CONFIRM_MODE", "none").strip().lower()
+    if lbo_confirm_mode not in {"none", "confirm_ticks", "pullback"}:
+        raise ValueError(f"Invalid LBO_CONFIRM_MODE: {lbo_confirm_mode}")
+    lbo_confirm_ticks = int(os.environ.get("LBO_CONFIRM_TICKS", "1"))
+    lbo_confirm_max_bars = int(os.environ.get("LBO_CONFIRM_MAX_BARS", "5"))
+    lbo_confirm_use_mid = os.environ.get("LBO_CONFIRM_USE_MID", "1").strip() == "1"
+    lbo_confirm_require_flow_align = os.environ.get("LBO_CONFIRM_REQUIRE_FLOW_ALIGN", "0").strip() == "1"
+    lbo_confirm_flow_align_bars = int(os.environ.get("LBO_CONFIRM_FLOW_ALIGN_BARS", "5"))
+    lbo_confirm_min_flow_abs_align = float(os.environ.get("LBO_CONFIRM_MIN_FLOW_ABS_ALIGN", "40"))
+    lbo_pullback_ticks = int(os.environ.get("LBO_PULLBACK_TICKS", "1"))
+    lbo_pullback_max_bars = int(os.environ.get("LBO_PULLBACK_MAX_BARS", "10"))
+    lbo_resume_ticks = int(os.environ.get("LBO_RESUME_TICKS", "1"))
+    lbo_resume_max_bars = int(os.environ.get("LBO_RESUME_MAX_BARS", "5"))
     if strategy_mode == "absorption_failure_v2":
         if afr_tp_ticks is None:
             afr_tp_ticks = 3
@@ -2865,12 +3558,12 @@ def main() -> None:
         sweep_ws = [gate_lookback_bars]
 
     afr_min_flow_abs_sweep_env = os.environ.get("AFR_MIN_FLOW_ABS_SWEEP", "").strip()
-    if afr_min_flow_abs_sweep_env:
+    if run_afr2_sweep and afr_min_flow_abs_sweep_env:
         afr_min_flow_abs_sweep = [float(x.strip()) for x in afr_min_flow_abs_sweep_env.split(",") if x.strip()]
     else:
         afr_min_flow_abs_sweep = [afr_min_flow_abs]
     afr_ft_bars_sweep_env = os.environ.get("AFR_FT_BARS_SWEEP", "").strip()
-    if afr_ft_bars_sweep_env:
+    if run_afr2_sweep and afr_ft_bars_sweep_env:
         afr_ft_bars_sweep = [int(x.strip()) for x in afr_ft_bars_sweep_env.split(",") if x.strip()]
     else:
         afr_ft_bars_sweep = [afr_ft_bars]
@@ -2949,6 +3642,18 @@ def main() -> None:
             "trade_session": trade_session,
             "min_spread_ticks": min_spread_ticks,
             "entry_cooldown_bars": entry_cooldown_bars,
+            "lbo_flip_direction": lbo_flip_direction,
+            "lbo_confirm_mode": lbo_confirm_mode,
+            "lbo_confirm_ticks": lbo_confirm_ticks,
+            "lbo_confirm_max_bars": lbo_confirm_max_bars,
+            "lbo_confirm_use_mid": lbo_confirm_use_mid,
+            "lbo_confirm_require_flow_align": lbo_confirm_require_flow_align,
+            "lbo_confirm_flow_align_bars": lbo_confirm_flow_align_bars,
+            "lbo_confirm_min_flow_abs_align": lbo_confirm_min_flow_abs_align,
+            "lbo_pullback_ticks": lbo_pullback_ticks,
+            "lbo_pullback_max_bars": lbo_pullback_max_bars,
+            "lbo_resume_ticks": lbo_resume_ticks,
+            "lbo_resume_max_bars": lbo_resume_max_bars,
         },
         flush=True,
     )
@@ -3017,6 +3722,29 @@ def main() -> None:
             },
             flush=True,
         )
+    if strategy_mode == "lrams_breakout_v1":
+        print(
+            "LBO config:",
+            {
+                "lbo_break_ticks": lbo_break_ticks,
+                "lbo_confirm_bars": lbo_confirm_bars,
+                "lbo_min_flow_abs": lbo_min_flow_abs,
+                "lbo_max_spread_ticks": lbo_max_spread_ticks,
+                "lbo_ft_bars": lbo_ft_bars,
+                "lbo_ft_min_ticks": lbo_ft_min_ticks,
+                "lbo_rearm_enabled": lbo_rearm_enabled,
+                "lbo_rearm_band_ticks": lbo_rearm_band_ticks,
+                "lbo_rearm_max_bars": lbo_rearm_max_bars,
+                "lbo_tp_ticks": lbo_tp_ticks,
+                "lbo_sl_ticks": lbo_sl_ticks,
+                "lbo_max_hold_bars": lbo_max_hold_bars,
+                "lbo_scratch_bars": lbo_scratch_bars,
+                "lbo_scratch_min_progress_ticks": lbo_scratch_min_progress_ticks,
+                "lbo_decay_bars": lbo_decay_bars,
+                "lbo_breakeven_after_ticks": lbo_breakeven_after_ticks,
+            },
+            flush=True,
+        )
     if strategy_mode == "absorption_failure_v3":
         print(
             "AFR3 config:",
@@ -3073,6 +3801,9 @@ def main() -> None:
     health_dir.mkdir(parents=True, exist_ok=True)
 
     afr2_sweep_rows = []
+    print(f"=== STRATEGY: {strategy_mode} ({run_mode}) ===", flush=True)
+    if run_afr2_sweep:
+        print(f"=== STRATEGY: {strategy_mode} AFR2_SWEEP ===", flush=True)
     for afr_min_flow_abs_cur in afr_min_flow_abs_sweep:
         for afr_ft_bars_cur in afr_ft_bars_sweep:
             for gate_mode in gate_modes:
@@ -3091,6 +3822,8 @@ def main() -> None:
                             "trade_session": trade_session,
                             "min_spread_ticks": min_spread_ticks,
                             "entry_cooldown_bars": entry_cooldown_bars,
+                            "lbo_ignore_thr": lbo_ignore_thr,
+                            "lbo_flip_direction": lbo_flip_direction,
                         },
                         flush=True,
                     )
@@ -3216,10 +3949,29 @@ def main() -> None:
                                     afr3_checked_base,
                                     afr3_absorption_pass_base,
                                     afr3_break_pass_base,
-                                    afr3_break_quality_pass_base,
-                                    afr3_snapback_pass_base,
-                                    afr3_entered_base,
-                                    mmas_checked_base,
+                            afr3_break_quality_pass_base,
+                            afr3_snapback_pass_base,
+                            afr3_entered_base,
+                            lbo_weak_none_base,
+                            lbo_weak_ask_base,
+                            lbo_weak_bid_base,
+                            lbo_weak_none_blocked_base,
+                            lbo_rej_empty_base,
+                            lbo_rej_before_lookback_base,
+                            lbo_rej_thr_nan_base,
+                            lbo_rej_asym_below_thr_base,
+                            lbo_missing_both_base,
+                            lbo_only_buy_base,
+                            lbo_only_sell_base,
+                            lbo_both_fail_thr_base,
+                            lbo_pending_started_base,
+                            lbo_confirm_entered_base,
+                            lbo_confirm_expired_base,
+                            lbo_pull_triggered_base,
+                            lbo_pull_pulled_back_base,
+                            lbo_pull_resumed_entered_base,
+                            lbo_pull_expired_base,
+                            mmas_checked_base,
                                     mmas_passed_base,
                                     mmas_signaled_base,
                                     mmas_entered_base,
@@ -3274,10 +4026,39 @@ def main() -> None:
                                     afr_enter_on=afr_enter_on,
                                     afr_break_quality_min_flow_abs=afr_break_quality_min_flow_abs,
                                     afr_break_quality_max_spread_ticks=afr_break_quality_max_spread_ticks,
-                                    afr_snapback_bars=afr_snapback_bars,
-                                    afr_snapback_band_ticks=afr_snapback_band_ticks,
-                                    debug_first_afr=debug_first_afr,
-                                    debug_first_afr2=debug_first_afr2,
+                            afr_snapback_bars=afr_snapback_bars,
+                            afr_snapback_band_ticks=afr_snapback_band_ticks,
+                            lbo_break_ticks=lbo_break_ticks,
+                            lbo_confirm_bars=lbo_confirm_bars,
+                            lbo_min_flow_abs=lbo_min_flow_abs,
+                            lbo_max_spread_ticks=lbo_max_spread_ticks,
+                            lbo_ft_bars=lbo_ft_bars,
+                            lbo_ft_min_ticks=lbo_ft_min_ticks,
+                            lbo_rearm_enabled=lbo_rearm_enabled,
+                            lbo_rearm_band_ticks=lbo_rearm_band_ticks,
+                            lbo_rearm_max_bars=lbo_rearm_max_bars,
+                            lbo_tp_ticks=lbo_tp_ticks,
+                            lbo_sl_ticks=lbo_sl_ticks,
+                            lbo_max_hold_bars=lbo_max_hold_bars,
+                            lbo_scratch_bars=lbo_scratch_bars,
+                            lbo_scratch_min_progress_ticks=lbo_scratch_min_progress_ticks,
+                            lbo_decay_bars=lbo_decay_bars,
+                            lbo_breakeven_after_ticks=lbo_breakeven_after_ticks,
+                            lbo_ignore_thr=lbo_ignore_thr,
+                            lbo_flip_direction=lbo_flip_direction,
+                            lbo_confirm_mode=lbo_confirm_mode,
+                            lbo_confirm_ticks=lbo_confirm_ticks,
+                            lbo_confirm_max_bars=lbo_confirm_max_bars,
+                            lbo_confirm_use_mid=lbo_confirm_use_mid,
+                            lbo_confirm_require_flow_align=lbo_confirm_require_flow_align,
+                            lbo_confirm_flow_align_bars=lbo_confirm_flow_align_bars,
+                            lbo_confirm_min_flow_abs_align=lbo_confirm_min_flow_abs_align,
+                            lbo_pullback_max_bars=lbo_pullback_max_bars,
+                            lbo_pullback_ticks=lbo_pullback_ticks,
+                            lbo_resume_ticks=lbo_resume_ticks,
+                            lbo_resume_max_bars=lbo_resume_max_bars,
+                            debug_first_afr=debug_first_afr,
+                            debug_first_afr2=debug_first_afr2,
                                     afr_scratch_bars=afr_scratch_bars,
                                     afr_scratch_min_progress_ticks=afr_scratch_min_progress_ticks,
                                     afr3_break_min_flow_abs=afr3_break_min_flow_abs,
@@ -3353,6 +4134,25 @@ def main() -> None:
                                 afr3_break_quality_pass_base = 0
                                 afr3_snapback_pass_base = 0
                                 afr3_entered_base = 0
+                                lbo_weak_none_base = 0
+                                lbo_weak_ask_base = 0
+                                lbo_weak_bid_base = 0
+                                lbo_weak_none_blocked_base = 0
+                                lbo_rej_empty_base = 0
+                                lbo_rej_before_lookback_base = 0
+                                lbo_rej_thr_nan_base = 0
+                                lbo_rej_asym_below_thr_base = 0
+                                lbo_missing_both_base = 0
+                                lbo_only_buy_base = 0
+                                lbo_only_sell_base = 0
+                                lbo_both_fail_thr_base = 0
+                                lbo_pending_started_base = 0
+                                lbo_confirm_entered_base = 0
+                                lbo_confirm_expired_base = 0
+                                lbo_pull_triggered_base = 0
+                                lbo_pull_pulled_back_base = 0
+                                lbo_pull_resumed_entered_base = 0
+                                lbo_pull_expired_base = 0
                                 mmas_checked_base = 0
                                 mmas_passed_base = 0
                                 mmas_signaled_base = 0
@@ -3412,10 +4212,29 @@ def main() -> None:
                                 afr3_checked_gate,
                                 afr3_absorption_pass_gate,
                                 afr3_break_pass_gate,
-                                afr3_break_quality_pass_gate,
-                                afr3_snapback_pass_gate,
-                                afr3_entered_gate,
-                                mmas_checked_gate,
+                        afr3_break_quality_pass_gate,
+                        afr3_snapback_pass_gate,
+                        afr3_entered_gate,
+                        lbo_weak_none_gate,
+                        lbo_weak_ask_gate,
+                        lbo_weak_bid_gate,
+                        lbo_weak_none_blocked_gate,
+                        lbo_rej_empty_gate,
+                        lbo_rej_before_lookback_gate,
+                        lbo_rej_thr_nan_gate,
+                        lbo_rej_asym_below_thr_gate,
+                        lbo_missing_both_gate,
+                        lbo_only_buy_gate,
+                        lbo_only_sell_gate,
+                        lbo_both_fail_thr_gate,
+                        lbo_pending_started_gate,
+                        lbo_confirm_entered_gate,
+                        lbo_confirm_expired_gate,
+                        lbo_pull_triggered_gate,
+                        lbo_pull_pulled_back_gate,
+                        lbo_pull_resumed_entered_gate,
+                        lbo_pull_expired_gate,
+                        mmas_checked_gate,
                                 mmas_passed_gate,
                                 mmas_signaled_gate,
                                 mmas_entered_gate,
@@ -3470,10 +4289,39 @@ def main() -> None:
                                 afr_enter_on=afr_enter_on,
                                 afr_break_quality_min_flow_abs=afr_break_quality_min_flow_abs,
                                 afr_break_quality_max_spread_ticks=afr_break_quality_max_spread_ticks,
-                                afr_snapback_bars=afr_snapback_bars,
-                                afr_snapback_band_ticks=afr_snapback_band_ticks,
-                                debug_first_afr=debug_first_afr,
-                                debug_first_afr2=debug_first_afr2,
+                        afr_snapback_bars=afr_snapback_bars,
+                        afr_snapback_band_ticks=afr_snapback_band_ticks,
+                        lbo_break_ticks=lbo_break_ticks,
+                        lbo_confirm_bars=lbo_confirm_bars,
+                        lbo_min_flow_abs=lbo_min_flow_abs,
+                        lbo_max_spread_ticks=lbo_max_spread_ticks,
+                        lbo_ft_bars=lbo_ft_bars,
+                        lbo_ft_min_ticks=lbo_ft_min_ticks,
+                        lbo_rearm_enabled=lbo_rearm_enabled,
+                        lbo_rearm_band_ticks=lbo_rearm_band_ticks,
+                        lbo_rearm_max_bars=lbo_rearm_max_bars,
+                        lbo_tp_ticks=lbo_tp_ticks,
+                        lbo_sl_ticks=lbo_sl_ticks,
+                        lbo_max_hold_bars=lbo_max_hold_bars,
+                        lbo_scratch_bars=lbo_scratch_bars,
+                        lbo_scratch_min_progress_ticks=lbo_scratch_min_progress_ticks,
+                        lbo_decay_bars=lbo_decay_bars,
+                        lbo_breakeven_after_ticks=lbo_breakeven_after_ticks,
+                        lbo_ignore_thr=lbo_ignore_thr,
+                        lbo_flip_direction=lbo_flip_direction,
+                        lbo_confirm_mode=lbo_confirm_mode,
+                        lbo_confirm_ticks=lbo_confirm_ticks,
+                        lbo_confirm_max_bars=lbo_confirm_max_bars,
+                        lbo_confirm_use_mid=lbo_confirm_use_mid,
+                        lbo_confirm_require_flow_align=lbo_confirm_require_flow_align,
+                        lbo_confirm_flow_align_bars=lbo_confirm_flow_align_bars,
+                        lbo_confirm_min_flow_abs_align=lbo_confirm_min_flow_abs_align,
+                        lbo_pullback_max_bars=lbo_pullback_max_bars,
+                        lbo_pullback_ticks=lbo_pullback_ticks,
+                        lbo_resume_ticks=lbo_resume_ticks,
+                        lbo_resume_max_bars=lbo_resume_max_bars,
+                        debug_first_afr=debug_first_afr,
+                        debug_first_afr2=debug_first_afr2,
                                 afr_scratch_bars=afr_scratch_bars,
                                 afr_scratch_min_progress_ticks=afr_scratch_min_progress_ticks,
                                 afr3_break_min_flow_abs=afr3_break_min_flow_abs,
@@ -3809,6 +4657,43 @@ def main() -> None:
                                     f"entered={afr3_entered_gate}",
                                     flush=True,
                                 )
+                            if strategy_mode == "lrams_breakout_v1":
+                                base_side = trades_base["side"] if "side" in trades_base.columns else pd.Series(dtype=object)
+                                gate_side = trades_gate["side"] if "side" in trades_gate.columns else pd.Series(dtype=object)
+                                base_long_trades = int((base_side == "long").sum())
+                                base_short_trades = int((base_side == "short").sum())
+                                gate_long_trades = int((gate_side == "long").sum())
+                                gate_short_trades = int((gate_side == "short").sum())
+                                print(
+                                    f"{instrument} {day} LBO weak_side base none={lbo_weak_none_base} "
+                                    f"ask={lbo_weak_ask_base} bid={lbo_weak_bid_base} "
+                                    f"none_blocked={lbo_weak_none_blocked_base} "
+                                    f"rej_empty={lbo_rej_empty_base} rej_before_lookback={lbo_rej_before_lookback_base} "
+                                    f"rej_thr_nan={lbo_rej_thr_nan_base} rej_asym_below_thr={lbo_rej_asym_below_thr_base} "
+                                    f"missing_both={lbo_missing_both_base} only_buy={lbo_only_buy_base} "
+                                    f"only_sell={lbo_only_sell_base} both_fail_thr={lbo_both_fail_thr_base} | "
+                                    f"gate none={lbo_weak_none_gate} ask={lbo_weak_ask_gate} bid={lbo_weak_bid_gate} "
+                                    f"none_blocked={lbo_weak_none_blocked_gate} "
+                                    f"rej_empty={lbo_rej_empty_gate} rej_before_lookback={lbo_rej_before_lookback_gate} "
+                                    f"rej_thr_nan={lbo_rej_thr_nan_gate} rej_asym_below_thr={lbo_rej_asym_below_thr_gate} "
+                                    f"missing_both={lbo_missing_both_gate} only_buy={lbo_only_buy_gate} "
+                                    f"only_sell={lbo_only_sell_gate} both_fail_thr={lbo_both_fail_thr_gate} "
+                                    f"trades base long={base_long_trades} short={base_short_trades} | "
+                                    f"gate long={gate_long_trades} short={gate_short_trades}",
+                                    flush=True,
+                                )
+                                print(
+                                    f"{instrument} {day} LBO confirm mode={lbo_confirm_mode} "
+                                    f"pending_started base={lbo_pending_started_base} confirm_entered={lbo_confirm_entered_base} "
+                                    f"confirm_expired={lbo_confirm_expired_base} pull_triggered={lbo_pull_triggered_base} "
+                                    f"pull_pulled_back={lbo_pull_pulled_back_base} "
+                                    f"pull_resumed_entered={lbo_pull_resumed_entered_base} pull_expired={lbo_pull_expired_base} | "
+                                    f"gate pending_started={lbo_pending_started_gate} confirm_entered={lbo_confirm_entered_gate} "
+                                    f"confirm_expired={lbo_confirm_expired_gate} pull_triggered={lbo_pull_triggered_gate} "
+                                    f"pull_pulled_back={lbo_pull_pulled_back_gate} "
+                                    f"pull_resumed_entered={lbo_pull_resumed_entered_gate} pull_expired={lbo_pull_expired_gate}",
+                                    flush=True,
+                                )
                             base_entry_reason = trades_base["entry_reason"] if "entry_reason" in trades_base.columns else pd.Series(dtype=object)
                             gate_entry_reason = trades_gate["entry_reason"] if "entry_reason" in trades_gate.columns else pd.Series(dtype=object)
                             base_exit_reason = trades_base["exit_reason"] if "exit_reason" in trades_base.columns else pd.Series(dtype=object)
@@ -3823,6 +4708,17 @@ def main() -> None:
                             count_break_entries_gate = int((gate_entry_reason == "break").sum())
                             count_ft_entries_gate = int((gate_entry_reason == "ft").sum())
                             count_rearms_gate = int((gate_entry_reason == "rearm").sum())
+                            if strategy_mode == "lrams_breakout_v1":
+                                count_lbo_now_base = int((base_entry_reason == "lbo_now").sum())
+                                count_lbo_confirm_base = int((base_entry_reason == "lbo_confirm").sum())
+                                count_lbo_pullback_base = int((base_entry_reason == "lbo_pullback").sum())
+                                count_lbo_now_gate = int((gate_entry_reason == "lbo_now").sum())
+                                count_lbo_confirm_gate = int((gate_entry_reason == "lbo_confirm").sum())
+                                count_lbo_pullback_gate = int((gate_entry_reason == "lbo_pullback").sum())
+                                if count_lbo_now_base + count_lbo_confirm_base + count_lbo_pullback_base != len(trades_base):
+                                    raise RuntimeError("LBO base entry counts do not match trade count.")
+                                if count_lbo_now_gate + count_lbo_confirm_gate + count_lbo_pullback_gate != len(trades_gate):
+                                    raise RuntimeError("LBO gate entry counts do not match trade count.")
                             if strategy_mode == "absorption_failure_v2":
                                 if afr_enter_on == "break" and (count_ft_entries_base > 0 or count_ft_entries_gate > 0):
                                     raise RuntimeError("AFR_ENTER_ON=break but FT entries were recorded.")
@@ -3896,6 +4792,20 @@ def main() -> None:
                                     "afr_be_triggered_base": int(afr_be_triggered_base),
                                     "afr_be_armed_gate": int(afr_be_armed_gate),
                                     "afr_be_triggered_gate": int(afr_be_triggered_gate),
+                                    "lbo_pending_started_base": int(lbo_pending_started_base),
+                                    "lbo_confirm_entered_base": int(lbo_confirm_entered_base),
+                                    "lbo_confirm_expired_base": int(lbo_confirm_expired_base),
+                                    "lbo_pull_triggered_base": int(lbo_pull_triggered_base),
+                                    "lbo_pull_pulled_back_base": int(lbo_pull_pulled_back_base),
+                                    "lbo_pull_resumed_entered_base": int(lbo_pull_resumed_entered_base),
+                                    "lbo_pull_expired_base": int(lbo_pull_expired_base),
+                                    "lbo_pending_started_gate": int(lbo_pending_started_gate),
+                                    "lbo_confirm_entered_gate": int(lbo_confirm_entered_gate),
+                                    "lbo_confirm_expired_gate": int(lbo_confirm_expired_gate),
+                                    "lbo_pull_triggered_gate": int(lbo_pull_triggered_gate),
+                                    "lbo_pull_pulled_back_gate": int(lbo_pull_pulled_back_gate),
+                                    "lbo_pull_resumed_entered_gate": int(lbo_pull_resumed_entered_gate),
+                                    "lbo_pull_expired_gate": int(lbo_pull_expired_gate),
                                     "count_break_entries_base": int(count_break_entries_base),
                                     "count_ft_entries_base": int(count_ft_entries_base),
                                     "count_rearms_base": int(count_rearms_base),
@@ -4047,6 +4957,7 @@ def main() -> None:
         if strategy_rows:
             strategy_df = pd.DataFrame(strategy_rows)
             strategy_df.to_csv(out_dir_w / "strategy_diagnostics.csv", index=False)
+            print(f"=== STRATEGY: {strategy_mode} DIAGNOSTICS ===", flush=True)
             print("Strategy diagnostics by day:", flush=True)
             print(strategy_df.to_string(index=False), flush=True)
 
@@ -4074,33 +4985,34 @@ def main() -> None:
             pct_be = 0.0
             pct_decay = 0.0
 
-        afr2_sweep_rows.append(
-            {
-                "afr_min_flow_abs": float(afr_min_flow_abs_cur),
-                "afr_ft_bars": int(afr_ft_bars_cur),
-                "gate_mode": gate_mode,
-                "W": gate_lookback_bars,
-                "total_gated_trades": total_gated_trades,
-                "total_gated_pnl_ticks": total_gated_pnl,
-                "max_dd_ticks": max_dd_ticks,
-                "pnl_per_trade": pnl_per_trade,
-                "pnl_per_blocked_entry": pnl_per_blocked,
-                "median_mfe_ticks": median_mfe,
-                "median_mae_ticks": median_mae,
-                "pct_exit_on_scratch": pct_scratch,
-                "pct_exit_on_be": pct_be,
-                "pct_exit_on_decay": pct_decay,
-            }
-        )
-        print(
-            f"AFR2_SWEEP afr_min_flow_abs={afr_min_flow_abs_cur} afr_ft_bars={afr_ft_bars_cur} "
-            f"mode={gate_mode} W={gate_lookback_bars} gated_trades={total_gated_trades} "
-            f"gated_pnl={total_gated_pnl:.2f} max_dd={max_dd_ticks:.2f} "
-            f"pnl_per_trade={pnl_per_trade:.4f} pnl_per_blocked={pnl_per_blocked:.4f} "
-            f"median_mfe={median_mfe:.2f} median_mae={median_mae:.2f} "
-            f"scratch={pct_scratch:.2%} be={pct_be:.2%} decay={pct_decay:.2%}",
-            flush=True,
-        )
+        if run_afr2_sweep:
+            afr2_sweep_rows.append(
+                {
+                    "afr_min_flow_abs": float(afr_min_flow_abs_cur),
+                    "afr_ft_bars": int(afr_ft_bars_cur),
+                    "gate_mode": gate_mode,
+                    "W": gate_lookback_bars,
+                    "total_gated_trades": total_gated_trades,
+                    "total_gated_pnl_ticks": total_gated_pnl,
+                    "max_dd_ticks": max_dd_ticks,
+                    "pnl_per_trade": pnl_per_trade,
+                    "pnl_per_blocked_entry": pnl_per_blocked,
+                    "median_mfe_ticks": median_mfe,
+                    "median_mae_ticks": median_mae,
+                    "pct_exit_on_scratch": pct_scratch,
+                    "pct_exit_on_be": pct_be,
+                    "pct_exit_on_decay": pct_decay,
+                }
+            )
+            print(
+                f"AFR2_SWEEP afr_min_flow_abs={afr_min_flow_abs_cur} afr_ft_bars={afr_ft_bars_cur} "
+                f"mode={gate_mode} W={gate_lookback_bars} gated_trades={total_gated_trades} "
+                f"gated_pnl={total_gated_pnl:.2f} max_dd={max_dd_ticks:.2f} "
+                f"pnl_per_trade={pnl_per_trade:.4f} pnl_per_blocked={pnl_per_blocked:.4f} "
+                f"median_mfe={median_mfe:.2f} median_mae={median_mae:.2f} "
+                f"scratch={pct_scratch:.2%} be={pct_be:.2%} decay={pct_decay:.2%}",
+                flush=True,
+            )
 
     sweep_df = pd.DataFrame(sweep_rows)
     sweep_df.to_csv(out_dir / "summary_sweep.csv", index=False)
@@ -4242,7 +5154,7 @@ def main() -> None:
         print("Aggregate summary by W, gate_mode:", flush=True)
         print(agg_df.to_string(index=False), flush=True)
 
-    if afr2_sweep_rows:
+    if run_afr2_sweep and afr2_sweep_rows:
         afr2_sweep_df = pd.DataFrame(afr2_sweep_rows)
         afr2_sweep_path = Path("artifacts") / "afr2_sweep_summary.csv"
         afr2_sweep_df.to_csv(afr2_sweep_path, index=False)
