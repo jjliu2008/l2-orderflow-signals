@@ -83,6 +83,7 @@ Impulse confirm entry (strategy_mode=impulse_confirm_v1):
   LBO_DECAY_BARS          LRAMS breakout decay bars (default: 3)
   LBO_BREAKEVEN_AFTER_TICKS LRAMS breakout breakeven ticks (default: unset)
   LBO_IGNORE_THR          LRAMS breakout ignore asym <= thr (default: 0)
+  LBO_IGNORE_THR_OVERRIDE override LBO_IGNORE_THR if set (default: unset)
   LBO_FLIP_DIRECTION      LRAMS breakout invert weak_side mapping (default: 0)
   LBO_FLIP_MAPPING        LRAMS breakout invert weak_side mapping (default: 0)
   LBO_CONFIRM_MODE        LRAMS breakout confirm mode none|confirm_ticks|pullback (default: none)
@@ -96,6 +97,8 @@ Impulse confirm entry (strategy_mode=impulse_confirm_v1):
   LBO_PULLBACK_MAX_BARS   LRAMS breakout pullback max bars (default: 10)
   LBO_RESUME_TICKS        LRAMS breakout resume ticks (default: 1)
   LBO_RESUME_MAX_BARS     LRAMS breakout resume max bars (default: 5)
+  ALLOW_GATE_ON_NONE      allow gate when weak_side is None (default: 0)
+  GATE_DEBUG              print first 5 gate decisions per day (default: 0)
   AFR3_BREAK_MIN_FLOW_ABS AFR v3 min abs flow on break bar (default: 100)
   AFR3_BREAK_MAX_SPREAD_TICKS AFR v3 max spread on break bar (default: 2)
   AFR3_SNAPBACK_CHECK     AFR v3 require no snapback on next bar (default: 1)
@@ -463,6 +466,8 @@ def _simulate_day(
     lbo_pullback_ticks: int,
     lbo_resume_ticks: int,
     lbo_resume_max_bars: int,
+    allow_gate_on_none: bool,
+    gate_debug: bool,
     debug_first_afr: bool,
     debug_first_afr2: bool,
     afr_scratch_bars: int,
@@ -486,6 +491,7 @@ def _simulate_day(
     debug_entry_print: bool,
     debug_entry_limit: int,
     debug_entry_tag: str,
+    exit_mode: str,
 ) -> Tuple[object, ...]:
     bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
     ask = pd.to_numeric(df_day["ask_price_1"], errors="coerce").to_numpy()
@@ -635,6 +641,20 @@ def _simulate_day(
         "impulse_failed_threshold": 0,
         "impulse_failed_confirm": 0,
     }
+    gate_diag = {
+        "weak_side_ask": 0,
+        "weak_side_bid": 0,
+        "weak_side_none": 0,
+        "blocked_none": 0,
+        "blocked_mismatch": 0,
+        "allowed_count": 0,
+        "allow_on_none": 0,
+    }
+    gate_event_idx = -1
+    gate_event_age = -1
+    gate_asym_val = float("nan")
+    gate_thr_val = float("nan")
+    gate_weak_side = None
 
     signed_vol = pd.to_numeric(df_day["signed_volume"], errors="coerce").fillna(0.0).to_numpy()
     if afr_use_signed_volume:
@@ -926,6 +946,64 @@ def _simulate_day(
             lbo_break_blocked_abs_level_short = float(absorption_level_val)
             lbo_break_blocked_break_level_short = float(break_level_val)
             lbo_break_blocked_abs_bar_short = int(absorption_bar_val)
+
+    def _latest_event_side(entry_bar_val: int) -> str | None:
+        idx_buy = np.searchsorted(event_pos_buy, entry_bar_val - 1, side="right") - 1
+        idx_sell = np.searchsorted(event_pos_sell, entry_bar_val - 1, side="right") - 1
+        if idx_buy < 0 and idx_sell < 0:
+            return None
+        if idx_buy < 0:
+            return "sell"
+        if idx_sell < 0:
+            return "buy"
+        return "buy" if event_pos_buy[idx_buy] >= event_pos_sell[idx_sell] else "sell"
+
+    day_str = str(df_day["date"].iloc[0]) if "date" in df_day.columns and not df_day.empty else "unknown"
+    symbol_str = str(df_day["Symbol"].iloc[0]) if "Symbol" in df_day.columns and not df_day.empty else "NA"
+    gate_diag_printed = False
+    gate_debug_printed = 0
+
+    def _log_gate_decision(
+        gate_allowed_val: bool,
+        gate_reason_val: str,
+        weak_side_val: str | None,
+        weak_side_dir_val: str | None,
+        desired_side_val: str | None,
+        event_stream_val: str | None,
+    ) -> None:
+        nonlocal gate_diag_printed, gate_debug_printed
+        if gate_mode != "side_matched":
+            return
+        if gate_allowed_val:
+            gate_diag["allowed_count"] += 1
+        else:
+            if weak_side_val is None:
+                gate_diag["blocked_none"] += 1
+            elif weak_side_val is not None:
+                gate_diag["blocked_mismatch"] += 1
+        if not gate_diag_printed:
+            print(
+                f"GATE_DIAG_DECISION {symbol_str} {day_str} weak_side={weak_side_val} "
+                f"weak_side_dir={weak_side_dir_val} desired_side={desired_side_val} "
+                f"allowed={int(gate_allowed_val)} reason={gate_reason_val} "
+                f"weak_side_bid={gate_diag.get('weak_side_bid', 0)} "
+                f"weak_side_ask={gate_diag.get('weak_side_ask', 0)} "
+                f"weak_side_none={gate_diag.get('weak_side_none', 0)} "
+                f"blocked_none={gate_diag.get('blocked_none', 0)} "
+                f"blocked_mismatch={gate_diag.get('blocked_mismatch', 0)} "
+                f"allowed_count={gate_diag.get('allowed_count', 0)} "
+                f"allow_on_none={gate_diag.get('allow_on_none', 0)}",
+                flush=True,
+            )
+            gate_diag_printed = True
+        if gate_debug and gate_debug_printed < 5:
+            print(
+                f"GATE_DEBUG {symbol_str} {day_str} entry_bar={entry_bar} desired_side={desired_side_val} "
+                f"weak_side={weak_side_val} stream={event_stream_val} "
+                f"gate_decision={'allow' if gate_allowed_val else gate_reason_val}",
+                flush=True,
+            )
+            gate_debug_printed += 1
     if trade_session == "rth":
         times = pd.to_datetime(df_day["Time"], utc=True, errors="coerce")
         times_cst = times.dt.tz_convert("America/Chicago")
@@ -991,14 +1069,19 @@ def _simulate_day(
         event_asym_all = events_day["asym"].to_numpy(dtype=float)
         event_thr_all = events_day["asym_threshold"].to_numpy(dtype=float)
         event_side_all = events_day["side"].astype(str).to_numpy()
-        buy_mask = events_day["side"] == "buy"
-        sell_mask = events_day["side"] == "sell"
-        event_pos_buy = event_pos_all[buy_mask.to_numpy()]
-        event_asym_buy = event_asym_all[buy_mask.to_numpy()]
-        event_thr_buy = event_thr_all[buy_mask.to_numpy()]
-        event_pos_sell = event_pos_all[sell_mask.to_numpy()]
-        event_asym_sell = event_asym_all[sell_mask.to_numpy()]
-        event_thr_sell = event_thr_all[sell_mask.to_numpy()]
+        order = np.argsort(event_pos_all, kind="mergesort")
+        event_pos_all = event_pos_all[order]
+        event_asym_all = event_asym_all[order]
+        event_thr_all = event_thr_all[order]
+        event_side_all = event_side_all[order]
+        buy_mask = event_side_all == "buy"
+        sell_mask = event_side_all == "sell"
+        event_pos_buy = event_pos_all[buy_mask]
+        event_asym_buy = event_asym_all[buy_mask]
+        event_thr_buy = event_thr_all[buy_mask]
+        event_pos_sell = event_pos_all[sell_mask]
+        event_asym_sell = event_asym_all[sell_mask]
+        event_thr_sell = event_thr_all[sell_mask]
 
     in_position = False
     pos: Dict[str, object] = {}
@@ -1010,7 +1093,38 @@ def _simulate_day(
     i = lookback_bars
     max_i = n - 1
     entry_debug_printed = 0
+    flat_candidate_printed = 0
+    flat_suppress_printed = 0
+    event_debug_printed = False
+    use_exit_sm_v1 = exit_mode == "exit_sm_v1"
+    exit_sm_warned = False
+    if (not event_debug_printed) and event_pos_all.size:
+        print(
+            f"EVENT_POS_DEBUG {symbol_str} {day_str} "
+            f"min={int(event_pos_all.min())} max={int(event_pos_all.max())} "
+            f"first5={event_pos_all[:5].tolist()} last5={event_pos_all[-5:].tolist()} "
+            f"gate_lookback_bars={gate_lookback_bars} n={n}",
+            flush=True,
+        )
+        event_debug_printed = True
     while i <= max_i:
+        # Evaluate signals each bar; otherwise a flat day would never increment counters.
+        desired_side_top = _signal(i)
+        if desired_side_top is not None:
+            total_signals += 1
+            if in_position:
+                signals_in_position += 1
+            else:
+                signals_when_flat += 1
+        # DEBUG: prove we have flat candidates in this exact code path
+        if (not in_position) and (desired_side_top is not None):
+            if flat_candidate_printed < 5:
+                print(
+                    f"FLAT_CANDIDATE {symbol_str} {day_str} i={i} side={desired_side_top} "
+                    f"spread_ticks={spread_ticks if 'spread_ticks' in locals() else 'NA'}",
+                    flush=True,
+                )
+                flat_candidate_printed += 1
         if in_position:
             entry_bar = int(pos["entry_bar"])
             side = str(pos["side"])
@@ -1022,10 +1136,15 @@ def _simulate_day(
             pnl_ticks = float("nan")
             exit_reason = str(pos.get("exit_reason", "TIME"))
             sl_ticks_local = int(pos.get("sl_ticks", sl_ticks))
-            desired_side = _signal(i)
-            if desired_side is not None:
-                total_signals += 1
-                signals_in_position += 1
+            if use_exit_sm_v1:
+                # exit_sm_v1 not implemented in this build; fall back to legacy exits explicitly.
+                if not exit_sm_warned:
+                    print("Warning: exit_sm_v1 selected; using legacy exits.", flush=True)
+                    exit_sm_warned = True
+                use_exit_sm_v1 = False
+            else:
+                # legacy exit logic (default).
+                pass
             if i >= entry_bar + 1:
                 mark_px = bid[i] if side == "long" else ask[i]
                 if np.isfinite(mark_px):
@@ -1033,6 +1152,8 @@ def _simulate_day(
                     if np.isfinite(pnl_mark):
                         pos["mfe_ticks"] = max(float(pos.get("mfe_ticks", 0.0)), float(pnl_mark))
                         pos["mae_ticks"] = min(float(pos.get("mae_ticks", 0.0)), float(pnl_mark))
+                        if float(pos.get("bars_to_plus1", -1)) < 0 and float(pos.get("mfe_ticks", 0.0)) >= 1.0:
+                            pos["bars_to_plus1"] = int(i - entry_bar)
                         if (
                             strategy_mode == "absorption_failure_v2"
                             and afr_scratch_min_progress_ticks > 0
@@ -1130,6 +1251,27 @@ def _simulate_day(
                 exit_px = bid[exit_bar] if side == "long" else ask[exit_bar]
                 pnl_ticks = (exit_px - entry_px) / tick_size if side == "long" else (entry_px - exit_px) / tick_size
                 exit_reason = str(pos.get("exit_reason", "TIME"))
+                entry_spread_ticks = float(pos.get("entry_spread_ticks", 0.0))
+                tp_ticks_local = float(pos.get("tp_ticks", tp_ticks))
+                sl_ticks_local = float(pos.get("sl_ticks", sl_ticks))
+                if exit_reason == "SL":
+                    min_pnl = -(sl_ticks_local + entry_spread_ticks) - 1e-6
+                    if pnl_ticks < min_pnl:
+                        print(
+                            f"PNL_BOUND_FAIL side={side} entry_px={entry_px:.4f} exit_px={exit_px:.4f} "
+                            f"pnl_ticks={pnl_ticks:.4f} sl_ticks={sl_ticks_local} entry_spread_ticks={entry_spread_ticks}",
+                            flush=True,
+                        )
+                        raise RuntimeError("PnL below bound on SL exit.")
+                if exit_reason == "TP":
+                    max_pnl = (tp_ticks_local - entry_spread_ticks) + 1e-6
+                    if pnl_ticks > max_pnl:
+                        print(
+                            f"PNL_BOUND_FAIL side={side} entry_px={entry_px:.4f} exit_px={exit_px:.4f} "
+                            f"pnl_ticks={pnl_ticks:.4f} tp_ticks={tp_ticks_local} entry_spread_ticks={entry_spread_ticks}",
+                            flush=True,
+                        )
+                        raise RuntimeError("PnL above bound on TP exit.")
                 if bool(pos.get("breakeven_triggered", False)):
                     afr_be_triggered += 1
                 if strategy_mode.startswith("absorption_failure"):
@@ -1277,6 +1419,7 @@ def _simulate_day(
                         "entry_bar": int(pos["entry_bar"]),
                         "exit_bar": int(exit_bar),
                         "exit_reason": exit_reason,
+                        "exit_mode": "exit_sm_v1" if use_exit_sm_v1 else "legacy",
                         "entry_reason": pos.get("entry_reason"),
                         "absorption_level": float(pos.get("absorption_level", float("nan"))),
                         "break_level": float(pos.get("break_level", float("nan"))),
@@ -1284,6 +1427,7 @@ def _simulate_day(
                         "bars_from_absorption_to_entry": int(pos.get("bars_from_absorption", -1)),
                         "bars_from_absorption": int(pos.get("bars_from_absorption", -1)),
                         "bars_to_progress": int(pos.get("bars_to_progress", -1)),
+                        "bars_to_plus1": int(pos.get("bars_to_plus1", -1)),
                         "confirm_bars_waited": int(pos.get("confirm_bars_waited", 0)),
                         "confirm_price_ref": float(pos.get("confirm_price_ref", float("nan"))),
                         "mae_ticks": float(pos.get("mae_ticks", 0.0)),
@@ -1303,7 +1447,23 @@ def _simulate_day(
                 i += 1
                 continue
 
-        desired_side = None
+        if in_position:
+            # Still in a position after exit handling; skip entry logic.
+            i += 1
+            continue
+
+        def _print_flat_suppress(reason: str, extra: str = "") -> None:
+            nonlocal flat_suppress_printed
+            if desired_side_top is None:
+                return
+            if flat_suppress_printed < 10:
+                print(
+                    f"FLAT_SUPPRESS {symbol_str} {day_str} i={i} reason={reason} {extra}".strip(),
+                    flush=True,
+                )
+                flat_suppress_printed += 1
+
+        desired_side = desired_side_top
         dmid_ticks = float("nan")
         impulse_ticks = float("nan")
         flow = 0.0
@@ -1312,6 +1472,8 @@ def _simulate_day(
         break_ticks = float("nan")
         ft_progress_ticks = float("nan")
         break_level = float("nan")
+        absorption_level = float("nan")
+        absorption_bar = -1
         lbo_break_ticks_entry = float("nan")
         lbo_flow_align_sum = 0.0
         lbo_direction = ""
@@ -1332,8 +1494,10 @@ def _simulate_day(
         if strategy_mode == "lrams_breakout_v1":
             entry_bar = i
         if entry_bar >= n:
+            _print_flat_suppress("entry_bar_oob", f"entry_bar={entry_bar} n={n}")
             break
         if not np.isfinite(bid[entry_bar]) or not np.isfinite(ask[entry_bar]) or not np.isfinite(mid[entry_bar]):
+            _print_flat_suppress("nonfinite_quote", f"entry_bar={entry_bar}")
             i += 1
             continue
         cooldown_ok = i >= cooldown_until
@@ -1351,15 +1515,20 @@ def _simulate_day(
             cooldown_suppressed += 1
             filter_blocked = True
         if filter_blocked and strategy_mode != "absorption_failure_v2":
+            _print_flat_suppress(
+                "filter_blocked",
+                f"session_ok={bool(session_ok[entry_bar])} spread_ticks={int(spread_ticks[entry_bar])} cooldown_ok={cooldown_ok}",
+            )
             i += 1
             continue
 
-        if strategy_mode == "impulse_confirm_v1":
+        if desired_side is None and strategy_mode == "impulse_confirm_v1":
             impulse_signals_checked += 1
             impulse_ticks = impulse_ticks_series[i]
             if not np.isfinite(impulse_ticks) or abs(impulse_ticks) < impulse_min_ticks:
                 skip_reasons["impulse_failed_threshold"] += 1
                 skipped += 1
+                _print_flat_suppress("impulse_failed_threshold", f"impulse_ticks={impulse_ticks}")
                 i += 1
                 continue
             if impulse_ticks >= impulse_min_ticks:
@@ -1369,6 +1538,7 @@ def _simulate_day(
             else:
                 skip_reasons["impulse_failed_threshold"] += 1
                 skipped += 1
+                _print_flat_suppress("impulse_failed_threshold", f"impulse_ticks={impulse_ticks}")
                 i += 1
                 continue
             impulse_passed_threshold += 1
@@ -1389,13 +1559,14 @@ def _simulate_day(
             if not confirm_ok:
                 skip_reasons["impulse_failed_confirm"] += 1
                 skipped += 1
+                _print_flat_suppress("impulse_failed_confirm", f"confirm_bars={confirm_bars}")
                 i += 1
                 continue
             impulse_passed_confirm += 1
             flow = float(signed_vol[i]) if i < len(signed_vol) else 0.0
             signals_when_flat += 1
             total_signals += 1
-        elif strategy_mode == "absorption_failure_v1":
+        elif desired_side is None and strategy_mode == "absorption_failure_v1":
             afr_checked += 1
             k = max(1, int(afr_k_bars))
             if i < k or i - 1 < 0:
@@ -1436,7 +1607,7 @@ def _simulate_day(
                 continue
             signals_when_flat += 1
             total_signals += 1
-        elif strategy_mode == "absorption_failure_v2":
+        elif desired_side is None and strategy_mode == "absorption_failure_v2":
             afr2_checked += 1
             k = max(1, int(afr_k_bars))
             ft_bars = max(1, int(afr_ft_bars))
@@ -1821,7 +1992,7 @@ def _simulate_day(
 
             signals_when_flat += 1
             total_signals += 1
-        elif strategy_mode == "absorption_failure_v3":
+        elif desired_side is None and strategy_mode == "absorption_failure_v3":
             afr3_checked += 1
             k = max(1, int(afr_k_bars))
             if i < k or i - 1 < 0:
@@ -1895,7 +2066,7 @@ def _simulate_day(
             }
             signals_when_flat += 1
             total_signals += 1
-        elif strategy_mode == "lrams_breakout_v1":
+        elif desired_side is None and strategy_mode == "lrams_breakout_v1":
             k = max(1, int(afr_k_bars))
             if afr_use_mid_for_stall:
                 stall_series = mid
@@ -2088,8 +2259,9 @@ def _simulate_day(
                     desired_side = None
             else:
                 if desired_side is None:
-                    i += 1
-                    continue
+                    if lbo_break_blocked_bar_long < 0 and lbo_break_blocked_bar_short < 0:
+                        i += 1
+                        continue
 
                 break_level = (
                     absorption_level + lbo_break_ticks * tick_size
@@ -2115,12 +2287,25 @@ def _simulate_day(
                 if spread_ticks[entry_bar] > lbo_max_spread_ticks:
                     confirm_ok = False
 
-                if break_trigger and confirm_ok:
+                if break_trigger:
                     entry_reason = "rearm" if (lbo_rearm_enabled and (lbo_rearm_active_long if desired_side == "long" else lbo_rearm_active_short)) else "break"
                     entry_reason_label = "lbo_now"
                     lbo_break_ticks_entry = (mid[entry_bar] - absorption_level) / tick_size
                     lbo_flow_align_sum = flow_align_sum
                     lbo_entry_mode = "now"
+                    if entry_reason == "break":
+                        _mark_lbo_break_for_ft_on_block(
+                            entry_reason,
+                            desired_side,
+                            entry_bar,
+                            absorption_level,
+                            absorption_bar,
+                            break_level,
+                        )
+                        entry_reason = None
+                        entry_reason_label = None
+                        lbo_entry_mode = "ft_wait"
+                        lbo_break_ticks_entry = float("nan")
                     if entry_reason == "rearm":
                         if desired_side == "long":
                             lbo_rearm_used_long = True
@@ -2132,9 +2317,9 @@ def _simulate_day(
                         lbo_break_blocked_bar_long = -1
                     else:
                         lbo_break_blocked_bar_short = -1
-                elif lbo_ft_bars > 0:
+                if lbo_ft_bars > 0 and entry_reason is None:
                     ft_ok = False
-                    if desired_side == "long" and lbo_break_blocked_bar_long >= 0:
+                    if lbo_break_blocked_bar_long >= 0:
                         if entry_bar <= lbo_break_blocked_bar_long + lbo_ft_bars:
                             ft_level = lbo_break_blocked_break_level_long + lbo_ft_min_ticks * tick_size
                             abs_level = lbo_break_blocked_abs_level_long
@@ -2142,12 +2327,13 @@ def _simulate_day(
                                 if lbo_confirm_bars > 0:
                                     ft_ok = flow_align_sum >= lbo_min_flow_abs
                                 else:
-                                    ft_ok = True
+                                    ft_ok = flow_align_sum > 0.0
                                 if spread_ticks[entry_bar] > lbo_max_spread_ticks:
                                     ft_ok = False
                                 if ft_ok:
                                     entry_reason = "ft"
                                     entry_reason_label = "lbo_now"
+                                    desired_side = "long"
                                     absorption_level = lbo_break_blocked_abs_level_long
                                     absorption_bar = lbo_break_blocked_abs_bar_long
                                     break_level = lbo_break_blocked_break_level_long
@@ -2157,7 +2343,7 @@ def _simulate_day(
                                     lbo_break_blocked_bar_long = -1
                         else:
                             lbo_break_blocked_bar_long = -1
-                    elif desired_side == "short" and lbo_break_blocked_bar_short >= 0:
+                    elif lbo_break_blocked_bar_short >= 0:
                         if entry_bar <= lbo_break_blocked_bar_short + lbo_ft_bars:
                             ft_level = lbo_break_blocked_break_level_short - lbo_ft_min_ticks * tick_size
                             abs_level = lbo_break_blocked_abs_level_short
@@ -2165,12 +2351,13 @@ def _simulate_day(
                                 if lbo_confirm_bars > 0:
                                     ft_ok = flow_align_sum <= -lbo_min_flow_abs
                                 else:
-                                    ft_ok = True
+                                    ft_ok = flow_align_sum < 0.0
                                 if spread_ticks[entry_bar] > lbo_max_spread_ticks:
                                     ft_ok = False
                                 if ft_ok:
                                     entry_reason = "ft"
                                     entry_reason_label = "lbo_now"
+                                    desired_side = "short"
                                     absorption_level = lbo_break_blocked_abs_level_short
                                     absorption_bar = lbo_break_blocked_abs_bar_short
                                     break_level = lbo_break_blocked_break_level_short
@@ -2187,7 +2374,7 @@ def _simulate_day(
                 flow_align_sum = float(lbo_flow_align_sum)
             if entry_reason is None:
                 desired_side = None
-        elif strategy_mode == "micro_momo_v1":
+        elif desired_side is None and strategy_mode == "micro_momo_v1":
             k = max(1, int(micro_k_bars))
             if i >= k and np.isfinite(mid[i]) and np.isfinite(mid[i - k]):
                 dmid = mid[i] - mid[i - k]
@@ -2197,7 +2384,7 @@ def _simulate_day(
                     desired_side = "long"
                 elif impulse_ticks <= -micro_impulse_ticks and flow <= -micro_flow_min:
                     desired_side = "short"
-        elif baseline_mode == "mmas":
+        elif desired_side is None and baseline_mode == "mmas":
             mmas_signals_checked += 1
             desired_side, dmid_ticks, flow, mmas_passed = _mmas_signal(i)
             if mmas_passed:
@@ -2214,6 +2401,12 @@ def _simulate_day(
         if desired_side is None:
             i += 1
             continue
+        if flat_candidate_printed < 5:
+            print(
+                f"FLAT_CANDIDATE {symbol_str} {day_str} t={i} side={desired_side}",
+                flush=True,
+            )
+            flat_candidate_printed += 1
         if strategy_mode != "impulse_confirm_v1":
             total_signals += 1
             signals_when_flat += 1
@@ -2236,10 +2429,19 @@ def _simulate_day(
         gate_allowed = True
         gate_reason = "not_gated"
         gate_enabled = gated and not disable_gate
+        weak_side = None
+        gate_event_idx = -1
+        gate_event_age = -1
+        gate_asym_val = float("nan")
+        gate_thr_val = float("nan")
+        gate_weak_side = None
+        weak_side_dir = None
+        event_stream = None
         if gate_enabled:
             gate_allowed = True
             gate_reason = "allowed"
             if gate_mode == "side_matched":
+                event_stream = "buy" if desired_side == "long" else "sell"
                 if desired_side == "long":
                     event_pos = event_pos_buy
                     event_asym = event_asym_buy
@@ -2248,6 +2450,76 @@ def _simulate_day(
                     event_pos = event_pos_sell
                     event_asym = event_asym_sell
                     event_thr = event_thr_sell
+                weak_side = _lbo_weak_side(entry_bar)
+                weak_side_dir = None
+                if weak_side is None:
+                    gate_diag["weak_side_none"] += 1
+                    if allow_gate_on_none:
+                        gate_diag["allow_on_none"] += 1
+                        weak_side_dir = desired_side
+                        gate_reason = "allowed_none"
+                elif weak_side == "ask_weak":
+                    gate_diag["weak_side_ask"] += 1
+                    weak_side_dir = "long"
+                    event_pos = event_pos_buy
+                    event_asym = event_asym_buy
+                    event_thr = event_thr_buy
+                    event_stream = "buy"
+                else:
+                    gate_diag["weak_side_bid"] += 1
+                    weak_side_dir = "short"
+                    event_pos = event_pos_sell
+                    event_asym = event_asym_sell
+                    event_thr = event_thr_sell
+                    event_stream = "sell"
+                gate_weak_side = weak_side
+                if weak_side_dir is None:
+                    gate_allowed = False
+                    gate_reason = "blocked_none"
+                elif desired_side != weak_side_dir:
+                    gate_allowed = False
+                    gate_reason = "blocked_mismatch"
+                _log_gate_decision(
+                    gate_allowed_val=gate_allowed,
+                    gate_reason_val=gate_reason,
+                    weak_side_val=weak_side,
+                    weak_side_dir_val=weak_side_dir,
+                    desired_side_val=desired_side,
+                    event_stream_val=event_stream,
+                )
+                if not gate_allowed:
+                    skip_reasons["gated_blocked"] += 1
+                    skipped += 1
+                    blocked_signals += 1
+                    if strategy_mode == "lrams_breakout_v1":
+                        _mark_lbo_break_for_ft_on_block(
+                            entry_reason,
+                            desired_side,
+                            entry_bar,
+                            absorption_level,
+                            absorption_bar,
+                            break_level,
+                        )
+                    _mark_break_for_ft_on_block(entry_reason, desired_side, entry_bar)
+                    if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
+                        print(
+                            "MMAS_DEBUG",
+                            {
+                                "t": int(i),
+                                "dmid_ticks": float(dmid_ticks),
+                                "flow": float(flow),
+                                "spread_ticks": float(spread_ticks[entry_bar]),
+                                "gate_allowed": False,
+                                "gate_reason": gate_reason,
+                                "side": desired_side,
+                            },
+                            flush=True,
+                        )
+                        debug_mmas_printed = True
+                    if strategy_mode.startswith("absorption_failure") and desired_side is not None:
+                        _arm_rearm(desired_side, absorption_bar)
+                    i += 1
+                    continue
             else:
                 event_pos = event_pos_all
                 event_asym = event_asym_all
@@ -2259,6 +2531,14 @@ def _simulate_day(
                 blocked_signals += 1
                 gate_allowed = False
                 gate_reason = "no_recent_event"
+                _log_gate_decision(
+                    gate_allowed_val=gate_allowed,
+                    gate_reason_val=gate_reason,
+                    weak_side_val=weak_side,
+                    weak_side_dir_val=weak_side_dir,
+                    desired_side_val=desired_side,
+                    event_stream_val=event_stream,
+                )
                 if strategy_mode == "impulse_confirm_v1" and debug_first_impulse and entry_debug_printed == 0:
                     _print_impulse_debug(
                         t_idx=i,
@@ -2387,6 +2667,14 @@ def _simulate_day(
                     blocked_signals += 1
                     gate_allowed = False
                     gate_reason = "no_recent_event"
+                    _log_gate_decision(
+                        gate_allowed_val=gate_allowed,
+                        gate_reason_val=gate_reason,
+                        weak_side_val=weak_side,
+                        weak_side_dir_val=weak_side_dir,
+                        desired_side_val=desired_side,
+                        event_stream_val=event_stream,
+                    )
                     if strategy_mode == "impulse_confirm_v1" and debug_first_impulse and entry_debug_printed == 0:
                         _print_impulse_debug(
                             t_idx=i,
@@ -2531,6 +2819,14 @@ def _simulate_day(
                     blocked_signals += 1
                     gate_allowed = False
                     gate_reason = "no_event_in_window"
+                    _log_gate_decision(
+                        gate_allowed_val=gate_allowed,
+                        gate_reason_val=gate_reason,
+                        weak_side_val=weak_side,
+                        weak_side_dir_val=weak_side_dir,
+                        desired_side_val=desired_side,
+                        event_stream_val=event_stream,
+                    )
                     if strategy_mode == "impulse_confirm_v1" and debug_first_impulse and entry_debug_printed == 0:
                         _print_impulse_debug(
                             t_idx=i,
@@ -2631,6 +2927,14 @@ def _simulate_day(
                         blocked_signals += 1
                         gate_allowed = False
                         gate_reason = "no_threshold_yet"
+                        _log_gate_decision(
+                            gate_allowed_val=gate_allowed,
+                            gate_reason_val=gate_reason,
+                            weak_side_val=weak_side,
+                            weak_side_dir_val=weak_side_dir,
+                            desired_side_val=desired_side,
+                            event_stream_val=event_stream,
+                        )
                         if strategy_mode == "impulse_confirm_v1" and debug_first_impulse and entry_debug_printed == 0:
                             _print_impulse_debug(
                                 t_idx=i,
@@ -2749,136 +3053,147 @@ def _simulate_day(
                             debug_mmas_printed = True
                         if strategy_mode.startswith("absorption_failure") and desired_side is not None:
                             _arm_rearm(desired_side, absorption_bar)
-                        i += 1
-                        continue
-                    else:
-                        eligible_signals += 1
-                        if event_asym[idx_pos] >= thr:
-                            skip_reasons["gated_blocked"] += 1
-                            skipped += 1
-                            blocked_signals += 1
-                            gate_allowed = False
-                            gate_reason = "gated_blocked"
-                            if strategy_mode == "impulse_confirm_v1" and debug_first_impulse and entry_debug_printed == 0:
-                                _print_impulse_debug(
-                                    t_idx=i,
-                                    impulse_val=impulse_ticks,
-                                    spread_val=spread_ticks[entry_bar],
-                                    cooldown_ok_val=cooldown_ok,
-                                    gate_allowed_val=False,
-                                    gate_reason_val=gate_reason,
-                                    desired_side_val=desired_side,
-                                    entry_action_val="blocked",
-                                )
-                                entry_debug_printed += 1
-                            if strategy_mode == "absorption_failure_v1" and debug_first_afr and entry_debug_printed == 0:
-                                _print_afr_debug(
-                                    t_idx=i,
-                                    flow_val=flow,
-                                    stall_val=stall_ticks,
-                                    break_val=break_ticks,
-                                    spread_val=spread_ticks[entry_bar],
-                                    cooldown_ok_val=cooldown_ok,
-                                    session_ok_val=bool(session_ok[entry_bar]),
-                                    gate_allowed_val=False,
-                                    gate_reason_val=gate_reason,
-                                    desired_side_val=desired_side,
-                                    absorption_pass_val=True,
-                                    break_pass_val=True,
-                                    entry_taken_val=False,
-                                    tp_ticks_val=int(afr_tp_ticks) if afr_tp_ticks is not None else int(tp_ticks),
-                                    sl_ticks_val=int(afr_sl_ticks) if afr_sl_ticks is not None else int(sl_ticks),
-                                    hold_bars_val=int(afr_max_hold_bars) if afr_max_hold_bars is not None else int(hold_bars),
-                                    breakeven_ticks_val=afr_breakeven_after_ticks,
-                                    entry_action_val="blocked",
-                                )
-                                entry_debug_printed += 1
-                            if strategy_mode == "absorption_failure_v2" and debug_first_afr2 and entry_debug_printed == 0:
-                                _print_afr2_debug(
-                                    t_idx=afr_t_idx,
-                                    tf_idx=afr_tf_idx,
-                                    flow_val=flow,
-                                    stall_val=stall_ticks,
-                                    break_val=break_ticks,
-                                    ft_val=ft_progress_ticks,
-                                    spread_val=spread_ticks[entry_bar],
-                                    cooldown_ok_val=cooldown_ok,
-                                    session_ok_val=bool(session_ok[entry_bar]),
-                                    gate_allowed_val=False,
-                                    gate_reason_val=gate_reason,
-                                    desired_side_val=desired_side,
-                                    entry_action_val="blocked",
-                                )
-                                entry_debug_printed += 1
-                            if strategy_mode == "absorption_failure_v2" and debug_first_afr and entry_debug_printed == 0:
-                                _print_afr_debug(
-                                    t_idx=entry_bar,
-                                    flow_val=flow,
-                                    stall_val=stall_ticks,
-                                    break_val=break_ticks,
-                                    spread_val=spread_ticks[entry_bar],
-                                    cooldown_ok_val=cooldown_ok,
-                                    session_ok_val=bool(session_ok[entry_bar]),
-                                    gate_allowed_val=False,
-                                    gate_reason_val=gate_reason,
-                                    desired_side_val=desired_side,
-                                    absorption_pass_val=True,
-                                    break_pass_val=True,
-                                    entry_taken_val=False,
-                                    tp_ticks_val=int(afr_tp_ticks) if afr_tp_ticks is not None else int(tp_ticks),
-                                    sl_ticks_val=int(afr_sl_ticks) if afr_sl_ticks is not None else int(sl_ticks),
-                                    hold_bars_val=int(afr_max_hold_bars) if afr_max_hold_bars is not None else int(hold_bars),
-                                    breakeven_ticks_val=afr_breakeven_after_ticks,
-                                    entry_action_val="blocked",
-                                )
-                                entry_debug_printed += 1
-                            if strategy_mode == "absorption_failure_v3" and debug_first_afr3 and entry_debug_printed == 0 and afr3_candidate:
-                                _print_afr3_debug(
-                                    t_idx=i,
-                                    flow_val=flow,
-                                    spread_val=spread_ticks[i],
-                                    cooldown_ok_val=cooldown_ok,
-                                    session_ok_val=bool(session_ok[entry_bar]),
-                                    gate_allowed_val=False,
-                                    gate_reason_val=gate_reason,
-                                    desired_side_val=desired_side,
-                                    absorption_pass_val=True,
-                                    break_pass_val=True,
-                                    break_quality_pass_val=True,
-                                    snapback_pass_val=True,
-                                    entry_taken_val=False,
-                                    entry_action_val="blocked",
-                                )
-                                entry_debug_printed += 1
-                            if strategy_mode == "lrams_breakout_v1":
-                                _mark_lbo_break_for_ft_on_block(
-                                    entry_reason,
-                                    desired_side,
-                                    entry_bar,
-                                    absorption_level,
-                                    absorption_bar,
-                                    break_level,
-                                )
-                            _mark_break_for_ft_on_block(entry_reason, desired_side, entry_bar)
-                            if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
-                                print(
-                                    "MMAS_DEBUG",
-                                    {
-                                        "t": int(i),
-                                        "dmid_ticks": float(dmid_ticks),
-                                        "flow": float(flow),
-                                        "spread_ticks": float(spread_ticks[entry_bar]),
-                                        "gate_allowed": False,
-                                        "gate_reason": gate_reason,
-                                        "side": desired_side,
-                                    },
-                                    flush=True,
-                                )
-                                debug_mmas_printed = True
-                            if strategy_mode.startswith("absorption_failure") and desired_side is not None:
-                                _arm_rearm(desired_side, absorption_bar)
-                            i += 1
-                            continue
+                    i += 1
+                    continue
+            eligible_signals += 1
+            gate_event_idx = int(idx_pos)
+            gate_event_age = int(entry_bar - int(event_pos[idx_pos]))
+            gate_asym_val = float(event_asym[idx_pos])
+            gate_thr_val = float(event_thr[idx_pos])
+            if event_asym[idx_pos] >= thr:
+                skip_reasons["gated_blocked"] += 1
+                skipped += 1
+                blocked_signals += 1
+                gate_allowed = False
+                gate_reason = "gated_blocked"
+                _log_gate_decision(
+                    gate_allowed_val=gate_allowed,
+                    gate_reason_val=gate_reason,
+                    weak_side_val=weak_side,
+                    weak_side_dir_val=weak_side_dir,
+                    desired_side_val=desired_side,
+                    event_stream_val=event_stream,
+                )
+                if strategy_mode == "impulse_confirm_v1" and debug_first_impulse and entry_debug_printed == 0:
+                    _print_impulse_debug(
+                        t_idx=i,
+                        impulse_val=impulse_ticks,
+                        spread_val=spread_ticks[entry_bar],
+                        cooldown_ok_val=cooldown_ok,
+                        gate_allowed_val=False,
+                        gate_reason_val=gate_reason,
+                        desired_side_val=desired_side,
+                        entry_action_val="blocked",
+                    )
+                    entry_debug_printed += 1
+                if strategy_mode == "absorption_failure_v1" and debug_first_afr and entry_debug_printed == 0:
+                    _print_afr_debug(
+                        t_idx=i,
+                        flow_val=flow,
+                        stall_val=stall_ticks,
+                        break_val=break_ticks,
+                        spread_val=spread_ticks[entry_bar],
+                        cooldown_ok_val=cooldown_ok,
+                        session_ok_val=bool(session_ok[entry_bar]),
+                        gate_allowed_val=False,
+                        gate_reason_val=gate_reason,
+                        desired_side_val=desired_side,
+                        absorption_pass_val=True,
+                        break_pass_val=True,
+                        entry_taken_val=False,
+                        tp_ticks_val=int(afr_tp_ticks) if afr_tp_ticks is not None else int(tp_ticks),
+                        sl_ticks_val=int(afr_sl_ticks) if afr_sl_ticks is not None else int(sl_ticks),
+                        hold_bars_val=int(afr_max_hold_bars) if afr_max_hold_bars is not None else int(hold_bars),
+                        breakeven_ticks_val=afr_breakeven_after_ticks,
+                        entry_action_val="blocked",
+                    )
+                    entry_debug_printed += 1
+                if strategy_mode == "absorption_failure_v2" and debug_first_afr2 and entry_debug_printed == 0:
+                    _print_afr2_debug(
+                        t_idx=afr_t_idx,
+                        tf_idx=afr_tf_idx,
+                        flow_val=flow,
+                        stall_val=stall_ticks,
+                        break_val=break_ticks,
+                        ft_val=ft_progress_ticks,
+                        spread_val=spread_ticks[entry_bar],
+                        cooldown_ok_val=cooldown_ok,
+                        session_ok_val=bool(session_ok[entry_bar]),
+                        gate_allowed_val=False,
+                        gate_reason_val=gate_reason,
+                        desired_side_val=desired_side,
+                        entry_action_val="blocked",
+                    )
+                    entry_debug_printed += 1
+                if strategy_mode == "absorption_failure_v2" and debug_first_afr and entry_debug_printed == 0:
+                    _print_afr_debug(
+                        t_idx=entry_bar,
+                        flow_val=flow,
+                        stall_val=stall_ticks,
+                        break_val=break_ticks,
+                        spread_val=spread_ticks[entry_bar],
+                        cooldown_ok_val=cooldown_ok,
+                        session_ok_val=bool(session_ok[entry_bar]),
+                        gate_allowed_val=False,
+                        gate_reason_val=gate_reason,
+                        desired_side_val=desired_side,
+                        absorption_pass_val=True,
+                        break_pass_val=True,
+                        entry_taken_val=False,
+                        tp_ticks_val=int(afr_tp_ticks) if afr_tp_ticks is not None else int(tp_ticks),
+                        sl_ticks_val=int(afr_sl_ticks) if afr_sl_ticks is not None else int(sl_ticks),
+                        hold_bars_val=int(afr_max_hold_bars) if afr_max_hold_bars is not None else int(hold_bars),
+                        breakeven_ticks_val=afr_breakeven_after_ticks,
+                        entry_action_val="blocked",
+                    )
+                    entry_debug_printed += 1
+                if strategy_mode == "absorption_failure_v3" and debug_first_afr3 and entry_debug_printed == 0 and afr3_candidate:
+                    _print_afr3_debug(
+                        t_idx=i,
+                        flow_val=flow,
+                        spread_val=spread_ticks[i],
+                        cooldown_ok_val=cooldown_ok,
+                        session_ok_val=bool(session_ok[entry_bar]),
+                        gate_allowed_val=False,
+                        gate_reason_val=gate_reason,
+                        desired_side_val=desired_side,
+                        absorption_pass_val=True,
+                        break_pass_val=True,
+                        break_quality_pass_val=True,
+                        snapback_pass_val=True,
+                        entry_taken_val=False,
+                        entry_action_val="blocked",
+                    )
+                    entry_debug_printed += 1
+                if strategy_mode == "lrams_breakout_v1":
+                    _mark_lbo_break_for_ft_on_block(
+                        entry_reason,
+                        desired_side,
+                        entry_bar,
+                        absorption_level,
+                        absorption_bar,
+                        break_level,
+                    )
+                _mark_break_for_ft_on_block(entry_reason, desired_side, entry_bar)
+                if baseline_mode == "mmas" and debug_first_mmas and (not debug_mmas_printed) and mmas_passed:
+                    print(
+                        "MMAS_DEBUG",
+                        {
+                            "t": int(i),
+                            "dmid_ticks": float(dmid_ticks),
+                            "flow": float(flow),
+                            "spread_ticks": float(spread_ticks[entry_bar]),
+                            "gate_allowed": False,
+                            "gate_reason": gate_reason,
+                            "side": desired_side,
+                        },
+                        flush=True,
+                    )
+                    debug_mmas_printed = True
+                if strategy_mode.startswith("absorption_failure") and desired_side is not None:
+                    _arm_rearm(desired_side, absorption_bar)
+                i += 1
+                continue
             if (
                 debug_first_mmas
                 and (not debug_mmas_printed)
@@ -2919,6 +3234,9 @@ def _simulate_day(
                 flush=True,
             )
             debug_mmas_printed = True
+
+        if gate_enabled and gate_allowed:
+            gate_diag["allowed_count"] += 1
 
         if strategy_mode == "impulse_confirm_v1" and debug_first_impulse and entry_debug_printed == 0:
             _print_impulse_debug(
@@ -3045,6 +3363,7 @@ def _simulate_day(
             "sl_level": float(sl_level),
             "entry_spread_ticks": entry_spread_ticks,
             "sl_ticks": int(sl_ticks_local),
+            "tp_ticks": int(tp_ticks_local),
             "breakeven_ticks": breakeven_ticks_local,
             "breakeven_set": False,
             "breakeven_triggered": False,
@@ -3067,6 +3386,14 @@ def _simulate_day(
             "lbo_flow_align_sum": float(lbo_flow_align_sum),
             "side": desired_side,
         }
+        if gated and gate_enabled:
+            print(
+                f"GATE_ENTRY {symbol_str} {day_str} mode={gate_mode} "
+                f"desired_side={desired_side} weak_side={gate_weak_side} "
+                f"event_idx={gate_event_idx} event_age_bars={gate_event_age} "
+                f"asym={gate_asym_val:.6f} thr={gate_thr_val:.6f}",
+                flush=True,
+            )
         in_position = True
         entries_taken += 1
         if strategy_mode == "impulse_confirm_v1":
@@ -3082,6 +3409,13 @@ def _simulate_day(
                 lbo_confirm_entered += 1
             elif lbo_entry_mode == "pullback":
                 lbo_pull_resumed_entered += 1
+        if gate_debug and gated and gate_enabled and flat_candidate_printed < 5:
+            print(
+                f"GATE_DEBUG {symbol_str} {day_str} entry_bar={entry_bar} desired_side={desired_side} "
+                f"weak_side={gate_weak_side} stream={'buy' if event_pos is event_pos_buy else 'sell'} "
+                f"gate_decision={'allow' if gate_allowed else gate_reason}",
+                flush=True,
+            )
         impulse_for_entry = impulse_ticks if np.isfinite(impulse_ticks) else dmid_ticks
         if np.isfinite(impulse_for_entry):
             entry_impulse_sum += float(impulse_for_entry)
@@ -3132,6 +3466,23 @@ def _simulate_day(
                 pass
             entry_debug_printed += 1
         i = entry_bar + 1
+
+    print(
+        f"DAY_STATE {symbol_str} {day_str} signals_total={total_signals} "
+        f"signals_when_flat={signals_when_flat} signals_in_position={signals_in_position} "
+        f"in_position={in_position} entry_bar={int(pos.get('entry_bar', -1)) if pos else -1} "
+        f"exit_bar={int(pos.get('exit_bar', -1)) if pos else -1}",
+        flush=True,
+    )
+    skip_total = sum(skip_reasons.values())
+    if skip_total != skipped:
+        print(
+            f"SKIP_MISMATCH {symbol_str} {day_str} skipped={skipped} sum={skip_total} reasons={skip_reasons}",
+            flush=True,
+        )
+        raise RuntimeError(
+            f"Skip reasons mismatch: sum={skip_total} skipped={skipped} day={day_str} mode={gate_mode}"
+        )
 
     return (
         pd.DataFrame(trades),
@@ -3214,6 +3565,7 @@ def _simulate_day(
         impulse_passed_confirm,
         impulse_entered,
         skip_reasons,
+        gate_diag,
     )
 
 
@@ -3231,7 +3583,7 @@ def _equity_stats(pnl: np.ndarray) -> Dict[str, float]:
 
 
 def _metrics(trades: pd.DataFrame) -> Dict[str, float]:
-    if trades.empty:
+    if trades.empty or "pnl_ticks" not in trades.columns:
         return {
             "trade_count": 0,
             "total_pnl_ticks": 0.0,
@@ -3468,6 +3820,8 @@ def main() -> None:
     afr_rearm_stop_max_bars = int(_arg_or_env("afr_rearm_stop_max_bars", "AFR_REARM_STOP_MAX_BARS", "3"))
     afr_momentum_decay_bars = int(_arg_or_env("afr_momentum_decay_bars", "AFR_MOMENTUM_DECAY_BARS", "3"))
     afr_momentum_decay_min_flow = float(_arg_or_env("afr_momentum_decay_min_flow", "AFR_MOMENTUM_DECAY_MIN_FLOW", "0"))
+    print("ENV EXIT_MODE =", os.getenv("EXIT_MODE"), flush=True)
+    exit_mode = os.environ.get("EXIT_MODE", "").strip().lower()
     afr3_break_min_flow_abs = float(os.environ.get("AFR3_BREAK_MIN_FLOW_ABS", "100"))
     afr3_break_max_spread_ticks = int(os.environ.get("AFR3_BREAK_MAX_SPREAD_TICKS", "2"))
     afr3_snapback_check = os.environ.get("AFR3_SNAPBACK_CHECK", "1").strip() == "1"
@@ -3497,6 +3851,9 @@ def main() -> None:
     lbo_be_env = os.environ.get("LBO_BREAKEVEN_AFTER_TICKS", "").strip()
     lbo_breakeven_after_ticks = int(lbo_be_env) if lbo_be_env else None
     lbo_ignore_thr = os.environ.get("LBO_IGNORE_THR", "0").strip() == "1"
+    lbo_ignore_thr_override = os.environ.get("LBO_IGNORE_THR_OVERRIDE", "").strip()
+    if lbo_ignore_thr_override:
+        lbo_ignore_thr = lbo_ignore_thr_override == "1"
     lbo_flip_direction = os.environ.get("LBO_FLIP_DIRECTION", "0").strip() == "1"
     lbo_flip_mapping_env = os.environ.get("LBO_FLIP_MAPPING", "").strip()
     if lbo_flip_mapping_env:
@@ -3514,6 +3871,8 @@ def main() -> None:
     lbo_pullback_max_bars = int(os.environ.get("LBO_PULLBACK_MAX_BARS", "10"))
     lbo_resume_ticks = int(os.environ.get("LBO_RESUME_TICKS", "1"))
     lbo_resume_max_bars = int(os.environ.get("LBO_RESUME_MAX_BARS", "5"))
+    allow_gate_on_none = os.environ.get("ALLOW_GATE_ON_NONE", "0").strip().lower() in {"1", "true", "yes", "y"}
+    gate_debug = os.environ.get("GATE_DEBUG", "0").strip().lower() in {"1", "true", "yes", "y"}
     if strategy_mode == "absorption_failure_v2":
         if afr_tp_ticks is None:
             afr_tp_ticks = 3
@@ -3662,6 +4021,15 @@ def main() -> None:
         print("RUN_MODE: gated_only (no baseline)", flush=True)
     else:
         print("RUN_MODE: baseline_vs_gated (default)", flush=True)
+    # Testing:
+    #  - Strict gate:
+    #    set EXIT_MODE=exit_sm_v1
+    #    set ALLOW_GATE_ON_NONE=0
+    #    python scripts\run_lrams_gate_backtest.py
+    #  - Debug gate:
+    #    set ALLOW_GATE_ON_NONE=1
+    #  - Optional:
+    #    set GATE_DEBUG=1
     if strategy_mode == "impulse_confirm_v1":
         print(
             "Impulse config:",
@@ -3816,6 +4184,7 @@ def main() -> None:
                             "strategy_mode": strategy_mode,
                             "W": gate_lookback_bars,
                             "gate_mode": gate_mode,
+                            "exit_mode": os.getenv("EXIT_MODE"),
                             "afr_min_flow_abs": afr_min_flow_abs_cur,
                             "afr_ft_bars": afr_ft_bars_cur,
                             "disable_gate": disable_gate,
@@ -3980,6 +4349,7 @@ def main() -> None:
                                     impulse_passed_confirm_base,
                                     impulse_entered_base,
                                     skip_base,
+                                    gate_diag_base,
                                 ) = _simulate_day(
                                     df_day,
                                     events_day,
@@ -4057,6 +4427,8 @@ def main() -> None:
                             lbo_pullback_ticks=lbo_pullback_ticks,
                             lbo_resume_ticks=lbo_resume_ticks,
                             lbo_resume_max_bars=lbo_resume_max_bars,
+                            allow_gate_on_none=allow_gate_on_none,
+                            gate_debug=gate_debug,
                             debug_first_afr=debug_first_afr,
                             debug_first_afr2=debug_first_afr2,
                                     afr_scratch_bars=afr_scratch_bars,
@@ -4080,6 +4452,7 @@ def main() -> None:
                                     debug_entry_print=debug_entry,
                                     debug_entry_limit=5,
                                     debug_entry_tag="baseline",
+                                    exit_mode=exit_mode,
                                 )
                             else:
                                 trades_base = pd.DataFrame({"pnl_ticks": pd.Series(dtype=float)})
@@ -4243,6 +4616,7 @@ def main() -> None:
                                 impulse_passed_confirm_gate,
                                 impulse_entered_gate,
                                 skip_gate,
+                                gate_diag,
                             ) = _simulate_day(
                                 df_day,
                                 events_day,
@@ -4320,6 +4694,8 @@ def main() -> None:
                         lbo_pullback_ticks=lbo_pullback_ticks,
                         lbo_resume_ticks=lbo_resume_ticks,
                         lbo_resume_max_bars=lbo_resume_max_bars,
+                        allow_gate_on_none=allow_gate_on_none,
+                        gate_debug=gate_debug,
                         debug_first_afr=debug_first_afr,
                         debug_first_afr2=debug_first_afr2,
                                 afr_scratch_bars=afr_scratch_bars,
@@ -4343,16 +4719,19 @@ def main() -> None:
                                 debug_entry_print=debug_entry,
                                 debug_entry_limit=5,
                                 debug_entry_tag="gated",
+                                exit_mode=exit_mode,
                             )
                             if disable_gate:
                                 blocked_gate = 0
                                 eligible_gate = signals_flat_gate
 
                             if not sample_printed and day == selected_days[0]:
-                                gate_eq = _equity_stats(trades_gate["pnl_ticks"].to_numpy())
+                                gate_pnl = trades_gate.get("pnl_ticks", pd.Series(dtype=float)).to_numpy()
+                                gate_eq = _equity_stats(gate_pnl)
                                 gate_stats_sample = _metrics(trades_gate)
                                 if run_baseline:
-                                    base_eq = _equity_stats(trades_base["pnl_ticks"].to_numpy())
+                                    base_pnl = trades_base.get("pnl_ticks", pd.Series(dtype=float)).to_numpy()
+                                    base_eq = _equity_stats(base_pnl)
                                     base_stats_sample = _metrics(trades_base)
                                     print(
                                         f"Sample day {instrument} {day} W={gate_lookback_bars} mode={gate_mode} "
@@ -4490,6 +4869,18 @@ def main() -> None:
                                     f"entries_blocked_by_gate={blocked_gate} coverage={gate_stats['coverage']:.2%}",
                                     flush=True,
                                 )
+                                if gate_mode == "side_matched":
+                                    print(
+                                        f"GATE_DIAG {instrument} {day} W={gate_lookback_bars} mode={gate_mode} "
+                                        f"weak_side_bid={gate_diag.get('weak_side_bid', 0)} "
+                                        f"weak_side_ask={gate_diag.get('weak_side_ask', 0)} "
+                                        f"weak_side_none={gate_diag.get('weak_side_none', 0)} "
+                                        f"blocked_none={gate_diag.get('blocked_none', 0)} "
+                                        f"blocked_mismatch={gate_diag.get('blocked_mismatch', 0)} "
+                                        f"allowed_count={gate_diag.get('allowed_count', 0)} "
+                                        f"allow_on_none={gate_diag.get('allow_on_none', 0)}",
+                                        flush=True,
+                                    )
                                 skipped_days.append(
                                     f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode}: {','.join(drop_reasons)} "
                                     f"signals_when_flat={signals_flat_base} baseline_trades={entries_taken_base} "
@@ -4597,6 +4988,68 @@ def main() -> None:
                                 f"spread_supp={spread_supp_gate} cooldown_supp={cooldown_supp_gate}",
                                 flush=True,
                             )
+                            if gate_mode == "side_matched":
+                                print(
+                                    f"{instrument} {day} gate_diag weak_side_bid={gate_diag.get('weak_side_bid', 0)} "
+                                    f"weak_side_ask={gate_diag.get('weak_side_ask', 0)} "
+                                    f"weak_side_none={gate_diag.get('weak_side_none', 0)} "
+                                    f"blocked_none={gate_diag.get('blocked_none', 0)} "
+                                    f"blocked_mismatch={gate_diag.get('blocked_mismatch', 0)} "
+                                    f"allowed_count={gate_diag.get('allowed_count', 0)} "
+                                    f"allow_on_none={gate_diag.get('allow_on_none', 0)}",
+                                    flush=True,
+                                )
+                            if not trades_gate.empty and "mfe_ticks" in trades_gate.columns:
+                                gate_mfe = trades_gate["mfe_ticks"].to_numpy()
+                                gate_pnl = trades_gate["pnl_ticks"].to_numpy() if "pnl_ticks" in trades_gate.columns else np.array([])
+                                touched = gate_mfe >= 1.0
+                                touch_plus1_count = int(np.sum(touched))
+                                touch_plus1_nonpos = int(np.sum(touched & (gate_pnl <= 0.0))) if gate_pnl.size else 0
+                                touch_plus1_pos = int(np.sum(touched & (gate_pnl > 0.0))) if gate_pnl.size else 0
+                                if "bars_to_plus1" in trades_gate.columns:
+                                    bars_to_plus1 = trades_gate.loc[touched, "bars_to_plus1"]
+                                    bars_to_plus1 = bars_to_plus1[bars_to_plus1 >= 0].to_numpy()
+                                else:
+                                    bars_to_plus1 = np.array([])
+                                avg_bars_to_plus1 = float(np.mean(bars_to_plus1)) if bars_to_plus1.size else 0.0
+                            else:
+                                touch_plus1_count = 0
+                                touch_plus1_nonpos = 0
+                                touch_plus1_pos = 0
+                                avg_bars_to_plus1 = 0.0
+                            print(
+                                f"EXIT_DIAG {instrument} {day} gated_trades={entries_taken_gate} "
+                                f"touch+1={touch_plus1_count} touch+1_nonpos={touch_plus1_nonpos} "
+                                f"touch+1_pos={touch_plus1_pos} avg_bars_to+1={avg_bars_to_plus1:.2f}",
+                                flush=True,
+                            )
+                            if not trades_gate.empty:
+                                debug_rows = trades_gate.head(5)
+                                for _, row in debug_rows.iterrows():
+                                    mfe_ticks = float(row.get("mfe_ticks", 0.0))
+                                    entry_px = float(row.get("entry_px", float("nan")))
+                                    best_fav_px = (
+                                        entry_px + mfe_ticks * tick_size
+                                        if row.get("side") == "long"
+                                        else entry_px - mfe_ticks * tick_size
+                                    )
+                                    bars_held = int(row.get("exit_bar", 0)) - int(row.get("entry_bar", 0))
+                                    print(
+                                        f"TRADE_DEBUG {instrument} {day} side={row.get('side')} "
+                                        f"entry_px={entry_px:.2f} best_fav_px={best_fav_px:.2f} "
+                                        f"mfe_ticks={mfe_ticks:.2f} exit_reason={row.get('exit_reason')} "
+                                        f"bars_held={bars_held}",
+                                        flush=True,
+                                    )
+                                for _, row in trades_gate.iterrows():
+                                    pnl = float(row.get("pnl_ticks", 0.0))
+                                    if pnl in (0.0, -1.0):
+                                        print(
+                                            f"EXIT_SANITY {instrument} {day} side={row.get('side')} "
+                                            f"pnl_ticks={pnl:.2f} exit_reason={row.get('exit_reason')} "
+                                            f"exit_mode={row.get('exit_mode', '')}",
+                                            flush=True,
+                                        )
                             base_cooldown_reduction = cooldown_supp_base / max(1, (signals_flat_base + cooldown_supp_base))
                             gate_cooldown_reduction = cooldown_supp_gate / max(1, (signals_flat_gate + cooldown_supp_gate))
                             print(
@@ -4915,11 +5368,27 @@ def main() -> None:
                                     else 0.0,
                                 }
                             )
-                            if sum(skip_gate.values()) != skipped_gate:
+                            skip_reason_keys = list(skip_gate.keys())
+                            if sum(skip_gate[k] for k in skip_reason_keys) != skipped_gate:
                                 raise RuntimeError(
-                                    f"Skip reasons mismatch: sum={sum(skip_gate.values())} skipped={skipped_gate} "
-                                    f"day={day} W={gate_lookback_bars} mode={gate_mode}"
+                                    f"Skip reasons mismatch: sum={sum(skip_gate[k] for k in skip_reason_keys)} "
+                                    f"skipped={skipped_gate} day={day} W={gate_lookback_bars} mode={gate_mode}"
                                 )
+                            if gate_mode == "side_matched":
+                                blocked_diag = int(gate_diag.get("blocked_none", 0)) + int(
+                                    gate_diag.get("blocked_mismatch", 0)
+                                )
+                                if blocked_diag != blocked_gate:
+                                    raise RuntimeError(
+                                        f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode} "
+                                        f"blocked_none+blocked_mismatch={blocked_diag} blocked_total={blocked_gate}"
+                                    )
+                                allowed_count = int(gate_diag.get("allowed_count", 0))
+                                if blocked_diag + allowed_count != signals_flat_gate:
+                                    raise RuntimeError(
+                                        f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode} "
+                                        f"blocked+allowed={blocked_diag + allowed_count} signals_when_flat={signals_flat_gate}"
+                                    )
                             if strategy_mode != "impulse_confirm_v1" and entries_taken_base != signals_flat_base:
                                 raise RuntimeError(
                                     f"Baseline entries mismatch: entries_taken={entries_taken_base} "
