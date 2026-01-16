@@ -494,7 +494,20 @@ def _simulate_day(
     debug_entry_print: bool,
     debug_entry_limit: int,
     debug_entry_tag: str,
+    exit_debug: bool,
     exit_mode: str,
+    validate_bars: int,
+    min_progress_ticks: int,
+    be_arm_ticks: int,
+    be_offset_ticks: int,
+    decay_bars: int,
+    scratch_bars: int,
+    scratch_min_progress_ticks: int,
+    be_after_ticks: int,
+    decay_min_flow: float,
+    be_grace_bars: int,
+    scratch_require_mfe_ticks: int,
+    scratch_grace_bars: int,
 ) -> Tuple[object, ...]:
     bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
     ask = pd.to_numeric(df_day["ask_price_1"], errors="coerce").to_numpy()
@@ -1119,6 +1132,8 @@ def _simulate_day(
     flat_suppress_printed = 0
     event_debug_printed = False
     use_exit_sm_v1 = exit_mode == "exit_sm_v1"
+    use_exit_sm_v2 = exit_mode == "exit_sm_v2"
+    use_exit_exec_v2 = exit_mode == "exit_exec_v2"
     exit_sm_warned = False
     if (not event_debug_printed) and event_pos_all.size:
         print(
@@ -1158,7 +1173,13 @@ def _simulate_day(
             pnl_ticks = float("nan")
             exit_reason = str(pos.get("exit_reason", "TIME"))
             sl_ticks_local = int(pos.get("sl_ticks", sl_ticks))
-            if use_exit_sm_v1:
+            if use_exit_exec_v2:
+                # exit_exec_v2 uses executable prices for triggers and fills.
+                pass
+            elif use_exit_sm_v2:
+                # exit_sm_v2 uses executable prices for triggers and fills.
+                pass
+            elif use_exit_sm_v1:
                 # exit_sm_v1 not implemented in this build; fall back to legacy exits explicitly.
                 if not exit_sm_warned:
                     print("Warning: exit_sm_v1 selected; using legacy exits.", flush=True)
@@ -1198,21 +1219,114 @@ def _simulate_day(
                             pos["breakeven_set"] = True
                             pos["breakeven_triggered"] = True
                             sl_level = float(pos["sl_level"])
-                    if side == "long":
-                        if mark_px >= tp_level:
-                            pos["exit_bar"] = i
-                            pos["exit_reason"] = "TP"
-                        elif mark_px <= sl_level:
+                    if use_exit_exec_v2:
+                        u_ticks = float(pnl_mark)
+                        prev_mfe = float(pos.get("mfe_ticks", 0.0))
+                        if u_ticks > prev_mfe:
+                            pos["last_best_bar"] = int(i)
+                        age_bars = int(i - entry_bar)
+                        sl_ticks_local = int(pos.get("sl_ticks", sl_ticks))
+                        tp_ticks_local = int(pos.get("tp_ticks", tp_ticks))
+                        tp_level_exec = float(entry_px + tp_ticks_local * tick_size) if side == "long" else float(
+                            entry_px - tp_ticks_local * tick_size
+                        )
+                        sl_level_exec = float(entry_px - sl_ticks_local * tick_size) if side == "long" else float(
+                            entry_px + sl_ticks_local * tick_size
+                        )
+                        if side == "long":
+                            sl_hit = mark_px <= sl_level_exec
+                            tp_hit = mark_px >= tp_level_exec
+                        else:
+                            sl_hit = mark_px >= sl_level_exec
+                            tp_hit = mark_px <= tp_level_exec
+                        if float(pos.get("mfe_ticks", 0.0)) >= float(be_arm_ticks):
+                            if not pos.get("be_armed", False):
+                                pos["be_armed"] = True
+                                pos["be_arm_bar"] = int(i)
+                        against = (afr_flow_series[i] <= -decay_min_flow) if side == "long" else (
+                            afr_flow_series[i] >= decay_min_flow
+                        )
+                        decay_count = int(pos.get("decay_flow_count", 0))
+                        decay_count = decay_count + 1 if against else 0
+                        pos["decay_flow_count"] = decay_count
+                        if sl_hit:
                             pos["exit_bar"] = i
                             pos["exit_reason"] = "SL"
+                        elif tp_hit:
+                            pos["exit_bar"] = i
+                            pos["exit_reason"] = "TP"
+                        else:
+                            be_armed = bool(pos.get("be_armed", False))
+                            be_arm_bar = int(pos.get("be_arm_bar", entry_bar))
+                            be_limit_active = be_armed and (i - be_arm_bar) <= int(be_grace_bars)
+                            if be_limit_active and (
+                                (side == "long" and mark_px >= entry_px) or (side == "short" and mark_px <= entry_px)
+                            ):
+                                pos["exit_bar"] = i
+                                pos["exit_reason"] = "BE_LIMIT"
+                                pos["breakeven_set"] = True
+                                pos["exit_on_be"] = True
+                            else:
+                                scratch_condition = age_bars >= int(scratch_bars) and float(pos.get("mfe_ticks", 0.0)) < float(
+                                    scratch_min_progress_ticks
+                                )
+                                if scratch_condition and float(pos.get("mfe_ticks", 0.0)) >= float(scratch_require_mfe_ticks):
+                                    if pos.get("scratch_start_bar") is None:
+                                        pos["scratch_start_bar"] = int(i)
+                                    scratch_start = int(pos.get("scratch_start_bar", i))
+                                    if (i - scratch_start) >= int(scratch_grace_bars):
+                                        pos["exit_bar"] = i
+                                        pos["exit_reason"] = "SCRATCH"
+                                if pos.get("exit_reason") == "TIME" and decay_count >= int(decay_bars):
+                                    pos["exit_bar"] = i
+                                    pos["exit_reason"] = "DECAY"
+                        if pos.get("exit_reason") == "TIME" and i >= int(pos.get("exit_bar", entry_bar)):
+                            pos["exit_bar"] = i
+                            pos["exit_reason"] = "TIME"
+                    elif use_exit_sm_v2:
+                        u_ticks = float(pnl_mark)
+                        prev_mfe = float(pos.get("mfe_ticks", 0.0))
+                        if u_ticks > prev_mfe:
+                            pos["last_best_bar"] = int(i)
+                        age_bars = int(i - entry_bar)
+                        sl_ticks_local = int(pos.get("sl_ticks", sl_ticks))
+                        if u_ticks <= -float(sl_ticks_local):
+                            pos["exit_bar"] = i
+                            pos["exit_reason"] = "SL"
+                        elif age_bars >= int(validate_bars) and float(pos.get("mfe_ticks", 0.0)) < float(min_progress_ticks):
+                            pos["exit_bar"] = i
+                            pos["exit_reason"] = "SCRATCH"
+                        elif float(pos.get("mfe_ticks", 0.0)) >= float(be_arm_ticks):
+                            be_level = float(entry_px + be_offset_ticks * tick_size) if side == "long" else float(
+                                entry_px - be_offset_ticks * tick_size
+                            )
+                            if (side == "long" and mark_px <= be_level) or (side == "short" and mark_px >= be_level):
+                                pos["exit_bar"] = i
+                                pos["exit_reason"] = "BE"
+                        else:
+                            last_best_bar = int(pos.get("last_best_bar", entry_bar))
+                            if (i - last_best_bar) >= int(decay_bars):
+                                pos["exit_bar"] = i
+                                pos["exit_reason"] = "DECAY"
                     else:
-                        if mark_px <= tp_level:
-                            pos["exit_bar"] = i
-                            pos["exit_reason"] = "TP"
-                        elif mark_px >= sl_level:
-                            pos["exit_bar"] = i
-                            pos["exit_reason"] = "SL"
-                if (
+                        if side == "long":
+                            if mark_px >= tp_level:
+                                pos["exit_bar"] = i
+                                pos["exit_reason"] = "TP"
+                            elif mark_px <= sl_level:
+                                pos["exit_bar"] = i
+                                pos["exit_reason"] = "SL"
+                        else:
+                            if mark_px <= tp_level:
+                                pos["exit_bar"] = i
+                                pos["exit_reason"] = "TP"
+                            elif mark_px >= sl_level:
+                                pos["exit_bar"] = i
+                                pos["exit_reason"] = "SL"
+                if use_exit_sm_v2 and pos.get("exit_reason") == "TIME" and i >= int(pos["exit_bar"]):
+                    pos["exit_bar"] = i
+                    pos["exit_reason"] = "TIME"
+                if not use_exit_sm_v2 and not use_exit_exec_v2 and (
                     strategy_mode == "absorption_failure_v2"
                     and pos.get("exit_reason") == "TIME"
                     and afr_scratch_bars > 0
@@ -1221,7 +1335,7 @@ def _simulate_day(
                 ):
                     pos["exit_bar"] = i
                     pos["exit_reason"] = "SCRATCH"
-                if (
+                if not use_exit_sm_v2 and not use_exit_exec_v2 and (
                     strategy_mode == "lrams_breakout_v1"
                     and pos.get("exit_reason") == "TIME"
                     and lbo_scratch_bars > 0
@@ -1230,7 +1344,7 @@ def _simulate_day(
                 ):
                     pos["exit_bar"] = i
                     pos["exit_reason"] = "SCRATCH"
-                if strategy_mode.startswith("absorption_failure") and pos.get("exit_reason") == "TIME":
+                if not use_exit_sm_v2 and not use_exit_exec_v2 and strategy_mode.startswith("absorption_failure") and pos.get("exit_reason") == "TIME":
                     flow_sum = _flow_sum_at(i, afr_flow_align_bars)
                     decay_count = int(pos.get("decay_count", 0))
                     if side == "long":
@@ -1248,7 +1362,7 @@ def _simulate_day(
                         pos["exit_bar"] = i
                         pos["exit_reason"] = "DECAY"
                         pos["exit_on_decay"] = True
-                if strategy_mode == "lrams_breakout_v1" and pos.get("exit_reason") == "TIME":
+                if not use_exit_sm_v2 and not use_exit_exec_v2 and strategy_mode == "lrams_breakout_v1" and pos.get("exit_reason") == "TIME":
                     flow_sum = _flow_sum_at(i, lbo_confirm_bars)
                     decay_count = int(pos.get("decay_count", 0))
                     if side == "long":
@@ -1273,38 +1387,37 @@ def _simulate_day(
                 exit_reason = str(pos.get("exit_reason", "TIME"))
                 tp_level = float(pos.get("tp_level", float("nan")))
                 sl_level = float(pos.get("sl_level", float("nan")))
-                # TP/SL fill at the level; other exits are market (conservative).
-                if exit_reason == "TP":
-                    if not np.isfinite(tp_level):
-                        raise RuntimeError("Non-finite tp_level on TP exit.")
-                    exit_px = tp_level
-                elif exit_reason == "SL":
-                    if not np.isfinite(sl_level):
-                        raise RuntimeError("Non-finite sl_level on SL exit.")
-                    exit_px = sl_level
-                else:
-                    exit_px = bid[exit_bar] if side == "long" else ask[exit_bar]
+                # All exits fill at executable prices.
+                exit_px = bid[exit_bar] if side == "long" else ask[exit_bar]
                 pnl_ticks = (exit_px - entry_px) / tick_size if side == "long" else (entry_px - exit_px) / tick_size
                 tp_ticks_local = float(pos.get("tp_ticks", tp_ticks))
                 sl_ticks_local = float(pos.get("sl_ticks", sl_ticks))
-                if exit_reason == "SL":
-                    min_pnl = -float(sl_ticks_local) - 1e-6
-                    if pnl_ticks < min_pnl:
+                if use_exit_exec_v2 and exit_reason == "SL":
+                    max_pnl = -float(sl_ticks_local) + 1e-6
+                    if pnl_ticks > max_pnl:
                         print(
                             f"PNL_BOUND_FAIL side={side} entry_px={entry_px:.4f} exit_px={exit_px:.4f} "
                             f"pnl_ticks={pnl_ticks:.4f} sl_ticks={sl_ticks_local}",
                             flush=True,
                         )
-                        raise RuntimeError("PnL below bound on SL exit.")
-                if exit_reason == "TP":
-                    max_pnl = float(tp_ticks_local) + 1e-6
-                    if pnl_ticks > max_pnl:
+                        raise RuntimeError("PnL above SL bound (should be <= -sl_ticks).")
+                if use_exit_exec_v2 and exit_reason == "TP":
+                    min_pnl = float(tp_ticks_local) - 1e-6
+                    if pnl_ticks < min_pnl:
                         print(
                             f"PNL_BOUND_FAIL side={side} entry_px={entry_px:.4f} exit_px={exit_px:.4f} "
                             f"pnl_ticks={pnl_ticks:.4f} tp_ticks={tp_ticks_local}",
                             flush=True,
                         )
-                        raise RuntimeError("PnL above bound on TP exit.")
+                        raise RuntimeError("PnL below TP bound (should be >= tp_ticks).")
+                if exit_debug:
+                    trigger_px = bid[exit_bar] if side == "long" else ask[exit_bar]
+                    print(
+                        f"EXIT_DEBUG side={side} entry_bar={entry_bar} exit_bar={exit_bar} "
+                        f"entry_px={entry_px:.4f} exit_px={exit_px:.4f} tp_level={tp_level:.4f} "
+                        f"sl_level={sl_level:.4f} trigger_px={trigger_px:.4f} reason={exit_reason}",
+                        flush=True,
+                    )
                 if bool(pos.get("breakeven_triggered", False)):
                     afr_be_triggered += 1
                 if strategy_mode.startswith("absorption_failure"):
@@ -1316,6 +1429,11 @@ def _simulate_day(
                             pos["exit_on_be"] = True
                         else:
                             exit_reason = "sl"
+                    elif exit_reason == "BE_LIMIT":
+                        exit_reason = "be_limit"
+                    elif exit_reason == "BE":
+                        exit_reason = "be"
+                        pos["exit_on_be"] = True
                     elif exit_reason == "SCRATCH":
                         exit_reason = "scratch"
                     elif exit_reason == "TIME":
@@ -1358,6 +1476,11 @@ def _simulate_day(
                             pos["exit_on_be"] = True
                         else:
                             exit_reason = "sl"
+                    elif exit_reason == "BE_LIMIT":
+                        exit_reason = "be_limit"
+                    elif exit_reason == "BE":
+                        exit_reason = "be"
+                        pos["exit_on_be"] = True
                     elif exit_reason == "SCRATCH":
                         exit_reason = "scratch"
                     elif exit_reason == "TIME":
@@ -1379,9 +1502,10 @@ def _simulate_day(
                             lbo_rearm_used_long = True
                         else:
                             lbo_rearm_used_short = True
-                eps = 1e-9
-                entry_spread = float(pos.get("entry_spread_ticks", 0.0))
-                floor_ticks = -(sl_ticks_local + entry_spread + eps)
+                if not use_exit_exec_v2:
+                    eps = 1e-9
+                    entry_spread = float(pos.get("entry_spread_ticks", 0.0))
+                    floor_ticks = -(sl_ticks_local + entry_spread + eps)
                 if not np.isfinite(pnl_ticks):
                     if pnl_bound_printed < 5:
                         try:
@@ -1404,7 +1528,7 @@ def _simulate_day(
                     pos = {}
                     i += 1
                     continue
-                if pnl_ticks < floor_ticks and pnl_bound_printed < 5:
+                if (not use_exit_exec_v2) and pnl_ticks < floor_ticks and pnl_bound_printed < 5:
                     dt_ms = (df_day["Time"].iloc[exit_bar] - pos["entry_time"]).total_seconds() * 1000.0
                     try:
                         print(
@@ -1449,10 +1573,15 @@ def _simulate_day(
                         "entry_px": float(entry_px),
                         "exit_px": float(exit_px),
                         "pnl_ticks": float(pnl_ticks),
+                        "realized_pnl_ticks": float(pnl_ticks),
                         "entry_bar": int(pos["entry_bar"]),
                         "exit_bar": int(exit_bar),
+                        "hold_bars_realized": int(exit_bar - int(pos["entry_bar"])),
                         "exit_reason": exit_reason,
-                        "exit_mode": "exit_sm_v1" if use_exit_sm_v1 else "legacy",
+                        "exit_reason_std": _standard_exit_reason(exit_reason),
+                        "exit_mode": "exit_exec_v2"
+                        if use_exit_exec_v2
+                        else ("exit_sm_v1" if use_exit_sm_v1 else "legacy"),
                         "entry_reason": pos.get("entry_reason"),
                         "absorption_level": float(pos.get("absorption_level", float("nan"))),
                         "break_level": float(pos.get("break_level", float("nan"))),
@@ -1465,6 +1594,11 @@ def _simulate_day(
                         "confirm_price_ref": float(pos.get("confirm_price_ref", float("nan"))),
                         "mae_ticks": float(pos.get("mae_ticks", 0.0)),
                         "mfe_ticks": float(pos.get("mfe_ticks", 0.0)),
+                        "be_armed": bool(pos.get("be_armed", False)),
+                        "entry_spread_ticks": float(pos.get("entry_spread_ticks", float("nan"))),
+                        "gate_event_age": int(pos.get("gate_event_age", -1)),
+                        "gate_asym_val": float(pos.get("gate_asym_val", float("nan"))),
+                        "gate_thr_val": float(pos.get("gate_thr_val", float("nan"))),
                         "exit_on_decay": bool(pos.get("exit_on_decay", False)),
                         "exit_on_be": bool(pos.get("exit_on_be", False)),
                         "lbo_direction": str(pos.get("lbo_direction", "")),
@@ -3068,6 +3202,9 @@ def _simulate_day(
             "lbo_break_ticks": float(lbo_break_ticks_entry) if np.isfinite(lbo_break_ticks_entry) else float("nan"),
             "lbo_flow_align_sum": float(lbo_flow_align_sum),
             "side": desired_side,
+            "gate_event_age": int(gate_event_age),
+            "gate_asym_val": float(gate_asym_val),
+            "gate_thr_val": float(gate_thr_val),
         }
         if gated and gate_enabled:
             print(
@@ -3311,6 +3448,21 @@ def _metrics(trades: pd.DataFrame) -> Dict[str, float]:
     }
 
 
+def _standard_exit_reason(reason: str) -> str:
+    r = str(reason).upper()
+    mapping = {
+        "TP": "TP",
+        "SL": "SL",
+        "BE_LIMIT": "BE_LIMIT",
+        "BE": "BE",
+        "SCRATCH": "SCRATCH",
+        "DECAY": "DECAY",
+        "TIME": "TIME",
+        "MAX_HOLD": "TIME",
+    }
+    return mapping.get(r, "OTHER")
+
+
 def _plot_equity(trades_base: pd.DataFrame, trades_gated: pd.DataFrame, out_path: Path) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -3330,6 +3482,39 @@ def _plot_equity(trades_base: pd.DataFrame, trades_gated: pd.DataFrame, out_path
     plt.tight_layout()
     plt.savefig(out_path)
     plt.close()
+
+
+def _exit_breakdown_stats(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return pd.DataFrame()
+    if "exit_reason_std" not in trades.columns:
+        trades = trades.copy()
+        trades["exit_reason_std"] = trades["exit_reason"].apply(_standard_exit_reason)
+    def _agg(g: pd.DataFrame) -> pd.Series:
+        pnl = pd.to_numeric(g["pnl_ticks"], errors="coerce").to_numpy()
+        wins = pnl[pnl > 0]
+        losses = pnl[pnl < 0]
+        sum_wins = float(np.sum(wins)) if wins.size else 0.0
+        sum_losses = float(np.sum(losses)) if losses.size else 0.0
+        pf = (sum_wins / abs(sum_losses)) if sum_losses != 0.0 else 0.0
+        return pd.Series(
+            {
+                "count_trades": int(len(pnl)),
+                "sum_pnl_ticks": float(np.sum(pnl)),
+                "mean_pnl_ticks": float(np.mean(pnl)) if pnl.size else 0.0,
+                "median_pnl_ticks": float(np.median(pnl)) if pnl.size else 0.0,
+                "win_rate": float(np.mean(pnl > 0)) if pnl.size else 0.0,
+                "profit_factor": float(pf),
+                "median_mfe_ticks": float(np.nanmedian(g["mfe_ticks"])) if "mfe_ticks" in g.columns else 0.0,
+                "median_mae_ticks": float(np.nanmedian(g["mae_ticks"])) if "mae_ticks" in g.columns else 0.0,
+                "median_hold_bars_realized": float(np.nanmedian(g["hold_bars_realized"]))
+                if "hold_bars_realized" in g.columns
+                else 0.0,
+                "p5_pnl_ticks": float(np.quantile(pnl, 0.05)) if pnl.size else 0.0,
+                "p1_pnl_ticks": float(np.quantile(pnl, 0.01)) if pnl.size else 0.0,
+            }
+        )
+    return trades.groupby(["date", "strategy", "exit_reason_std"], sort=False).apply(_agg).reset_index()
 
 
 def _day_health_report(
@@ -3519,6 +3704,19 @@ def main() -> None:
     afr_momentum_decay_min_flow = float(_arg_or_env("afr_momentum_decay_min_flow", "AFR_MOMENTUM_DECAY_MIN_FLOW", "0"))
     print("ENV EXIT_MODE =", os.getenv("EXIT_MODE"), flush=True)
     exit_mode = os.environ.get("EXIT_MODE", "").strip().lower()
+    exit_debug = os.environ.get("EXIT_DEBUG", "0").strip() == "1"
+    validate_bars = int(os.environ.get("VALIDATE_BARS", "5"))
+    min_progress_ticks = int(os.environ.get("MIN_PROGRESS_TICKS", "1"))
+    be_arm_ticks = int(os.environ.get("BE_ARM_TICKS", "1"))
+    be_offset_ticks = int(os.environ.get("BE_OFFSET_TICKS", "0"))
+    decay_bars = int(os.environ.get("DECAY_BARS", "10"))
+    scratch_bars = int(os.environ.get("SCRATCH_BARS", "3"))
+    scratch_min_progress_ticks = int(os.environ.get("SCRATCH_MIN_PROGRESS_TICKS", "1"))
+    be_after_ticks = int(os.environ.get("BE_AFTER_TICKS", "2"))
+    decay_min_flow = float(os.environ.get("DECAY_MIN_FLOW", "20"))
+    be_grace_bars = int(os.environ.get("BE_GRACE_BARS", "5"))
+    scratch_require_mfe_ticks = int(os.environ.get("SCRATCH_REQUIRE_MFE_TICKS", str(be_arm_ticks)))
+    scratch_grace_bars = int(os.environ.get("SCRATCH_GRACE_BARS", "5"))
     afr3_break_min_flow_abs = float(os.environ.get("AFR3_BREAK_MIN_FLOW_ABS", "100"))
     afr3_break_max_spread_ticks = int(os.environ.get("AFR3_BREAK_MAX_SPREAD_TICKS", "2"))
     afr3_snapback_check = os.environ.get("AFR3_SNAPBACK_CHECK", "1").strip() == "1"
@@ -4158,7 +4356,20 @@ def main() -> None:
                                     debug_entry_print=debug_entry,
                                     debug_entry_limit=5,
                                     debug_entry_tag="baseline",
+                                    exit_debug=exit_debug,
                                     exit_mode=exit_mode,
+                                    validate_bars=validate_bars,
+                                    min_progress_ticks=min_progress_ticks,
+                                    be_arm_ticks=be_arm_ticks,
+                                    be_offset_ticks=be_offset_ticks,
+                                    decay_bars=decay_bars,
+                                    scratch_bars=scratch_bars,
+                                    scratch_min_progress_ticks=scratch_min_progress_ticks,
+                                    be_after_ticks=be_after_ticks,
+                                    decay_min_flow=decay_min_flow,
+                                    be_grace_bars=be_grace_bars,
+                                    scratch_require_mfe_ticks=scratch_require_mfe_ticks,
+                                    scratch_grace_bars=scratch_grace_bars,
                                 )
                             else:
                                 trades_base = pd.DataFrame({"pnl_ticks": pd.Series(dtype=float)})
@@ -4427,7 +4638,20 @@ def main() -> None:
                                 debug_entry_print=debug_entry,
                                 debug_entry_limit=5,
                                 debug_entry_tag="gated",
+                                exit_debug=exit_debug,
                                 exit_mode=exit_mode,
+                                validate_bars=validate_bars,
+                                min_progress_ticks=min_progress_ticks,
+                                be_arm_ticks=be_arm_ticks,
+                                be_offset_ticks=be_offset_ticks,
+                                decay_bars=decay_bars,
+                                scratch_bars=scratch_bars,
+                                scratch_min_progress_ticks=scratch_min_progress_ticks,
+                                be_after_ticks=be_after_ticks,
+                                decay_min_flow=decay_min_flow,
+                                be_grace_bars=be_grace_bars,
+                                scratch_require_mfe_ticks=scratch_require_mfe_ticks,
+                                scratch_grace_bars=scratch_grace_bars,
                             )
                             if disable_gate:
                                 blocked_gate = 0
@@ -4482,8 +4706,16 @@ def main() -> None:
                             total_blocked += int(blocked_gate)
                             trades_base["date"] = day
                             trades_base["Symbol"] = instrument
+                            trades_base["strategy"] = "baseline"
+                            trades_base["W"] = gate_lookback_bars
+                            trades_base["gate_mode"] = gate_mode
+                            trades_base["strategy_mode"] = strategy_mode
                             trades_gate["date"] = day
                             trades_gate["Symbol"] = instrument
+                            trades_gate["strategy"] = "gated"
+                            trades_gate["W"] = gate_lookback_bars
+                            trades_gate["gate_mode"] = gate_mode
+                            trades_gate["strategy_mode"] = strategy_mode
                             all_base.append(trades_base)
                             all_gated.append(trades_gate)
 
@@ -4921,6 +5153,24 @@ def main() -> None:
                             pct_exit_on_be_gate = float((gate_exit_reason == "be").mean()) if len(gate_exit_reason) else 0.0
                             pct_exit_on_scratch_base = float((base_exit_reason == "scratch").mean()) if len(base_exit_reason) else 0.0
                             pct_exit_on_scratch_gate = float((gate_exit_reason == "scratch").mean()) if len(gate_exit_reason) else 0.0
+                            base_exit_counts = base_exit_reason.value_counts(dropna=False).to_dict()
+                            gate_exit_counts = gate_exit_reason.value_counts(dropna=False).to_dict()
+                            print(
+                                f"EXIT_COUNTS {instrument} {day} base={base_exit_counts} gate={gate_exit_counts}",
+                                flush=True,
+                            )
+                            base_be_armed = float(trades_base.get("be_armed", pd.Series(dtype=bool)).mean()) if len(trades_base) else 0.0
+                            gate_be_armed = float(trades_gate.get("be_armed", pd.Series(dtype=bool)).mean()) if len(trades_gate) else 0.0
+                            base_reason_std = trades_base.get("exit_reason_std", pd.Series(dtype=str)).astype(str).str.upper()
+                            gate_reason_std = trades_gate.get("exit_reason_std", pd.Series(dtype=str)).astype(str).str.upper()
+                            base_be_limit = float((base_reason_std == "BE_LIMIT").mean()) if len(base_reason_std) else 0.0
+                            gate_be_limit = float((gate_reason_std == "BE_LIMIT").mean()) if len(gate_reason_std) else 0.0
+                            print(
+                                f"BE_STATS {instrument} {day} base_armed={base_be_armed:.2%} "
+                                f"gate_armed={gate_be_armed:.2%} base_be_limit={base_be_limit:.2%} "
+                                f"gate_be_limit={gate_be_limit:.2%}",
+                                flush=True,
+                            )
                             median_mfe_base = float(np.nanmedian(base_mfe)) if len(base_mfe) else 0.0
                             median_mae_base = float(np.nanmedian(base_mae)) if len(base_mae) else 0.0
                             median_mfe_gate = float(np.nanmedian(gate_mfe)) if len(gate_mfe) else 0.0
@@ -5304,6 +5554,72 @@ def main() -> None:
         bad_tail = (sweep_df["baseline_p1_trade_ticks"] > sweep_df["baseline_p5_trade_ticks"]).sum()
         if bad_tail:
             print("Warning: baseline p1 > p5 detected; check tail computation.", flush=True)
+    if all_base or all_gated:
+        all_trades = pd.concat(all_base + all_gated, ignore_index=True)
+        w_tag = "multi" if len(sweep_ws) > 1 else str(sweep_ws[0])
+        gate_tag = "multi" if len(gate_modes) > 1 else gate_modes[0]
+        trades_path = out_dir / f"trades_{strategy_mode}_W{w_tag}_gate_{gate_tag}_baseline_vs_gated.csv"
+        all_trades.to_csv(trades_path, index=False)
+        exit_by_day = _exit_breakdown_stats(all_trades)
+        if not exit_by_day.empty:
+            exit_by_day_path = out_dir / f"exit_breakdown_by_day_{strategy_mode}_W{w_tag}_gate_{gate_tag}.csv"
+            exit_by_day.to_csv(exit_by_day_path, index=False)
+            for strat in ["baseline", "gated"]:
+                sub = exit_by_day[exit_by_day["strategy"] == strat].copy()
+                if sub.empty:
+                    continue
+                counts = (
+                    sub.pivot_table(
+                        index="date",
+                        columns="exit_reason_std",
+                        values="count_trades",
+                        aggfunc="sum",
+                        fill_value=0,
+                    )
+                    .reset_index()
+                )
+                totals = sub.groupby("date", as_index=False)["sum_pnl_ticks"].sum().rename(columns={"sum_pnl_ticks": "total_pnl_ticks"})
+                counts = counts.merge(totals, on="date", how="left")
+                counts["total_trades"] = counts.drop(columns=["date", "total_pnl_ticks"]).sum(axis=1)
+                print(f"Exit breakdown by day ({strat}):", flush=True)
+                print(counts.to_string(index=False), flush=True)
+            def _agg_reason(g: pd.DataFrame) -> pd.Series:
+                pnl = pd.to_numeric(g["pnl_ticks"], errors="coerce").to_numpy()
+                wins = pnl[pnl > 0]
+                losses = pnl[pnl < 0]
+                sum_wins = float(np.sum(wins)) if wins.size else 0.0
+                sum_losses = float(np.sum(losses)) if losses.size else 0.0
+                pf = (sum_wins / abs(sum_losses)) if sum_losses != 0.0 else 0.0
+                return pd.Series(
+                    {
+                        "count_trades": int(len(pnl)),
+                        "sum_pnl_ticks": float(np.sum(pnl)),
+                        "mean_pnl_ticks": float(np.mean(pnl)) if pnl.size else 0.0,
+                        "median_pnl_ticks": float(np.median(pnl)) if pnl.size else 0.0,
+                        "win_rate": float(np.mean(pnl > 0)) if pnl.size else 0.0,
+                        "profit_factor": float(pf),
+                        "median_mfe_ticks": float(np.nanmedian(g["mfe_ticks"])) if "mfe_ticks" in g.columns else 0.0,
+                        "median_mae_ticks": float(np.nanmedian(g["mae_ticks"])) if "mae_ticks" in g.columns else 0.0,
+                        "median_hold_bars_realized": float(np.nanmedian(g["hold_bars_realized"]))
+                        if "hold_bars_realized" in g.columns
+                        else 0.0,
+                        "p5_pnl_ticks": float(np.quantile(pnl, 0.05)) if pnl.size else 0.0,
+                        "p1_pnl_ticks": float(np.quantile(pnl, 0.01)) if pnl.size else 0.0,
+                    }
+                )
+            exit_agg = (
+                all_trades.groupby(["strategy", "exit_reason_std"], sort=False)
+                .apply(_agg_reason)
+                .reset_index()
+            )
+            exit_agg_path = out_dir / f"exit_breakdown_aggregate_{strategy_mode}_W{w_tag}_gate_{gate_tag}.csv"
+            exit_agg.to_csv(exit_agg_path, index=False)
+            for strat in ["baseline", "gated"]:
+                sub = exit_agg[exit_agg["strategy"] == strat].copy()
+                if sub.empty:
+                    continue
+                print(f"Exit breakdown aggregate ({strat}):", flush=True)
+                print(sub.to_string(index=False), flush=True)
     agg_rows = []
     if not sweep_df.empty:
         for (w, mode), g in sweep_df.groupby(["W", "gate_mode"], sort=False):
