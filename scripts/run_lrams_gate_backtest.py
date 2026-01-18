@@ -117,6 +117,11 @@ Impulse confirm entry (strategy_mode=impulse_confirm_v1):
   AFR_REARM_STOP_MAX_BARS allow rearm if stop within bars (default: 3)
   AFR_MOMENTUM_DECAY_BARS consecutive bars of weak flow to exit (default: 3)
   AFR_MOMENTUM_DECAY_MIN_FLOW min aligned flow to avoid decay exit (default: 0)
+  FAIL_FAST_ENABLED     enable FAIL_FAST exits (default: 1)
+  FAIL_FAST_BARS         fail fast after N bars (default: 3)
+  FAIL_FAST_MAX_ADVERSE_TICKS max adverse ticks for fail fast (default: 2)
+  ENTRY_VIABILITY_MODE   entry viability gate: base|strict (default: base)
+  ENTRY_VIABILITY_FLOW_CONFIRM require flow alignment for viability gate (default: 0)
 
 Gate:
   GATE_LOOKBACK_BARS      event lookback W (default: 10)
@@ -391,6 +396,35 @@ def _compute_thresholds(events: pd.DataFrame, worst_q: float) -> pd.DataFrame:
     return pd.concat(out, ignore_index=True) if out else events
 
 
+def _mfe_threshold_table(trades_df: pd.DataFrame, reason_col: str) -> pd.DataFrame:
+    if trades_df.empty:
+        return pd.DataFrame()
+    df = trades_df.copy()
+    df["entry_time"] = pd.to_datetime(df["entry_time"], errors="coerce")
+    df["date"] = df["entry_time"].dt.date.astype(str)
+    df[reason_col] = df[reason_col].fillna("unknown").astype(str)
+    df["strategy"] = df["strategy"].fillna("unknown").astype(str)
+    mfe = pd.to_numeric(df["mfe_ticks"], errors="coerce")
+    df["mfe_ticks"] = mfe
+    rows = []
+    for (day, strategy, reason), g in df.groupby(["date", "strategy", reason_col], sort=False):
+        mf = g["mfe_ticks"].dropna()
+        if mf.empty:
+            continue
+        rows.append(
+            {
+                "date": day,
+                "strategy": strategy,
+                reason_col: reason,
+                "count": int(mf.shape[0]),
+                "pct_mfe_ge_1": float((mf >= 1.0).mean()),
+                "pct_mfe_ge_2": float((mf >= 2.0).mean()),
+                "pct_mfe_ge_3": float((mf >= 3.0).mean()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _simulate_day(
     df_day: pd.DataFrame,
     events_day: pd.DataFrame,
@@ -514,6 +548,9 @@ def _simulate_day(
     scratch_grace_bars: int,
     fail_fast_bars: int,
     fail_fast_max_adverse_ticks: int,
+    fail_fast_enabled: bool,
+    entry_viability_mode: str,
+    entry_viability_flow_confirm: bool,
     runner_trail_start_ticks: int,
     runner_trail_giveback_ticks: int,
     passive_exit_enabled: bool,
@@ -692,6 +729,8 @@ def _simulate_day(
     exit_sm_exit_taken = 0
     exit_sm_hold = 0
     legacy_exit_taken = 0
+    fail_fast_exit_taken = 0
+    fail_fast_exit_suppressed = 0
     skip_reasons = {
         "gated_blocked": 0,
         "no_recent_event": 0,
@@ -831,6 +870,7 @@ def _simulate_day(
         mark_px: float,
         tick_size_val: float,
     ) -> Dict[str, object] | None:
+        nonlocal fail_fast_exit_taken, fail_fast_exit_suppressed
         required = ("entry_bar", "entry_px", "side", "exit_bar", "tp_level", "sl_level")
         missing = [name for name in required if name not in pos_state]
         if missing:
@@ -868,14 +908,21 @@ def _simulate_day(
                     pos_state["exit_exec_style"] = "passive_filled"
                     pos_state["exit_px_override"] = limit_px
                     pos_state["passive_exit_active"] = False
+                    if pending_reason == "FAIL_FAST":
+                        fail_fast_exit_taken += 1
                     return {"exit_reason": pending_reason, "exit_bar": bar_idx}
                 return None
             pos_state["exit_exec_style"] = "market_fallback"
             pos_state["passive_exit_active"] = False
+            if pending_reason == "FAIL_FAST":
+                fail_fast_exit_taken += 1
             return {"exit_reason": pending_reason, "exit_bar": bar_idx}
+        fail_fast_active = fail_fast_enabled and int(fail_fast_max_adverse_ticks) < 999
         if age_bars <= int(fail_fast_bars):
             if mae_ticks <= -float(fail_fast_max_adverse_ticks):
-                if passive_exit_enabled:
+                if not fail_fast_active:
+                    fail_fast_exit_suppressed += 1
+                elif passive_exit_enabled:
                     be_offset = pos_state.get("be_offset_ticks")
                     be_offset = int(be_offset) if be_offset is not None else 0
                     limit_px = (
@@ -888,9 +935,13 @@ def _simulate_day(
                     pos_state["passive_exit_price"] = float(limit_px)
                     pos_state["passive_exit_expiry"] = int(bar_idx + passive_exit_bars)
                     return None
-                return {"exit_reason": "FAIL_FAST", "exit_bar": bar_idx}
+                elif fail_fast_active:
+                    fail_fast_exit_taken += 1
+                    return {"exit_reason": "FAIL_FAST", "exit_bar": bar_idx}
             if age_bars >= int(fail_fast_bars) and peak_mfe < float(min_progress_ticks):
-                if passive_exit_enabled:
+                if not fail_fast_active:
+                    fail_fast_exit_suppressed += 1
+                elif passive_exit_enabled:
                     be_offset = pos_state.get("be_offset_ticks")
                     be_offset = int(be_offset) if be_offset is not None else 0
                     limit_px = (
@@ -903,7 +954,9 @@ def _simulate_day(
                     pos_state["passive_exit_price"] = float(limit_px)
                     pos_state["passive_exit_expiry"] = int(bar_idx + passive_exit_bars)
                     return None
-                return {"exit_reason": "FAIL_FAST", "exit_bar": bar_idx}
+                elif fail_fast_active:
+                    fail_fast_exit_taken += 1
+                    return {"exit_reason": "FAIL_FAST", "exit_bar": bar_idx}
         if peak_mfe >= float(be_arm_ticks):
             if not pos_state.get("be_armed", False):
                 pos_state["be_armed"] = True
@@ -1439,9 +1492,10 @@ def _simulate_day(
     flat_candidate_printed = 0
     flat_suppress_printed = 0
     event_debug_printed = False
-    use_exit_sm_v1 = exit_mode == "exit_sm_v1"
-    use_exit_sm_v2 = exit_mode == "exit_sm_v2"
-    use_exit_exec_v2 = exit_mode == "exit_exec_v2"
+    exit_mode_norm = (exit_mode or "").strip().lower()
+    use_exit_sm_v1 = exit_mode_norm == "exit_sm_v1"
+    use_exit_sm_v2 = exit_mode_norm == "exit_sm_v2"
+    use_exit_exec_v2 = exit_mode_norm == "exit_exec_v2"
     if (not event_debug_printed) and event_pos_all.size:
         print(
             f"EVENT_POS_DEBUG {symbol_str} {day_str} "
@@ -1471,6 +1525,10 @@ def _simulate_day(
                 )
                 flat_candidate_printed += 1
         if in_position:
+            exit_bar_val = pos.get("exit_bar")
+            if exit_bar_val is None:
+                exit_bar_val = int(pos.get("time_exit_bar", entry_bar))
+                pos["exit_bar"] = exit_bar_val
             if use_exit_sm_v1:
                 missing = [name for name in ("entry_bar", "entry_px", "side", "exit_bar", "tp_level", "sl_level") if name not in pos]
                 if missing:
@@ -1522,7 +1580,9 @@ def _simulate_day(
                             pos["breakeven_set"] = True
                             pos["breakeven_triggered"] = True
                             sl_level = float(pos["sl_level"])
-                    if use_exit_sm_v1:
+                    if pos.get("exit_locked"):
+                        pass
+                    elif use_exit_sm_v1:
                         # EXIT_MODE routing: exit_sm_v1 owns exit decisions; legacy exits are bypassed.
                         exit_sm_called += 1
                         sm_action = _exit_sm_v1_action(
@@ -1535,6 +1595,8 @@ def _simulate_day(
                             exit_sm_exit_taken += 1
                             pos["exit_bar"] = int(sm_action["exit_bar"])
                             pos["exit_reason"] = str(sm_action["exit_reason"])
+                            pos["exit_engine"] = "exit_sm_v1"
+                            pos["exit_locked"] = True
                         else:
                             exit_sm_hold += 1
                     elif use_exit_sm_v2:
@@ -1550,9 +1612,12 @@ def _simulate_day(
                             exit_sm_exit_taken += 1
                             pos["exit_bar"] = int(sm_action["exit_bar"])
                             pos["exit_reason"] = str(sm_action["exit_reason"])
+                            pos["exit_engine"] = "exit_sm_v2"
+                            pos["exit_locked"] = True
                         else:
                             exit_sm_hold += 1
                     elif use_exit_exec_v2:
+                        exit_sm_called += 1
                         u_ticks = float(pnl_mark)
                         prev_mfe = float(pos.get("mfe_ticks", 0.0))
                         if u_ticks > prev_mfe:
@@ -1582,58 +1647,72 @@ def _simulate_day(
                         decay_count = int(pos.get("decay_flow_count", 0))
                         decay_count = decay_count + 1 if against else 0
                         pos["decay_flow_count"] = decay_count
+                        be_armed = bool(pos.get("be_armed", False))
+                        be_arm_bar = int(pos.get("be_arm_bar", entry_bar))
+                        be_limit_active = be_armed and (i - be_arm_bar) <= int(be_grace_bars)
+                        be_limit_hit = be_limit_active and (
+                            (side == "long" and mark_px >= entry_px) or (side == "short" and mark_px <= entry_px)
+                        )
+                        scratch_condition = age_bars >= int(scratch_bars) and float(pos.get("mfe_ticks", 0.0)) < float(
+                            scratch_min_progress_ticks
+                        )
+                        scratch_hit = False
+                        if scratch_condition and float(pos.get("mfe_ticks", 0.0)) >= float(scratch_require_mfe_ticks):
+                            if pos.get("scratch_start_bar") is None:
+                                pos["scratch_start_bar"] = int(i)
+                            scratch_start = int(pos.get("scratch_start_bar", i))
+                            scratch_hit = (i - scratch_start) >= int(scratch_grace_bars)
+                        time_hit = i >= int(pos.get("time_exit_bar", entry_bar))
+                        decay_hit = decay_count >= int(decay_bars)
                         if sl_hit:
                             pos["exit_bar"] = i
                             pos["exit_reason"] = "SL"
                         elif tp_hit:
                             pos["exit_bar"] = i
                             pos["exit_reason"] = "TP"
-                        else:
-                            be_armed = bool(pos.get("be_armed", False))
-                            be_arm_bar = int(pos.get("be_arm_bar", entry_bar))
-                            be_limit_active = be_armed and (i - be_arm_bar) <= int(be_grace_bars)
-                            if be_limit_active and (
-                                (side == "long" and mark_px >= entry_px) or (side == "short" and mark_px <= entry_px)
-                            ):
-                                pos["exit_bar"] = i
-                                pos["exit_reason"] = "BE_LIMIT"
-                                pos["breakeven_set"] = True
-                                pos["exit_on_be"] = True
-                            else:
-                                scratch_condition = age_bars >= int(scratch_bars) and float(pos.get("mfe_ticks", 0.0)) < float(
-                                    scratch_min_progress_ticks
-                                )
-                                if scratch_condition and float(pos.get("mfe_ticks", 0.0)) >= float(scratch_require_mfe_ticks):
-                                    if pos.get("scratch_start_bar") is None:
-                                        pos["scratch_start_bar"] = int(i)
-                                    scratch_start = int(pos.get("scratch_start_bar", i))
-                                    if (i - scratch_start) >= int(scratch_grace_bars):
-                                        pos["exit_bar"] = i
-                                        pos["exit_reason"] = "SCRATCH"
-                                if pos.get("exit_reason") == "TIME" and decay_count >= int(decay_bars):
-                                    pos["exit_bar"] = i
-                                    pos["exit_reason"] = "DECAY"
-                        if pos.get("exit_reason") == "TIME" and i >= int(pos.get("exit_bar", entry_bar)):
+                        elif be_limit_hit:
+                            pos["exit_bar"] = i
+                            pos["exit_reason"] = "BE_LIMIT"
+                            pos["breakeven_set"] = True
+                            pos["exit_on_be"] = True
+                        elif decay_hit:
+                            pos["exit_bar"] = i
+                            pos["exit_reason"] = "DECAY"
+                        elif scratch_hit:
+                            pos["exit_bar"] = i
+                            pos["exit_reason"] = "SCRATCH"
+                        elif time_hit:
                             pos["exit_bar"] = i
                             pos["exit_reason"] = "TIME"
+                        if pos.get("exit_reason") is not None:
+                            pos["exit_engine"] = "exit_exec_v2"
+                            pos["exit_locked"] = True
+                            exit_sm_exit_taken += 1
+                        else:
+                            exit_sm_hold += 1
                     else:
                         if side == "long":
                             if mark_px >= tp_level:
                                 pos["exit_bar"] = i
                                 pos["exit_reason"] = "TP"
+                                pos["exit_engine"] = "legacy"
+                                pos["exit_locked"] = True
                             elif mark_px <= sl_level:
                                 pos["exit_bar"] = i
                                 pos["exit_reason"] = "SL"
+                                pos["exit_engine"] = "legacy"
+                                pos["exit_locked"] = True
                         else:
                             if mark_px <= tp_level:
                                 pos["exit_bar"] = i
                                 pos["exit_reason"] = "TP"
+                                pos["exit_engine"] = "legacy"
+                                pos["exit_locked"] = True
                             elif mark_px >= sl_level:
                                 pos["exit_bar"] = i
                                 pos["exit_reason"] = "SL"
-                if use_exit_sm_v2 and pos.get("exit_reason") == "TIME" and i >= int(pos["exit_bar"]):
-                    pos["exit_bar"] = i
-                    pos["exit_reason"] = "TIME"
+                                pos["exit_engine"] = "legacy"
+                                pos["exit_locked"] = True
                 if not use_exit_sm_v2 and not use_exit_exec_v2 and not use_exit_sm_v1 and (
                     strategy_mode == "absorption_failure_v2"
                     and pos.get("exit_reason") == "TIME"
@@ -1643,6 +1722,8 @@ def _simulate_day(
                 ):
                     pos["exit_bar"] = i
                     pos["exit_reason"] = "SCRATCH"
+                    pos["exit_engine"] = "legacy"
+                    pos["exit_locked"] = True
                 if not use_exit_sm_v2 and not use_exit_exec_v2 and not use_exit_sm_v1 and (
                     strategy_mode == "lrams_breakout_v1"
                     and pos.get("exit_reason") == "TIME"
@@ -1652,6 +1733,8 @@ def _simulate_day(
                 ):
                     pos["exit_bar"] = i
                     pos["exit_reason"] = "SCRATCH"
+                    pos["exit_engine"] = "legacy"
+                    pos["exit_locked"] = True
                 if (
                     not use_exit_sm_v2
                     and not use_exit_exec_v2
@@ -1676,6 +1759,8 @@ def _simulate_day(
                         pos["exit_bar"] = i
                         pos["exit_reason"] = "DECAY"
                         pos["exit_on_decay"] = True
+                        pos["exit_engine"] = "legacy"
+                        pos["exit_locked"] = True
                 if (
                     not use_exit_sm_v2
                     and not use_exit_exec_v2
@@ -1700,10 +1785,20 @@ def _simulate_day(
                         pos["exit_bar"] = i
                         pos["exit_reason"] = "DECAY"
                         pos["exit_on_decay"] = True
-            if i >= int(pos["exit_bar"]):
+                        pos["exit_engine"] = "legacy"
+                        pos["exit_locked"] = True
+                if not use_exit_sm_v2 and not use_exit_exec_v2 and not use_exit_sm_v1 and pos.get("exit_reason") is None:
+                    if i >= int(pos.get("time_exit_bar", entry_bar)):
+                        pos["exit_bar"] = i
+                        pos["exit_reason"] = "TIME"
+                        pos["exit_engine"] = "legacy"
+                        pos["exit_locked"] = True
+            if pos.get("exit_bar") is not None and i >= int(pos["exit_bar"]):
                 exit_bar = int(pos["exit_bar"])
                 if not np.isfinite(bid[exit_bar]) or not np.isfinite(ask[exit_bar]):
                     raise RuntimeError("Non-finite exit price; check data integrity.")
+                if not pos.get("exit_engine"):
+                    pos["exit_engine"] = "legacy"
                 exit_reason_raw = str(pos.get("exit_reason", "TIME"))
                 exit_reason = exit_reason_raw
                 tp_level = float(pos.get("tp_level", float("nan")))
@@ -1898,8 +1993,11 @@ def _simulate_day(
                         pass
                     debug_trigger_printed = True
                 entry_reason_out = pos.get("entry_reason")
+                entry_root_reason_out = pos.get("entry_root_reason")
+                entry_reason_raw_out = pos.get("entry_reason_raw")
+                entry_reason_label_out = pos.get("entry_reason_label")
                 if strategy_mode == "lrams_breakout_v1" and not entry_reason_out:
-                    entry_reason_out = "lbo_now"
+                    entry_reason_out = "break"
                 exit_exec_style = str(pos.get("exit_exec_style", "market"))
                 if exit_exec_style == "passive_filled":
                     passive_filled_count += 1
@@ -1923,10 +2021,15 @@ def _simulate_day(
                         "exit_reason_std": _standard_exit_reason(exit_reason),
                         "exit_exec_style": exit_exec_style,
                         "exit_exec_style": exit_exec_style,
+                        "exit_engine": str(pos.get("exit_engine", "legacy")),
+                        "exit_mode_norm": exit_mode_norm,
                         "exit_mode": "exit_exec_v2"
                         if use_exit_exec_v2
                         else ("exit_sm_v2" if use_exit_sm_v2 else ("exit_sm_v1" if use_exit_sm_v1 else "legacy")),
-                        "entry_reason": entry_reason_out,
+                        "entry_reason": entry_reason_out if entry_reason_out else "other",
+                        "entry_root_reason": entry_root_reason_out if entry_root_reason_out else "other",
+                        "entry_reason_raw": entry_reason_raw_out if entry_reason_raw_out else "",
+                        "entry_reason_label": entry_reason_label_out if entry_reason_label_out else "",
                         "absorption_level": float(pos.get("absorption_level", float("nan"))),
                         "break_level": float(pos.get("break_level", float("nan"))),
                         "flow_align_sum_at_entry": float(pos.get("flow_align_sum_at_entry", 0.0)),
@@ -2856,6 +2959,8 @@ def _simulate_day(
                 if break_trigger:
                     entry_reason = "rearm" if (lbo_rearm_enabled and (lbo_rearm_active_long if desired_side == "long" else lbo_rearm_active_short)) else "break"
                     entry_reason_label = "lbo_now"
+                    entry_root_reason = entry_reason
+                    entry_exec_reason = "break"
                     lbo_break_ticks_entry = (mid[entry_bar] - absorption_level) / tick_size
                     lbo_flow_align_sum = flow_align_sum
                     lbo_entry_mode = "now"
@@ -2868,10 +2973,10 @@ def _simulate_day(
                             absorption_bar,
                             break_level,
                         )
-                        entry_reason = None
-                        entry_reason_label = None
+                        entry_exec_reason = "ft"
+                        entry_reason = "ft"
+                        entry_reason_label = "lbo_ft_wait"
                         lbo_entry_mode = "ft_wait"
-                        lbo_break_ticks_entry = float("nan")
                     if entry_reason == "rearm":
                         if desired_side == "long":
                             lbo_rearm_used_long = True
@@ -3582,6 +3687,32 @@ def _simulate_day(
             continue
         entry_px = ask[entry_bar] if desired_side == "long" else bid[entry_bar]
         entry_spread_ticks = float(spread_ticks[entry_bar])
+        # Minimal cost-aware viability gate: require some progress metric to exceed spread.
+        entry_viability_mode = (entry_viability_mode or "base").strip().lower()
+        if entry_viability_mode not in {"base", "strict"}:
+            raise ValueError(f"Invalid ENTRY_VIABILITY_MODE: {entry_viability_mode}")
+        min_viable_ticks = float(entry_spread_ticks) + (2.0 if entry_viability_mode == "strict" else 1.0)
+        progress_vals = []
+        if np.isfinite(ft_progress_ticks):
+            progress_vals.append(abs(float(ft_progress_ticks)))
+        if np.isfinite(break_ticks):
+            progress_vals.append(abs(float(break_ticks)))
+        if np.isfinite(impulse_ticks):
+            progress_vals.append(abs(float(impulse_ticks)))
+        progress_metric = max(progress_vals) if progress_vals else 0.0
+        if entry_viability_flow_confirm:
+            if not np.isfinite(flow_align_sum):
+                i += 1
+                continue
+            if desired_side == "long" and flow_align_sum < 0.0:
+                i += 1
+                continue
+            if desired_side == "short" and flow_align_sum > 0.0:
+                i += 1
+                continue
+        if progress_metric < min_viable_ticks:
+            i += 1
+            continue
         if be_offset_ticks is None:
             be_offset_ticks_local = max(1, int(round(entry_spread_ticks)))
             if not be_offset_logged:
@@ -3602,6 +3733,26 @@ def _simulate_day(
                 be_offset_logged = True
         if strategy_mode == "lrams_breakout_v1" and entry_reason_label is None and entry_reason is None:
             entry_reason_label = "lbo_now"
+        entry_reason_std = "other"
+        entry_reason_raw = entry_reason_label if entry_reason_label is not None else entry_reason
+        entry_root_reason = entry_root_reason if "entry_root_reason" in locals() else None
+        entry_exec_reason = entry_exec_reason if "entry_exec_reason" in locals() else None
+        if strategy_mode == "lrams_breakout_v1":
+            entry_reason_std = "ft" if entry_reason == "ft" else "break"
+        elif strategy_mode == "impulse_confirm_v1":
+            entry_reason_std = "impulse"
+        elif strategy_mode == "micro_momo_v1":
+            entry_reason_std = "impulse"
+        elif strategy_mode == "absorption_failure_v1":
+            entry_reason_std = "afr"
+        elif strategy_mode == "absorption_failure_v2":
+            entry_reason_std = "afr2"
+        elif strategy_mode == "absorption_failure_v3":
+            entry_reason_std = "afr3"
+        if entry_exec_reason is None:
+            entry_exec_reason = entry_reason_std
+        if entry_root_reason is None:
+            entry_root_reason = entry_reason_std
         tp_ticks_local = tp_ticks
         sl_ticks_local = sl_ticks
         hold_bars_local = hold_bars
@@ -3627,8 +3778,9 @@ def _simulate_day(
             "entry_time": df_day["Time"].iloc[entry_bar],
             "entry_bar": entry_bar,
             "entry_px": float(entry_px),
-            "exit_bar": int(min(entry_bar + hold_bars_local, n - 1)),
-            "exit_reason": "TIME",
+            "exit_bar": None,
+            "exit_reason": None,
+            "time_exit_bar": int(min(entry_bar + hold_bars_local, n - 1)),
             "tp_level": float(tp_level),
             "sl_level": float(sl_level),
             "entry_spread_ticks": entry_spread_ticks,
@@ -3640,7 +3792,11 @@ def _simulate_day(
             "be_offset_ticks": int(be_offset_ticks_local),
             "last_best_bar": int(entry_bar),
             "runner_active": False,
-            "entry_reason": entry_reason_label if entry_reason_label is not None else entry_reason,
+            "entry_reason": entry_exec_reason,
+            "entry_root_reason": entry_root_reason,
+            "entry_reason_raw": entry_reason_raw,
+            "entry_reason_label": entry_reason_label if entry_reason_label is not None else "",
+            "lbo_entry_mode": lbo_entry_mode,
             "absorption_level": float(absorption_level) if np.isfinite(absorption_level) else float("nan"),
             "break_level": float(break_level) if np.isfinite(break_level) else float("nan"),
             "flow_align_sum_at_entry": float(flow_align_sum),
@@ -3663,13 +3819,16 @@ def _simulate_day(
             "gate_thr_val": float(gate_thr_val),
         }
         if gated and gate_enabled:
-            print(
-                f"GATE_ENTRY {symbol_str} {day_str} mode={gate_mode} "
-                f"desired_side={desired_side} weak_side={gate_weak_side} "
-                f"event_idx={gate_event_idx} event_age_bars={gate_event_age} "
-                f"asym={gate_asym_val:.6f} thr={gate_thr_val:.6f}",
-                flush=True,
-            )
+            try:
+                print(
+                    f"GATE_ENTRY {symbol_str} {day_str} mode={gate_mode} "
+                    f"desired_side={desired_side} weak_side={gate_weak_side} "
+                    f"event_idx={gate_event_idx} event_age_bars={gate_event_age} "
+                    f"asym={gate_asym_val:.6f} thr={gate_thr_val:.6f}",
+                    flush=True,
+                )
+            except OSError:
+                pass
         in_position = True
         entries_taken += 1
         signals_when_flat += 1
@@ -3778,6 +3937,14 @@ def _simulate_day(
                 f"Entry confirm checked exceeds candidates: checked={entry_confirm_checked} "
                 f"candidates={entry_candidates_when_flat}"
             )
+        trade_count = int(len(trades))
+        mean_pnl = float(pnl_ticks_total / trade_count) if trade_count else 0.0
+        print(
+            f"FAIL_FAST_SUMMARY {symbol_str} {day_str} trades={trade_count} "
+            f"fail_fast_exits={fail_fast_exit_taken} fail_fast_suppressed={fail_fast_exit_suppressed} "
+            f"mean_pnl_per_trade={mean_pnl:.4f}",
+            flush=True,
+        )
 
     return (
         pd.DataFrame(trades),
@@ -3869,6 +4036,8 @@ def _simulate_day(
         exit_sm_exit_taken,
         exit_sm_hold,
         legacy_exit_taken,
+        fail_fast_exit_taken,
+        fail_fast_exit_suppressed,
         skip_reasons,
         gate_avail,
         gate_diag,
@@ -4143,10 +4312,25 @@ def main() -> None:
     lookback_bars = int(os.environ.get("LOOKBACK_BARS", "10"))
     entry_threshold_ticks = int(os.environ.get("ENTRY_THRESHOLD_TICKS", "1"))
     hold_bars = int(os.environ.get("HOLD_BARS", "20"))
-    strategy_mode = _arg_or_env("strategy_mode", "STRATEGY_MODE", "").strip().lower()
+    raw_strategy_env = os.environ.get("STRATEGY_MODE", "")
+    if raw_strategy_env.strip():
+        strategy_mode = raw_strategy_env
+    else:
+        strategy_mode = _arg_or_env("strategy_mode", "STRATEGY_MODE", "")
+    strategy_mode = strategy_mode.strip().lower()
     baseline_mode = os.environ.get("BASELINE_MODE", "flat").strip().lower()
     if not strategy_mode:
         strategy_mode = "micro_momo_v1"
+    print(
+        f"STRATEGY_MODE raw_env={raw_strategy_env!r} resolved={strategy_mode}",
+        flush=True,
+    )
+    if raw_strategy_env.strip():
+        env_norm = raw_strategy_env.strip().lower()
+        if strategy_mode != env_norm:
+            raise RuntimeError(
+                f"STRATEGY_MODE mismatch: env={env_norm} resolved={strategy_mode}"
+            )
     run_afr2_sweep = strategy_mode.startswith("absorption_failure") or os.environ.get("RUN_AFR2_SWEEP", "0").strip() == "1"
     baseline_k_bars = int(os.environ.get("BASELINE_K_BARS", "5"))
     micro_k_bars = int(os.environ.get("MICRO_K_BARS", "5"))
@@ -4206,6 +4390,14 @@ def main() -> None:
     min_progress_ticks = int(os.environ.get("MIN_PROGRESS_TICKS", "1"))
     fail_fast_bars = int(os.environ.get("FAIL_FAST_BARS", "3"))
     fail_fast_max_adverse_ticks = int(os.environ.get("FAIL_FAST_MAX_ADVERSE_TICKS", "2"))
+    fail_fast_enabled = os.environ.get("FAIL_FAST_ENABLED", "1").strip() == "1"
+    entry_viability_mode = os.environ.get("ENTRY_VIABILITY_MODE", "base").strip().lower()
+    entry_viability_flow_confirm = os.environ.get("ENTRY_VIABILITY_FLOW_CONFIRM", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+    }
     be_arm_ticks = int(os.environ.get("BE_ARM_TICKS", "1"))
     be_offset_env = os.environ.get("BE_OFFSET_TICKS", "").strip()
     be_offset_ticks = int(be_offset_env) if be_offset_env else None
@@ -4362,6 +4554,8 @@ def main() -> None:
             "entry_cooldown_bars": entry_cooldown_bars,
             "tp_ticks": tp_ticks,
             "sl_ticks": sl_ticks,
+            "entry_viability_mode": entry_viability_mode,
+            "entry_viability_flow_confirm": entry_viability_flow_confirm,
             "afr3_break_min_flow_abs": afr3_break_min_flow_abs,
             "afr3_break_max_spread_ticks": afr3_break_max_spread_ticks,
             "afr3_snapback_check": afr3_snapback_check,
@@ -4407,6 +4601,8 @@ def main() -> None:
             "trade_session": trade_session,
             "min_spread_ticks": min_spread_ticks,
             "entry_cooldown_bars": entry_cooldown_bars,
+            "entry_viability_mode": entry_viability_mode,
+            "entry_viability_flow_confirm": entry_viability_flow_confirm,
             "lbo_flip_direction": lbo_flip_direction,
             "lbo_confirm_mode": lbo_confirm_mode,
             "lbo_confirm_ticks": lbo_confirm_ticks,
@@ -4764,6 +4960,8 @@ def main() -> None:
                                     exit_sm_exit_taken_base,
                                     exit_sm_hold_base,
                                     legacy_exit_taken_base,
+                                    fail_fast_exit_taken_base,
+                                    fail_fast_exit_suppressed_base,
                                     skip_base,
                                     gate_avail_base,
                                     gate_diag_base,
@@ -4890,6 +5088,9 @@ def main() -> None:
                                     scratch_grace_bars=scratch_grace_bars,
                                     fail_fast_bars=fail_fast_bars,
                                     fail_fast_max_adverse_ticks=fail_fast_max_adverse_ticks,
+                                    fail_fast_enabled=fail_fast_enabled,
+                                    entry_viability_mode=entry_viability_mode,
+                                    entry_viability_flow_confirm=entry_viability_flow_confirm,
                                     runner_trail_start_ticks=runner_trail_start_ticks,
                                     runner_trail_giveback_ticks=runner_trail_giveback_ticks,
                                     passive_exit_enabled=passive_exit_enabled,
@@ -4985,6 +5186,8 @@ def main() -> None:
                                 exit_sm_exit_taken_base = 0
                                 exit_sm_hold_base = 0
                                 legacy_exit_taken_base = 0
+                                fail_fast_exit_taken_base = 0
+                                fail_fast_exit_suppressed_base = 0
                                 skip_base = {}
                             (
                                 trades_gate,
@@ -5076,6 +5279,8 @@ def main() -> None:
                                 exit_sm_exit_taken_gate,
                                 exit_sm_hold_gate,
                                 legacy_exit_taken_gate,
+                                fail_fast_exit_taken_gate,
+                                fail_fast_exit_suppressed_gate,
                                 skip_gate,
                                 gate_avail_gate,
                                 gate_diag,
@@ -5202,6 +5407,9 @@ def main() -> None:
                                 scratch_grace_bars=scratch_grace_bars,
                                 fail_fast_bars=fail_fast_bars,
                                 fail_fast_max_adverse_ticks=fail_fast_max_adverse_ticks,
+                                fail_fast_enabled=fail_fast_enabled,
+                                entry_viability_mode=entry_viability_mode,
+                                entry_viability_flow_confirm=entry_viability_flow_confirm,
                                 runner_trail_start_ticks=runner_trail_start_ticks,
                                 runner_trail_giveback_ticks=runner_trail_giveback_ticks,
                                 passive_exit_enabled=passive_exit_enabled,
@@ -5284,6 +5492,15 @@ def main() -> None:
 
                             base_stats = _metrics(trades_base)
                             gate_stats = _metrics(trades_gate)
+                            if (not fail_fast_enabled) or (fail_fast_max_adverse_ticks >= 999):
+                                base_dd = float(base_stats["max_drawdown_ticks"])
+                                gate_dd = float(gate_stats["max_drawdown_ticks"])
+                                if base_dd > 0 and gate_dd > (5.0 * base_dd):
+                                    print(
+                                        f"Warning: FAIL_FAST disabled and gated max_dd {gate_dd:.2f} exceeds "
+                                        f"5x baseline max_dd {base_dd:.2f} on {instrument} {day}.",
+                                        flush=True,
+                                    )
                             gate_max_dds.append(float(gate_stats["max_drawdown_ticks"]))
                             base_stats.update(
                                 {
@@ -5705,17 +5922,25 @@ def main() -> None:
                             count_ft_entries_gate = int((gate_entry_reason == "ft").sum())
                             count_rearms_gate = int((gate_entry_reason == "rearm").sum())
                             if strategy_mode == "lrams_breakout_v1":
-                                count_lbo_now_base = int((base_entry_reason == "lbo_now").sum())
-                                count_lbo_confirm_base = int((base_entry_reason == "lbo_confirm").sum())
-                                count_lbo_pullback_base = int((base_entry_reason == "lbo_pullback").sum())
-                                count_lbo_now_gate = int((gate_entry_reason == "lbo_now").sum())
-                                count_lbo_confirm_gate = int((gate_entry_reason == "lbo_confirm").sum())
-                                count_lbo_pullback_gate = int((gate_entry_reason == "lbo_pullback").sum())
+                                base_entry_reason_raw = trades_base.get("entry_reason_raw", pd.Series(dtype=object)).fillna("")
+                                gate_entry_reason_raw = trades_gate.get("entry_reason_raw", pd.Series(dtype=object)).fillna("")
+                                count_lbo_now_base = int((base_entry_reason_raw == "lbo_now").sum())
+                                count_lbo_confirm_base = int((base_entry_reason_raw == "lbo_confirm").sum())
+                                count_lbo_pullback_base = int((base_entry_reason_raw == "lbo_pullback").sum())
+                                count_lbo_now_gate = int((gate_entry_reason_raw == "lbo_now").sum())
+                                count_lbo_confirm_gate = int((gate_entry_reason_raw == "lbo_confirm").sum())
+                                count_lbo_pullback_gate = int((gate_entry_reason_raw == "lbo_pullback").sum())
                                 lbo_base_entered_count = (
                                     count_lbo_now_base + count_lbo_confirm_base + count_lbo_pullback_base
                                 )
                                 lbo_gate_entered_count = (
                                     count_lbo_now_gate + count_lbo_confirm_gate + count_lbo_pullback_gate
+                                )
+                                print(
+                                    f"LBO_POS_OPEN {instrument} {day} "
+                                    f"baseline_pos_opens={entries_taken_base} baseline_trades={len(trades_base)} "
+                                    f"gated_pos_opens={entries_taken_gate} gated_trades={len(trades_gate)}",
+                                    flush=True,
                                 )
                                 if validate_debug:
                                     print(
@@ -5725,10 +5950,10 @@ def main() -> None:
                                         f"lbo_gate_entered_count={lbo_gate_entered_count}",
                                         flush=True,
                                     )
-                                if len(trades_base) != lbo_base_entered_count:
-                                    raise RuntimeError("LBO base entered count does not match trade count.")
-                                if len(trades_gate) != lbo_gate_entered_count:
-                                    raise RuntimeError("LBO gate entered count does not match trade count.")
+                                if len(trades_base) != entries_taken_base:
+                                    raise RuntimeError("LBO base pos-open count does not match trade count.")
+                                if len(trades_gate) != entries_taken_gate:
+                                    raise RuntimeError("LBO gate pos-open count does not match trade count.")
                             if strategy_mode == "absorption_failure_v2":
                                 if afr_enter_on == "break" and (count_ft_entries_base > 0 or count_ft_entries_gate > 0):
                                     raise RuntimeError("AFR_ENTER_ON=break but FT entries were recorded.")
@@ -6060,11 +6285,14 @@ def main() -> None:
                                 )
                         except Exception as exc:
                             skipped_days.append(f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode}: {exc}")
-                            print(
-                                f"[{day_index}/{day_count}] {instrument} {day} W={gate_lookback_bars} "
-                                f"mode={gate_mode} FAILED: {exc}",
-                                flush=True,
-                            )
+                            try:
+                                print(
+                                    f"[{day_index}/{day_count}] {instrument} {day} W={gate_lookback_bars} "
+                                    f"mode={gate_mode} FAILED: {exc}",
+                                    flush=True,
+                                )
+                            except OSError:
+                                pass
                             msg = str(exc)
                             if "mismatch" in msg or "entries" in msg or "gate_mismatch" in msg:
                                 raise
@@ -6232,6 +6460,66 @@ def main() -> None:
         gate_tag = "multi" if len(gate_modes) > 1 else gate_modes[0]
         trades_path = out_dir / f"trades_{strategy_mode}_W{w_tag}_gate_{gate_tag}_baseline_vs_gated.csv"
         all_trades.to_csv(trades_path, index=False)
+        mfe_table = _mfe_threshold_table(all_trades, "entry_reason")
+        if not mfe_table.empty:
+            mfe_path = out_dir / f"mfe_thresholds_{strategy_mode}_W{w_tag}_gate_{gate_tag}.csv"
+            mfe_table.to_csv(mfe_path, index=False)
+            print("MFE thresholds by entry_reason (per day):", flush=True)
+            print(mfe_table.to_string(index=False), flush=True)
+            agg_rows = []
+            for (strategy, reason), g in mfe_table.groupby(["strategy", "entry_reason"], sort=False):
+                total = float(g["count"].sum())
+                if total <= 0:
+                    continue
+                agg_rows.append(
+                    {
+                        "strategy": strategy,
+                        "entry_reason": reason,
+                        "count": int(total),
+                        "pct_mfe_ge_1": float((g["pct_mfe_ge_1"] * g["count"]).sum() / total),
+                        "pct_mfe_ge_2": float((g["pct_mfe_ge_2"] * g["count"]).sum() / total),
+                        "pct_mfe_ge_3": float((g["pct_mfe_ge_3"] * g["count"]).sum() / total),
+                    }
+                )
+            mfe_agg = pd.DataFrame(agg_rows)
+            if not mfe_agg.empty:
+                print("MFE thresholds aggregate:", flush=True)
+                print(mfe_agg.to_string(index=False), flush=True)
+                viable = mfe_agg[
+                    (mfe_agg["strategy"] == "baseline")
+                    & (mfe_agg["pct_mfe_ge_2"] >= 0.05)
+                    & (mfe_agg["count"] >= 500)
+                ]
+                if not viable.empty:
+                    reasons = ", ".join(sorted(viable["entry_reason"].unique().tolist()))
+                    print(f"ENTRY_EDGE_VERDICT: VIABLE ENTRY SUBSET EXISTS (baseline reasons: {reasons})", flush=True)
+                else:
+                    print("ENTRY_EDGE_VERDICT: NO STANDALONE ENTRY EDGE (demote to gate-only)", flush=True)
+        mfe_root = _mfe_threshold_table(all_trades, "entry_root_reason")
+        if not mfe_root.empty:
+            mfe_root_path = out_dir / f"mfe_thresholds_root_{strategy_mode}_W{w_tag}_gate_{gate_tag}.csv"
+            mfe_root.to_csv(mfe_root_path, index=False)
+            print("MFE thresholds by entry_root_reason (per day):", flush=True)
+            print(mfe_root.to_string(index=False), flush=True)
+            agg_rows_root = []
+            for (strategy, reason), g in mfe_root.groupby(["strategy", "entry_root_reason"], sort=False):
+                total = float(g["count"].sum())
+                if total <= 0:
+                    continue
+                agg_rows_root.append(
+                    {
+                        "strategy": strategy,
+                        "entry_root_reason": reason,
+                        "count": int(total),
+                        "pct_mfe_ge_1": float((g["pct_mfe_ge_1"] * g["count"]).sum() / total),
+                        "pct_mfe_ge_2": float((g["pct_mfe_ge_2"] * g["count"]).sum() / total),
+                        "pct_mfe_ge_3": float((g["pct_mfe_ge_3"] * g["count"]).sum() / total),
+                    }
+                )
+            mfe_root_agg = pd.DataFrame(agg_rows_root)
+            if not mfe_root_agg.empty:
+                print("MFE thresholds aggregate (entry_root_reason):", flush=True)
+                print(mfe_root_agg.to_string(index=False), flush=True)
         exit_by_day = _exit_breakdown_stats(all_trades)
         if not exit_by_day.empty:
             exit_by_day_path = out_dir / f"exit_breakdown_by_day_{strategy_mode}_W{w_tag}_gate_{gate_tag}.csv"
