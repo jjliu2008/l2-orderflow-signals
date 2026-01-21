@@ -3898,6 +3898,8 @@ def _simulate_day(
             progress_vals.append(abs(float(break_ticks)))
         if np.isfinite(impulse_ticks):
             progress_vals.append(abs(float(impulse_ticks)))
+        if strategy_mode == "srf_entry_v1" and np.isfinite(srf_disp_ticks):
+            progress_vals.append(abs(float(srf_disp_ticks)))
         progress_metric = max(progress_vals) if progress_vals else 0.0
         if entry_viability_flow_confirm:
             if not np.isfinite(flow_align_sum):
@@ -4168,18 +4170,12 @@ def _simulate_day(
             f"mean_pnl_per_trade={mean_pnl:.4f}",
             flush=True,
         )
-    if strategy_mode == "srf_entry_v1":
-        # In SRF mode, candidate counts reflect post-viability gateable candidates.
-        if gated:
-            entry_candidates_when_flat = int(blocked_signals + gate_diag.get("allowed_count", 0))
-        else:
-            entry_candidates_when_flat = int(entries_taken)
-        if srf_debug:
-            print(
-                f"{symbol_str} {day_str} SRF raw long={srf_raw_long} short={srf_raw_short} | "
-                f"exec long={srf_exec_long} short={srf_exec_short}",
-                flush=True,
-            )
+    if strategy_mode == "srf_entry_v1" and srf_debug:
+        print(
+            f"{symbol_str} {day_str} SRF raw long={srf_raw_long} short={srf_raw_short} | "
+            f"exec long={srf_exec_long} short={srf_exec_short}",
+            flush=True,
+        )
 
     return (
         pd.DataFrame(trades),
