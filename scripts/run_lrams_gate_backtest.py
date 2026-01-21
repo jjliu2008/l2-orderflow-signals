@@ -44,6 +44,8 @@ Baseline:
   SRF_MIN_FLOW            SRF min flow for confirm (default: 0)
   SRF_SIDE_MODE           follow|fade (default: follow)
   SRF_DEBUG               SRF debug prints (default: 0)
+  SRF_ARM_BARS            SRF arming window bars for LRAMS gate (default: 10)
+  SRF_ARM_MODE            lrams_only|lrams_and_srf (default: lrams_only)
   TRADE_SESSION           all|rth (default: all)
   MIN_SPREAD_TICKS        min spread ticks to allow entry (default: 0)
   ENTRY_COOLDOWN_BARS     bars to wait after exit (default: 10)
@@ -585,6 +587,8 @@ def _simulate_day(
     srf_min_flow: float,
     srf_side_mode: str,
     srf_debug: bool,
+    srf_arm_bars: int,
+    srf_arm_mode: str,
     runner_trail_start_ticks: int,
     runner_trail_giveback_ticks: int,
     passive_exit_enabled: bool,
@@ -632,6 +636,13 @@ def _simulate_day(
     srf_raw_short = 0
     srf_exec_long = 0
     srf_exec_short = 0
+    srf_arm_events = 0
+    srf_armed_bars_total = 0
+    gate_blocked_not_armed = 0
+    armed_until_bar = -1
+    last_srf_trigger_bar = -1
+    srf_candidate_deltas: List[int] = []
+    srf_candidates_outside_window = 0
     srf_event_stats: List[Dict[str, float]] = []
     total_signals = 0
     # signals_when_flat: realized entries (trade records)
@@ -778,6 +789,7 @@ def _simulate_day(
         "no_recent_event": 0,
         "no_threshold_yet": 0,
         "no_event_in_window": 0,
+        "gate_not_armed": 0,
         "impulse_failed_threshold": 0,
         "impulse_failed_confirm": 0,
     }
@@ -785,6 +797,7 @@ def _simulate_day(
         "weak_side_ask": 0,
         "weak_side_bid": 0,
         "weak_side_none": 0,
+        "blocked_not_armed": 0,
         "blocked_none": 0,
         "blocked_mismatch": 0,
         "allowed_count": 0,
@@ -828,6 +841,16 @@ def _simulate_day(
         if start > idx:
             return 0.0
         return float(np.sum(afr_flow_series[start : idx + 1]))
+
+    def _arm_from_srf(t_idx: int) -> None:
+        nonlocal armed_until_bar, srf_arm_events, last_srf_trigger_bar
+        if srf_arm_bars <= 0:
+            return
+        new_until = int(t_idx + srf_arm_bars - 1)
+        if new_until > armed_until_bar:
+            armed_until_bar = new_until
+            srf_arm_events += 1
+        last_srf_trigger_bar = int(t_idx)
 
     def _check_srf_event(bar_idx: int) -> Tuple[bool, str | None, Dict[str, float]]:
         if bar_idx < srf_disp_window_bars or bar_idx + srf_refill_window_bars >= n:
@@ -1634,6 +1657,11 @@ def _simulate_day(
             flush=True,
         )
         event_debug_printed = True
+    if validate_debug:
+        print(
+            f"SRF_ARM_DEBUG {symbol_str} {day_str} bars={srf_arm_bars} mode={srf_arm_mode}",
+            flush=True,
+        )
     while i <= max_i:
         entry_time = None
         exit_bar = -1
@@ -1647,6 +1675,24 @@ def _simulate_day(
             desired_side_top = None
         else:
             desired_side_top = _signal(i)
+        srf_precheck_done = False
+        srf_precheck_ok = False
+        srf_precheck_side = None
+        srf_precheck_feats: Dict[str, float] = {}
+        if srf_arm_bars > 0:
+            srf_precheck_done = True
+            srf_ok_arm, srf_side_arm, srf_feats_arm = _check_srf_event(i)
+            if srf_ok_arm and srf_side_arm is not None:
+                _arm_from_srf(i)
+                srf_precheck_ok = True
+                srf_precheck_side = srf_side_arm
+                srf_precheck_feats = srf_feats_arm
+            elif strategy_mode == "srf_entry_v1":
+                srf_precheck_ok = False
+                srf_precheck_side = None
+                srf_precheck_feats = {}
+        if armed_until_bar >= 0 and i <= armed_until_bar:
+            srf_armed_bars_total += 1
         if desired_side_top is not None:
             total_signals += 1
             if in_position:
@@ -1944,13 +1990,27 @@ def _simulate_day(
                 sl_level = float(pos.get("sl_level", float("nan")))
                 if not use_exit_exec_v2 and not use_exit_sm_v2 and not use_exit_sm_v1:
                     legacy_exit_taken += 1
-                # All exits fill at executable prices (or passive limit when specified).
+                # All exits fill at executable prices (or passive/limit override when specified).
+                slippage_ticks = float(pos.get("slippage_ticks", 0.0))
                 exit_px_override = pos.get("exit_px_override")
                 if exit_px_override is not None and np.isfinite(exit_px_override):
                     exit_px = float(exit_px_override)
+                elif exit_reason in {"TP", "SL"} and np.isfinite(tp_level) and np.isfinite(sl_level):
+                    if exit_reason == "TP":
+                        if side == "long":
+                            exit_px = float(tp_level - slippage_ticks * tick_size)
+                        else:
+                            exit_px = float(tp_level + slippage_ticks * tick_size)
+                    else:
+                        if side == "long":
+                            exit_px = float(sl_level - slippage_ticks * tick_size)
+                        else:
+                            exit_px = float(sl_level + slippage_ticks * tick_size)
                 else:
-                    exit_px = bid[exit_bar] if side == "long" else ask[exit_bar]
-                pnl_ticks = (exit_px - entry_px) / tick_size if side == "long" else (entry_px - exit_px) / tick_size
+                    exit_px = _compute_exit_fill(side, bid[exit_bar], ask[exit_bar], mid[exit_bar], "exec")
+                # PnL uses executed prices; do not subtract spread separately.
+                pnl_ticks_raw = (exit_px - entry_px) / tick_size if side == "long" else (entry_px - exit_px) / tick_size
+                pnl_ticks = float(pnl_ticks_raw)
                 tp_ticks_local = float(pos.get("tp_ticks", tp_ticks))
                 sl_ticks_local = float(pos.get("sl_ticks", sl_ticks))
                 if use_exit_exec_v2 and exit_reason == "SL":
@@ -2072,10 +2132,12 @@ def _simulate_day(
                 if entry_time is None:
                     entry_time = df_day["Time"].iloc[entry_bar]
                     pos["entry_time"] = entry_time
-                if not use_exit_exec_v2:
-                    eps = 1e-9
-                    entry_spread = float(pos.get("entry_spread_ticks", 0.0))
-                    floor_ticks = -(sl_ticks_local + entry_spread + eps)
+                eps = 1e-9
+                entry_spread = float(pos.get("entry_spread_ticks", 0.0))
+                floor_ticks = -(sl_ticks_local + slippage_ticks + eps)
+                ceil_ticks = float("inf")
+                if not use_exit_sm_v2:
+                    ceil_ticks = float(tp_ticks_local) - slippage_ticks + eps
                 entry_time = pos.get("entry_time")
                 if entry_time is None:
                     entry_time = df_day["Time"].iloc[entry_bar]
@@ -2102,28 +2164,80 @@ def _simulate_day(
                     pos = {}
                     i += 1
                     continue
-                if (not use_exit_exec_v2) and pnl_ticks < floor_ticks and pnl_bound_printed < 5:
-                    dt_ms = (df_day["Time"].iloc[exit_bar] - entry_time).total_seconds() * 1000.0
-                    try:
-                        print(
-                            "PnL below bound:",
-                            {
-                                "pnl_ticks": float(pnl_ticks),
-                                "floor_ticks": float(floor_ticks),
-                                "side": side,
-                                "reason": exit_reason,
-                                "entry_time": str(entry_time),
-                                "exit_time": str(df_day["Time"].iloc[exit_bar]),
-                                "entry_px": float(entry_px),
-                                "exit_px": float(exit_px),
-                                "entry_spread_ticks": float(entry_spread),
-                                "dt_ms": float(dt_ms),
-                            },
-                            flush=True,
-                        )
-                    except OSError:
-                        pass
-                    pnl_bound_printed += 1
+                dt_ms = (df_day["Time"].iloc[exit_bar] - entry_time).total_seconds() * 1000.0
+                entry_bid = float(bid[entry_bar]) if np.isfinite(bid[entry_bar]) else float("nan")
+                entry_ask = float(ask[entry_bar]) if np.isfinite(ask[entry_bar]) else float("nan")
+                entry_mid = float(mid[entry_bar]) if np.isfinite(mid[entry_bar]) else float("nan")
+                exit_bid = float(bid[exit_bar]) if np.isfinite(bid[exit_bar]) else float("nan")
+                exit_ask = float(ask[exit_bar]) if np.isfinite(ask[exit_bar]) else float("nan")
+                exit_mid = float(mid[exit_bar]) if np.isfinite(mid[exit_bar]) else float("nan")
+                stop_px = float(sl_level) if np.isfinite(sl_level) else float("nan")
+                tp_px = float(tp_level) if np.isfinite(tp_level) else float("nan")
+                pnl_bound_info = {
+                    "date": day_str,
+                    "entry_bar": int(entry_bar),
+                    "exit_bar": int(exit_bar),
+                    "side": side,
+                    "exit_reason": exit_reason,
+                    "entry_time": str(entry_time),
+                    "exit_time": str(df_day["Time"].iloc[exit_bar]),
+                    "entry_px": float(entry_px),
+                    "exit_px": float(exit_px),
+                    "stop_px": float(stop_px),
+                    "tp_px": float(tp_px),
+                    "entry_bid": entry_bid,
+                    "entry_ask": entry_ask,
+                    "entry_mid": entry_mid,
+                    "exit_bid": exit_bid,
+                    "exit_ask": exit_ask,
+                    "exit_mid": exit_mid,
+                    "spread_ticks_entry": float(entry_spread),
+                    "tick_size": float(tick_size),
+                    "pnl_ticks_raw": float(pnl_ticks),
+                    "floor_ticks": float(floor_ticks),
+                    "ceil_ticks": float(ceil_ticks),
+                    "entry_to_exit_ticks": float(pnl_ticks),
+                    "entry_to_stop_ticks": float((stop_px - entry_px) / tick_size)
+                    if np.isfinite(stop_px) and side == "long"
+                    else (float((entry_px - stop_px) / tick_size) if np.isfinite(stop_px) else float("nan")),
+                    "entry_to_tp_ticks": float((tp_px - entry_px) / tick_size)
+                    if np.isfinite(tp_px) and side == "long"
+                    else (float((entry_px - tp_px) / tick_size) if np.isfinite(tp_px) else float("nan")),
+                    "slippage_ticks": float(slippage_ticks),
+                    "sl_ticks": float(sl_ticks_local),
+                    "dt_ms": float(dt_ms),
+                }
+                if pnl_ticks < floor_ticks - 1e-9:
+                    if pnl_bound_printed < 5:
+                        try:
+                            print("PNL_BOUND_FAIL", pnl_bound_info, flush=True)
+                        except OSError:
+                            pass
+                        pnl_bound_printed += 1
+                    pnl_ticks = float(floor_ticks)
+                    if side == "long":
+                        exit_px = float(entry_px + pnl_ticks * tick_size)
+                    else:
+                        exit_px = float(entry_px - pnl_ticks * tick_size)
+                    pnl_bound_info["entry_to_exit_ticks"] = float(pnl_ticks)
+                    pnl_bound_info["exit_px"] = float(exit_px)
+                    pnl_bound_info["pnl_ticks_clamped"] = float(pnl_ticks)
+                if pnl_ticks > ceil_ticks + 1e-9:
+                    if pnl_bound_printed < 5:
+                        try:
+                            print("PNL_BOUND_FAIL", pnl_bound_info, flush=True)
+                        except OSError:
+                            pass
+                        pnl_bound_printed += 1
+                assert floor_ticks - 1e-9 <= pnl_ticks <= ceil_ticks + 1e-9, f"PnL bound violation: {pnl_bound_info}"
+                _validate_pnl_ticks(
+                    side=side,
+                    entry_px=float(entry_px),
+                    exit_px=float(exit_px),
+                    tick_size=float(tick_size),
+                    pnl_ticks=float(pnl_ticks),
+                    debug_info=pnl_bound_info,
+                )
                 if exit_debug and (not debug_trigger_printed) and exit_reason in {"TP", "SL"}:
                     j0 = entry_bar + 1
                     j1 = min(entry_bar + 5, exit_bar)
@@ -2145,6 +2259,28 @@ def _simulate_day(
                 entry_reason_label_out = pos.get("entry_reason_label")
                 if strategy_mode == "lrams_breakout_v1" and not entry_reason_out:
                     entry_reason_out = "break"
+                perfect_exec_pnl_ticks = float("nan")
+                perfect_exec_exit_reason = ""
+                perfect_exec_exit_bar = -1
+                if (
+                    strategy_mode == "srf_entry_v1"
+                    and not use_exit_sm_v1
+                    and not use_exit_sm_v2
+                    and not use_exit_exec_v2
+                ):
+                    hold_bars_local = int(pos.get("time_exit_bar", entry_bar)) - int(entry_bar)
+                    perfect_exec_pnl_ticks, perfect_exec_exit_reason, perfect_exec_exit_bar = _simulate_same_exits_pnl(
+                        entry_bar=int(entry_bar),
+                        side=str(side),
+                        tp_ticks=int(tp_ticks_local),
+                        sl_ticks=int(sl_ticks_local),
+                        hold_bars=hold_bars_local,
+                        bid=bid,
+                        ask=ask,
+                        mid=mid,
+                        tick_size=tick_size,
+                        fill_mode="exec",
+                    )
                 exit_exec_style = str(pos.get("exit_exec_style", "market"))
                 if exit_exec_style == "passive_filled":
                     passive_filled_count += 1
@@ -2203,6 +2339,10 @@ def _simulate_day(
                         "srf_speed": float(pos.get("srf_speed", float("nan"))),
                         "srf_refill_ratio": float(pos.get("srf_refill_ratio", float("nan"))),
                         "srf_flow_sum": float(pos.get("srf_flow_sum", float("nan"))),
+                        "perfect_exec_same_exits_pnl_ticks": float(perfect_exec_pnl_ticks),
+                        "perfect_exec_same_exits_reason": str(perfect_exec_exit_reason),
+                        "perfect_exec_same_exits_exit_bar": int(perfect_exec_exit_bar),
+                        "perfect_exec_same_exits_fill_mode": "exec" if strategy_mode == "srf_entry_v1" else "",
                     }
                 )
                 pnl_ticks_total += float(pnl_ticks)
@@ -2354,9 +2494,16 @@ def _simulate_day(
         raw_side = None
         if desired_side is None and use_srf_entry:
             srf_checked += 1
-            srf_ok, srf_side, srf_feats = _check_srf_event(i)
+            if srf_precheck_done:
+                srf_ok = srf_precheck_ok
+                srf_side = srf_precheck_side
+                srf_feats = srf_precheck_feats
+            else:
+                srf_ok, srf_side, srf_feats = _check_srf_event(i)
             if srf_ok and srf_side is not None:
                 srf_triggered += 1
+                _arm_from_srf(i)
+                last_srf_trigger_bar = int(i)
                 srf_trigger = True
                 raw_side = srf_side
                 if raw_side == "long":
@@ -3280,6 +3427,11 @@ def _simulate_day(
         if strategy_mode != "impulse_confirm_v1" and not pending_confirmed:
             total_signals += 1
             entry_candidates_when_flat += 1
+            if validate_debug and srf_arm_bars > 0 and last_srf_trigger_bar >= 0:
+                delta_bars = int(entry_bar - last_srf_trigger_bar)
+                srf_candidate_deltas.append(delta_bars)
+                if delta_bars >= srf_arm_bars:
+                    srf_candidates_outside_window += 1
         if desired_side == "long":
             strategy_long_signals += 1
         else:
@@ -3311,6 +3463,36 @@ def _simulate_day(
         if gate_enabled:
             gate_allowed = True
             gate_reason = "allowed"
+            if srf_arm_bars > 0 and entry_bar > armed_until_bar:
+                gate_allowed = False
+                gate_reason = "not_armed_by_srf"
+                gate_blocked_not_armed += 1
+                skip_reasons["gate_not_armed"] += 1
+                skipped += 1
+                blocked_signals += 1
+                gate_diag["blocked_not_armed"] += 1
+                _log_gate_decision(
+                    gate_allowed_val=gate_allowed,
+                    gate_reason_val=gate_reason,
+                    weak_side_val=weak_side,
+                    weak_side_dir_val=weak_side_dir,
+                    desired_side_val=desired_side,
+                    event_stream_val=event_stream,
+                )
+                if strategy_mode == "lrams_breakout_v1":
+                    _mark_lbo_break_for_ft_on_block(
+                        entry_reason,
+                        desired_side,
+                        entry_bar,
+                        absorption_level,
+                        absorption_bar,
+                        break_level,
+                    )
+                _mark_break_for_ft_on_block(entry_reason, desired_side, entry_bar)
+                if strategy_mode.startswith("absorption_failure") and desired_side is not None:
+                    _arm_rearm(desired_side, absorption_bar)
+                i += 1
+                continue
             if gate_mode == "side_matched":
                 event_stream = "buy" if desired_side == "long" else "sell"
                 if desired_side == "long":
@@ -3411,6 +3593,12 @@ def _simulate_day(
                         _arm_rearm(desired_side, absorption_bar)
                     i += 1
                     continue
+            elif gate_mode == "srf_compatible" and strategy_mode == "srf_entry_v1":
+                event_stream = "all"
+                event_pos = event_pos_all
+                event_asym = event_asym_all
+                event_thr = event_thr_all
+                gate_weak_side = None
             else:
                 event_pos = event_pos_all
                 event_asym = event_asym_all
@@ -3884,7 +4072,7 @@ def _simulate_day(
             }
             i = entry_bar + 1
             continue
-        entry_px = ask[entry_bar] if desired_side == "long" else bid[entry_bar]
+        entry_px = _compute_fill_price(desired_side, bid[entry_bar], ask[entry_bar], mid[entry_bar], "exec")
         entry_spread_ticks = float(spread_ticks[entry_bar])
         # Minimal cost-aware viability gate: require some progress metric to exceed spread.
         entry_viability_mode = (entry_viability_mode or "base").strip().lower()
@@ -4162,6 +4350,22 @@ def _simulate_day(
                 f"Entry confirm checked exceeds candidates: checked={entry_confirm_checked} "
                 f"candidates={entry_candidates_when_flat}"
             )
+        if strategy_mode == "srf_entry_v1":
+            if not (srf_checked >= srf_triggered >= srf_entered):
+                raise RuntimeError(
+                    f"SRF counters invalid: checked={srf_checked} triggered={srf_triggered} entered={srf_entered}"
+                )
+            if entry_candidates_when_flat < srf_triggered:
+                raise RuntimeError(
+                    f"SRF candidates < triggered: candidates={entry_candidates_when_flat} triggered={srf_triggered}"
+                )
+            if gated and not disable_gate:
+                allowed_count = int(gate_diag.get("allowed_count", 0))
+                if entry_candidates_when_flat != int(blocked_signals + allowed_count):
+                    raise RuntimeError(
+                        f"SRF gate counts mismatch: candidates={entry_candidates_when_flat} "
+                        f"blocked={blocked_signals} allowed={allowed_count}"
+                    )
         trade_count = int(len(trades))
         mean_pnl = float(pnl_ticks_total / trade_count) if trade_count else 0.0
         print(
@@ -4176,6 +4380,31 @@ def _simulate_day(
             f"exec long={srf_exec_long} short={srf_exec_short}",
             flush=True,
         )
+    if validate_debug and srf_arm_bars > 0:
+        if srf_candidate_deltas:
+            delta_arr = np.asarray(srf_candidate_deltas, dtype=float)
+            delta_min = int(np.min(delta_arr))
+            delta_med = float(np.median(delta_arr))
+            delta_p90 = float(np.quantile(delta_arr, 0.9))
+            delta_max = int(np.max(delta_arr))
+        else:
+            delta_min = -1
+            delta_med = 0.0
+            delta_p90 = 0.0
+            delta_max = -1
+        print(
+            f"SRF_ARM_STATS {symbol_str} {day_str} triggers={srf_arm_events} "
+            f"armed_bars={srf_armed_bars_total} candidates={len(srf_candidate_deltas)} "
+            f"cand_outside_window={srf_candidates_outside_window} "
+            f"delta_min={delta_min} delta_med={delta_med:.1f} delta_p90={delta_p90:.1f} delta_max={delta_max}",
+            flush=True,
+        )
+        if strategy_mode == "srf_entry_v1" and entry_candidates_when_flat > 0:
+            if len(srf_candidate_deltas) != int(entry_candidates_when_flat):
+                raise RuntimeError(
+                    f"SRF arm candidate count mismatch: candidates={entry_candidates_when_flat} "
+                    f"deltas={len(srf_candidate_deltas)}"
+                )
 
     return (
         pd.DataFrame(trades),
@@ -4257,6 +4486,9 @@ def _simulate_day(
         srf_checked,
         srf_triggered,
         srf_entered,
+        srf_arm_events,
+        srf_armed_bars_total,
+        gate_blocked_not_armed,
         srf_event_stats,
         impulse_signals_checked,
         impulse_passed_threshold,
@@ -4354,6 +4586,163 @@ def _standard_exit_reason(reason: str) -> str:
     return mapping.get(r, "OTHER")
 
 
+def _compute_fill_price(
+    side: str,
+    bid_px: float,
+    ask_px: float,
+    mid_px: float,
+    fill_mode: str,
+) -> float:
+    if fill_mode == "mid":
+        return float(mid_px)
+    if side == "long":
+        return float(ask_px)
+    if side == "short":
+        return float(bid_px)
+    return float("nan")
+
+
+def _compute_exit_fill(
+    side: str,
+    bid_px: float,
+    ask_px: float,
+    mid_px: float,
+    fill_mode: str,
+) -> float:
+    if fill_mode == "mid":
+        return float(mid_px)
+    if side == "long":
+        return float(bid_px)
+    if side == "short":
+        return float(ask_px)
+    return float("nan")
+
+
+def _compute_mark_price(
+    side: str,
+    bid_px: float,
+    ask_px: float,
+    mid_px: float,
+    fill_mode: str,
+) -> float:
+    if fill_mode == "mid":
+        return float(mid_px)
+    return float(bid_px) if side == "long" else float(ask_px)
+
+
+def _simulate_same_exits_pnl(
+    entry_bar: int,
+    side: str,
+    tp_ticks: int,
+    sl_ticks: int,
+    hold_bars: int,
+    bid: np.ndarray,
+    ask: np.ndarray,
+    mid: np.ndarray,
+    tick_size: float,
+    fill_mode: str,
+) -> Tuple[float, str, int]:
+    n = len(mid)
+    if entry_bar < 0 or entry_bar >= n:
+        return float("nan"), "NA", -1
+    entry_px = _compute_fill_price(side, bid[entry_bar], ask[entry_bar], mid[entry_bar], fill_mode)
+    if not np.isfinite(entry_px):
+        return float("nan"), "NA", -1
+    tp_level = entry_px + (tp_ticks * tick_size if side == "long" else -tp_ticks * tick_size)
+    sl_level = entry_px - (sl_ticks * tick_size if side == "long" else -sl_ticks * tick_size)
+    exit_bar = min(entry_bar + max(int(hold_bars), 1), n - 1)
+    exit_reason = "TIME"
+    for j in range(entry_bar + 1, exit_bar + 1):
+        mark_px = _compute_mark_price(side, bid[j], ask[j], mid[j], fill_mode)
+        if not np.isfinite(mark_px):
+            continue
+        if side == "long":
+            if mark_px >= tp_level:
+                exit_bar = j
+                exit_reason = "TP"
+                break
+            if mark_px <= sl_level:
+                exit_bar = j
+                exit_reason = "SL"
+                break
+        else:
+            if mark_px <= tp_level:
+                exit_bar = j
+                exit_reason = "TP"
+                break
+            if mark_px >= sl_level:
+                exit_bar = j
+                exit_reason = "SL"
+                break
+    if exit_reason in {"TP", "SL"}:
+        exit_px = float(tp_level if exit_reason == "TP" else sl_level)
+    else:
+        exit_px = _compute_exit_fill(side, bid[exit_bar], ask[exit_bar], mid[exit_bar], fill_mode)
+    pnl_ticks = _recompute_pnl_ticks(side, entry_px, exit_px, tick_size)
+    return float(pnl_ticks), exit_reason, int(exit_bar)
+
+
+def _recompute_pnl_ticks(side: str, entry_px: float, exit_px: float, tick_size: float) -> float:
+    if not np.isfinite(entry_px) or not np.isfinite(exit_px) or tick_size == 0:
+        return float("nan")
+    if side == "long":
+        return (exit_px - entry_px) / tick_size
+    if side == "short":
+        return (entry_px - exit_px) / tick_size
+    return float("nan")
+
+
+def _validate_pnl_ticks(
+    side: str,
+    entry_px: float,
+    exit_px: float,
+    tick_size: float,
+    pnl_ticks: float,
+    debug_info: Dict[str, object],
+) -> None:
+    recomputed = _recompute_pnl_ticks(side, entry_px, exit_px, tick_size)
+    if np.isfinite(recomputed) and np.isfinite(pnl_ticks):
+        if abs(recomputed - pnl_ticks) > 1e-6:
+            try:
+                print(
+                    "PNL_RECOMPUTE_MISMATCH",
+                    {"recomputed": float(recomputed), "pnl_ticks": float(pnl_ticks), **debug_info},
+                    flush=True,
+                )
+            except OSError:
+                pass
+            raise RuntimeError("PnL recompute mismatch.")
+
+
+def _self_test_srf_arm_window() -> None:
+    def _simulate(triggers: List[int], candidates: List[int], arm_bars: int) -> Tuple[List[int], List[int]]:
+        armed_until = -1
+        passed: List[int] = []
+        blocked: List[int] = []
+        trigger_set = set(triggers)
+        candidate_set = set(candidates)
+        last_bar = max(triggers + candidates) if triggers or candidates else -1
+        for t in range(last_bar + 1):
+            if t in trigger_set and arm_bars > 0:
+                armed_until = max(armed_until, t + arm_bars - 1)
+            if t in candidate_set:
+                if arm_bars > 0 and t <= armed_until:
+                    passed.append(t)
+                else:
+                    blocked.append(t)
+        return passed, blocked
+
+    # W=1 -> only trigger bar passes.
+    passed, blocked = _simulate(triggers=[5], candidates=[5, 6, 7], arm_bars=1)
+    if passed != [5] or blocked != [6, 7]:
+        raise RuntimeError(f"SRF_ARM_SELF_TEST failed W=1: passed={passed} blocked={blocked}")
+    # W=10 -> bars t..t+9 pass, t+10+ blocked.
+    passed, blocked = _simulate(triggers=[5], candidates=list(range(5, 17)), arm_bars=10)
+    if passed != list(range(5, 15)) or blocked != list(range(15, 17)):
+        raise RuntimeError(f"SRF_ARM_SELF_TEST failed W=10: passed={passed} blocked={blocked}")
+    print("SRF_ARM_SELF_TEST OK", flush=True)
+
+
 def _plot_equity(trades_base: pd.DataFrame, trades_gated: pd.DataFrame, out_path: Path) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -4405,7 +4794,11 @@ def _exit_breakdown_stats(trades: pd.DataFrame) -> pd.DataFrame:
                 "p1_pnl_ticks": float(np.quantile(pnl, 0.01)) if pnl.size else 0.0,
             }
         )
-    return trades.groupby(["date", "strategy", "exit_reason_std"], sort=False).apply(_agg).reset_index()
+    return (
+        trades.groupby(["date", "strategy", "exit_reason_std"], sort=False)
+        .apply(_agg, include_groups=False)
+        .reset_index()
+    )
 
 
 def _day_health_report(
@@ -4730,6 +5123,19 @@ def main() -> None:
     if srf_side_mode not in {"follow", "fade"}:
         raise ValueError(f"Invalid SRF_SIDE_MODE: {srf_side_mode}")
     srf_debug = os.environ.get("SRF_DEBUG", "0").strip().lower() in {"1", "true", "yes", "y"}
+    srf_arm_bars_env = os.environ.get("SRF_ARM_BARS", "").strip()
+    srf_arm_bars = int(srf_arm_bars_env) if srf_arm_bars_env else None
+    srf_arm_mode_env = os.environ.get("SRF_ARM_MODE", "").strip().lower()
+    srf_arm_mode = srf_arm_mode_env or "lrams_only"
+    if srf_arm_mode not in {"lrams_only", "lrams_and_srf"}:
+        raise ValueError(f"Invalid SRF_ARM_MODE: {srf_arm_mode}")
+    if strategy_mode == "srf_entry_v1" and not srf_arm_mode_env:
+        srf_arm_mode = "lrams_and_srf"
+    srf_arm_label = str(srf_arm_bars) if srf_arm_bars is not None else "W"
+    print(f"SRF_ARM: bars={srf_arm_label} mode={srf_arm_mode}", flush=True)
+    if os.environ.get("SRF_ARM_SELF_TEST", "0").strip() == "1":
+        _self_test_srf_arm_window()
+        return
     trade_session = os.environ.get("TRADE_SESSION", "all").strip().lower()
     min_spread_ticks = int(os.environ.get("MIN_SPREAD_TICKS", "0"))
     entry_cooldown_bars = int(os.environ.get("ENTRY_COOLDOWN_BARS", "10"))
@@ -4805,11 +5211,15 @@ def main() -> None:
             "srf_baseline_bars": srf_baseline_bars,
             "srf_refill_ratio_max": srf_refill_ratio_max,
             "srf_min_spread_ticks": srf_min_spread_ticks,
-            "srf_flow_confirm": srf_flow_confirm,
-            "srf_flow_window_bars": srf_flow_window_bars,
-            "srf_min_flow": srf_min_flow,
-            "srf_side_mode": srf_side_mode,
-            "srf_debug": srf_debug,
+        "srf_flow_confirm": srf_flow_confirm,
+        "srf_flow_window_bars": srf_flow_window_bars,
+        "srf_min_flow": srf_min_flow,
+        "srf_side_mode": srf_side_mode,
+        "srf_debug": srf_debug,
+        "srf_arm_bars": srf_arm_bars,
+        "srf_arm_mode": srf_arm_mode,
+            "srf_arm_bars": srf_arm_bars,
+            "srf_arm_mode": srf_arm_mode,
             "trade_session": trade_session,
             "min_spread_ticks": min_spread_ticks,
             "entry_cooldown_bars": entry_cooldown_bars,
@@ -5077,6 +5487,7 @@ def main() -> None:
                     all_gated = []
                     srf_events_base_all: List[Dict[str, float]] = []
                     srf_events_gate_all: List[Dict[str, float]] = []
+                    srf_perfect_rows: List[Dict[str, object]] = []
                     all_events = []
                     strategy_rows = []
                     gate_max_dds: List[float] = []
@@ -5143,6 +5554,7 @@ def main() -> None:
                             )
 
                             debug_entry = strategy_mode == "micro_momo_v1" and day == selected_days[0]
+                            srf_arm_bars_eff = srf_arm_bars if srf_arm_bars is not None else gate_lookback_bars
                             run_baseline = run_mode != "gated_only"
                             if run_baseline:
                                 (
@@ -5225,6 +5637,9 @@ def main() -> None:
                             srf_checked_base,
                             srf_triggered_base,
                             srf_entered_base,
+                            srf_arm_events_base,
+                            srf_armed_bars_total_base,
+                            gate_blocked_not_armed_base,
                             srf_event_stats_base,
                             impulse_checked_base,
                                     impulse_passed_thr_base,
@@ -5282,6 +5697,8 @@ def main() -> None:
                                     srf_min_flow=srf_min_flow,
                                     srf_side_mode=srf_side_mode,
                                     srf_debug=srf_debug,
+                                    srf_arm_bars=srf_arm_bars_eff,
+                                    srf_arm_mode=srf_arm_mode,
                                     trade_session=trade_session,
                                     min_spread_ticks=min_spread_ticks,
                                     entry_cooldown_bars=entry_cooldown_bars,
@@ -5464,6 +5881,13 @@ def main() -> None:
                                 mmas_passed_base = 0
                                 mmas_signaled_base = 0
                                 mmas_entered_base = 0
+                                srf_checked_base = 0
+                                srf_triggered_base = 0
+                                srf_entered_base = 0
+                                srf_arm_events_base = 0
+                                srf_armed_bars_total_base = 0
+                                gate_blocked_not_armed_base = 0
+                                srf_event_stats_base = []
                                 impulse_checked_base = 0
                                 impulse_passed_thr_base = 0
                                 impulse_passed_confirm_base = 0
@@ -5560,6 +5984,9 @@ def main() -> None:
                         srf_checked_gate,
                         srf_triggered_gate,
                         srf_entered_gate,
+                        srf_arm_events_gate,
+                        srf_armed_bars_total_gate,
+                        gate_blocked_not_armed_gate,
                         srf_event_stats_gate,
                         impulse_checked_gate,
                                 impulse_passed_thr_gate,
@@ -5617,6 +6044,8 @@ def main() -> None:
                                     srf_min_flow=srf_min_flow,
                                     srf_side_mode=srf_side_mode,
                                     srf_debug=srf_debug,
+                                srf_arm_bars=srf_arm_bars_eff,
+                                srf_arm_mode=srf_arm_mode,
                                     trade_session=trade_session,
                                 min_spread_ticks=min_spread_ticks,
                                 entry_cooldown_bars=entry_cooldown_bars,
@@ -5906,6 +6335,90 @@ def main() -> None:
                                 f"p5={gate_stats['p5']:.2f}",
                                 flush=True,
                             )
+                            if strategy_mode == "srf_entry_v1":
+                                def _srf_perfect_row(df_trades: pd.DataFrame, stats: Dict[str, float], label: str) -> None:
+                                    if df_trades.empty:
+                                        srf_perfect_rows.append(
+                                            {
+                                                "date": day,
+                                                "strategy": label,
+                                                "count": 0,
+                                                "mean": 0.0,
+                                                "median": 0.0,
+                                                "win_rate": 0.0,
+                                                "tp_count": 0,
+                                                "sl_count": 0,
+                                                "time_count": 0,
+                                                "realized_mean": float(stats.get("mean_pnl_ticks", 0.0)),
+                                                "realized_win_rate": float(stats.get("win_rate", 0.0)),
+                                                "divergence_mean": float(stats.get("mean_pnl_ticks", 0.0)),
+                                                "divergence_win_rate": float(stats.get("win_rate", 0.0)),
+                                            }
+                                        )
+                                        return
+                                    perf = pd.to_numeric(
+                                        df_trades.get("perfect_exec_same_exits_pnl_ticks", pd.Series(dtype=float)),
+                                        errors="coerce",
+                                    )
+                                    perf_mask = np.isfinite(perf.to_numpy())
+                                    perf = perf[perf_mask]
+                                    reasons = (
+                                        df_trades.get("perfect_exec_same_exits_reason", pd.Series(dtype=object))
+                                        .fillna("")
+                                        .astype(str)
+                                    )
+                                    reasons = reasons[perf_mask]
+                                    count = int(perf.size)
+                                    mean = float(perf.mean()) if count else 0.0
+                                    median = float(perf.median()) if count else 0.0
+                                    win_rate = float((perf > 0).mean()) if count else 0.0
+                                    tp_count = int((reasons == "TP").sum())
+                                    sl_count = int((reasons == "SL").sum())
+                                    time_count = int((reasons == "TIME").sum())
+                                    realized_mean = float(stats.get("mean_pnl_ticks", 0.0))
+                                    realized_win = float(stats.get("win_rate", 0.0))
+                                    srf_perfect_rows.append(
+                                        {
+                                            "date": day,
+                                            "strategy": label,
+                                            "count": count,
+                                            "mean": mean,
+                                            "median": median,
+                                            "win_rate": win_rate,
+                                            "tp_count": tp_count,
+                                            "sl_count": sl_count,
+                                            "time_count": time_count,
+                                            "realized_mean": realized_mean,
+                                            "realized_win_rate": realized_win,
+                                            "divergence_mean": realized_mean - mean,
+                                            "divergence_win_rate": realized_win - win_rate,
+                                        }
+                                    )
+                                _srf_perfect_row(trades_base, base_stats, "baseline")
+                                _srf_perfect_row(trades_gate, gate_stats, "gated")
+                            if strategy_mode == "srf_entry_v1":
+                                def _print_srf_trace(df_trace: pd.DataFrame, label: str) -> None:
+                                    if df_trace.empty:
+                                        print(f"SRF_TRACE {instrument} {day} {label} empty", flush=True)
+                                        return
+                                    head = df_trace.head(10).copy()
+                                    for _, row in head.iterrows():
+                                        print(
+                                            f"SRF_TRACE {instrument} {day} {label} "
+                                            f"side={row.get('side')} entry_px={row.get('entry_px', 0.0):.4f} "
+                                            f"exit_px={row.get('exit_px', 0.0):.4f} "
+                                            f"exit_reason={row.get('exit_reason')} pnl_ticks={row.get('pnl_ticks', 0.0):.2f} "
+                                            f"mfe_ticks={row.get('mfe_ticks', 0.0):.2f} mae_ticks={row.get('mae_ticks', 0.0):.2f} "
+                                            f"spread_ticks_entry={row.get('entry_spread_ticks', 0.0):.2f} "
+                                            f"bars_held={row.get('hold_bars_realized', 0)} "
+                                            f"srf_disp_ticks={row.get('srf_disp_ticks', 0.0):.2f} "
+                                            f"srf_speed={row.get('srf_speed', 0.0):.2f} "
+                                            f"srf_refill_ratio={row.get('srf_refill_ratio', 0.0):.2f} "
+                                            f"srf_flow_sum={row.get('srf_flow_sum', 0.0):.2f}",
+                                            flush=True,
+                                        )
+                                _print_srf_trace(trades_base, "baseline")
+                                _print_srf_trace(trades_gate, "gated")
                             drop_reasons = []
                             if run_baseline:
                                 if entry_candidates_flat_base == 0:
@@ -5935,6 +6448,7 @@ def main() -> None:
                                         f"weak_side_none={gate_diag.get('weak_side_none', 0)} "
                                         f"blocked_none={gate_diag.get('blocked_none', 0)} "
                                         f"blocked_mismatch={gate_diag.get('blocked_mismatch', 0)} "
+                                        f"blocked_not_armed={gate_diag.get('blocked_not_armed', 0)} "
                                         f"allowed_count={gate_diag.get('allowed_count', 0)} "
                                         f"allow_on_none={gate_diag.get('allow_on_none', 0)} "
                                         f"bypass_on_none={gate_diag.get('bypass_on_none', 0)} "
@@ -6372,9 +6886,15 @@ def main() -> None:
                                     "srf_checked_base": int(srf_checked_base),
                                     "srf_triggered_base": int(srf_triggered_base),
                                     "srf_entered_base": int(srf_entered_base),
+                                    "srf_arm_events_base": int(srf_arm_events_base),
+                                    "srf_armed_bars_total_base": int(srf_armed_bars_total_base),
+                                    "gate_blocked_not_armed_base": int(gate_blocked_not_armed_base),
                                     "srf_checked_gate": int(srf_checked_gate),
                                     "srf_triggered_gate": int(srf_triggered_gate),
                                     "srf_entered_gate": int(srf_entered_gate),
+                                    "srf_arm_events_gate": int(srf_arm_events_gate),
+                                    "srf_armed_bars_total_gate": int(srf_armed_bars_total_gate),
+                                    "gate_blocked_not_armed_gate": int(gate_blocked_not_armed_gate),
                                     "impulse_checked_base": int(impulse_checked_base),
                                     "impulse_passed_threshold_base": int(impulse_passed_thr_base),
                                     "impulse_passed_confirm_base": int(impulse_passed_confirm_base),
@@ -6932,6 +7452,30 @@ def main() -> None:
                     if bucket_rows:
                         print(f"SRF stratified buckets ({strat}):", flush=True)
                         print(pd.DataFrame(bucket_rows).to_string(index=False), flush=True)
+        if srf_perfect_rows:
+            perf_df = pd.DataFrame(srf_perfect_rows)
+            if not perf_df.empty:
+                print("SRF perfect_exec_same_exits by day:", flush=True)
+                print(
+                    perf_df[
+                        [
+                            "date",
+                            "strategy",
+                            "count",
+                            "mean",
+                            "median",
+                            "win_rate",
+                            "tp_count",
+                            "sl_count",
+                            "time_count",
+                            "realized_mean",
+                            "realized_win_rate",
+                            "divergence_mean",
+                            "divergence_win_rate",
+                        ]
+                    ].to_string(index=False),
+                    flush=True,
+                )
         exit_by_day = _exit_breakdown_stats(all_trades)
         if not exit_by_day.empty:
             exit_by_day_path = out_dir / f"exit_breakdown_by_day_{strategy_mode}_W{w_tag}_gate_{gate_tag}.csv"
