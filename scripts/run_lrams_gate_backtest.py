@@ -22,7 +22,7 @@ Baseline:
   HOLD_BARS               holding horizon H (default: 20)
   BASELINE_MODE           flat|not_awful|mmas (default: flat)
   BASELINE_K_BARS         window for not_awful (default: 5)
-  STRATEGY_MODE           baseline_flat|micro_momo_v1|impulse_confirm_v1|absorption_failure_v1|absorption_failure_v2|absorption_failure_v3|lrams_breakout_v1 (default: micro_momo_v1)
+  STRATEGY_MODE           baseline_flat|micro_momo_v1|impulse_confirm_v1|absorption_failure_v1|absorption_failure_v2|absorption_failure_v3|lrams_breakout_v1|srf_entry_v1 (default: micro_momo_v1)
   MICRO_K_BARS            micro momentum window (default: 5)
   MICRO_IMPULSE_TICKS     min impulse ticks (default: 1)
   MICRO_FLOW_MIN          min abs flow (default: 0)
@@ -32,6 +32,18 @@ Baseline:
   MMAS_MIN_FLOW_ABS       min abs flow for MMAS (default: 20)
   MMAS_REQUIRE_AGREE      require dmid/flow sign agreement (default: 1)
   DEBUG_FIRST_MMAS        print first MMAS decision (default: 0)
+  SRF_MIN_DISP_TICKS      SRF min displacement ticks (default: 3)
+  SRF_DISP_WINDOW_BARS    SRF displacement window bars (default: 5)
+  SRF_MIN_SPEED_TICKS_PER_BAR SRF min speed ticks/bar (default: 0.6)
+  SRF_REFILL_WINDOW_BARS  SRF refill window bars (default: 5)
+  SRF_BASELINE_BARS       SRF baseline size window bars (default: 20)
+  SRF_REFILL_RATIO_MAX    SRF refill ratio max (default: 0.6)
+  SRF_MIN_SPREAD_TICKS    SRF fallback min spread ticks (default: 1)
+  SRF_FLOW_CONFIRM        SRF require flow confirm (default: 0)
+  SRF_FLOW_WINDOW_BARS    SRF flow confirm window bars (default: 5)
+  SRF_MIN_FLOW            SRF min flow for confirm (default: 0)
+  SRF_SIDE_MODE           follow|fade (default: follow)
+  SRF_DEBUG               SRF debug prints (default: 0)
   TRADE_SESSION           all|rth (default: all)
   MIN_SPREAD_TICKS        min spread ticks to allow entry (default: 0)
   ENTRY_COOLDOWN_BARS     bars to wait after exit (default: 10)
@@ -122,6 +134,16 @@ Impulse confirm entry (strategy_mode=impulse_confirm_v1):
   FAIL_FAST_MAX_ADVERSE_TICKS max adverse ticks for fail fast (default: 2)
   ENTRY_VIABILITY_MODE   entry viability gate: base|strict (default: base)
   ENTRY_VIABILITY_FLOW_CONFIRM require flow alignment for viability gate (default: 0)
+  SRF_MIN_DISP_TICKS     SRF min displacement ticks (default: 3)
+  SRF_DISP_WINDOW_BARS   SRF displacement window bars (default: 5)
+  SRF_MIN_SPEED_TICKS_PER_BAR SRF min speed ticks/bar (default: 0.6)
+  SRF_REFILL_WINDOW_BARS SRF refill window bars (default: 5)
+  SRF_BASELINE_BARS      SRF baseline window bars (default: 20)
+  SRF_REFILL_RATIO_MAX   SRF refill ratio max (default: 0.6)
+  SRF_MIN_SPREAD_TICKS   SRF spread min when no size (default: 1)
+  SRF_FLOW_CONFIRM       SRF flow confirm enable (default: 0)
+  SRF_FLOW_WINDOW_BARS   SRF flow window bars (default: 5)
+  SRF_MIN_FLOW           SRF min flow (default: 0)
 
 Gate:
   GATE_LOOKBACK_BARS      event lookback W (default: 10)
@@ -551,6 +573,18 @@ def _simulate_day(
     fail_fast_enabled: bool,
     entry_viability_mode: str,
     entry_viability_flow_confirm: bool,
+    srf_min_disp_ticks: int,
+    srf_disp_window_bars: int,
+    srf_min_speed_ticks_per_bar: float,
+    srf_refill_window_bars: int,
+    srf_baseline_bars: int,
+    srf_refill_ratio_max: float,
+    srf_min_spread_ticks: int,
+    srf_flow_confirm: bool,
+    srf_flow_window_bars: int,
+    srf_min_flow: float,
+    srf_side_mode: str,
+    srf_debug: bool,
     runner_trail_start_ticks: int,
     runner_trail_giveback_ticks: int,
     passive_exit_enabled: bool,
@@ -591,6 +625,14 @@ def _simulate_day(
     trades: List[Dict[str, float]] = []
     pnl_ticks_total = 0.0
     skipped = 0
+    srf_checked = 0
+    srf_triggered = 0
+    srf_entered = 0
+    srf_raw_long = 0
+    srf_raw_short = 0
+    srf_exec_long = 0
+    srf_exec_short = 0
+    srf_event_stats: List[Dict[str, float]] = []
     total_signals = 0
     # signals_when_flat: realized entries (trade records)
     # entry_candidates_when_flat: candidate evaluations while flat (pre-gate)
@@ -786,6 +828,91 @@ def _simulate_day(
         if start > idx:
             return 0.0
         return float(np.sum(afr_flow_series[start : idx + 1]))
+
+    def _check_srf_event(bar_idx: int) -> Tuple[bool, str | None, Dict[str, float]]:
+        if bar_idx < srf_disp_window_bars or bar_idx + srf_refill_window_bars >= n:
+            return False, None, {}
+        disp_ticks = (mid[bar_idx] - mid[bar_idx - srf_disp_window_bars]) / tick_size
+        speed = abs(disp_ticks) / float(max(1, srf_disp_window_bars))
+        if disp_ticks >= srf_min_disp_ticks:
+            side = "long"
+        elif disp_ticks <= -srf_min_disp_ticks:
+            side = "short"
+        else:
+            return False, None, {}
+        if speed < srf_min_speed_ticks_per_bar:
+            return False, None, {}
+        size_arr = top_ask_depth if side == "long" else top_bid_depth
+        baseline_slice = size_arr[max(0, bar_idx - srf_baseline_bars) : bar_idx]
+        post_slice = size_arr[bar_idx + 1 : bar_idx + 1 + srf_refill_window_bars]
+        baseline_size = float(np.nanmedian(baseline_slice)) if baseline_slice.size else float("nan")
+        post_size = float(np.nanmedian(post_slice)) if post_slice.size else float("nan")
+        refill_ratio = float("nan")
+        refill_ok = False
+        if np.isfinite(baseline_size) and baseline_size > 0 and np.isfinite(post_size):
+            refill_ratio = post_size / baseline_size
+            refill_ok = refill_ratio <= srf_refill_ratio_max
+        else:
+            if spread_ticks[bar_idx] >= srf_min_spread_ticks:
+                future = mid[bar_idx + 1 : bar_idx + 1 + srf_refill_window_bars]
+                if future.size:
+                    if side == "long":
+                        refill_ok = np.nanmax(future) - mid[bar_idx] < tick_size
+                    else:
+                        refill_ok = mid[bar_idx] - np.nanmin(future) < tick_size
+        if not refill_ok:
+            return False, None, {}
+        flow_sum = (
+            float(np.sum(afr_flow_series[bar_idx + 1 : bar_idx + 1 + srf_flow_window_bars]))
+            if srf_flow_window_bars > 0
+            else 0.0
+        )
+        if srf_flow_confirm:
+            if side == "long" and flow_sum < srf_min_flow:
+                return False, None, {}
+            if side == "short" and flow_sum > -srf_min_flow:
+                return False, None, {}
+        return True, side, {
+            "srf_disp_ticks": float(disp_ticks),
+            "srf_speed": float(speed),
+            "srf_refill_ratio": float(refill_ratio),
+            "srf_flow_sum": float(flow_sum),
+        }
+
+    srf_horizons = [2, 5, 10, 20, 50]
+
+    def _srf_perfect_exec_stats(entry_idx: int, side: str) -> Dict[str, float]:
+        s = 1.0 if side == "long" else -1.0
+        entry_mid = mid[entry_idx]
+        out: Dict[str, float] = {
+            "entry_bar": float(entry_idx),
+            "side": 1.0 if side == "long" else -1.0,
+        }
+        if not np.isfinite(entry_mid):
+            for h in srf_horizons:
+                out[f"R_{h}"] = float("nan")
+            out["MFE_20"] = float("nan")
+            out["MAE_20"] = float("nan")
+            out["MFE_50"] = float("nan")
+            out["MAE_50"] = float("nan")
+            return out
+        for h in srf_horizons:
+            idx = entry_idx + h
+            if idx < n and np.isfinite(mid[idx]):
+                out[f"R_{h}"] = float(s * (mid[idx] - entry_mid) / tick_size)
+            else:
+                out[f"R_{h}"] = float("nan")
+        for h in (20, 50):
+            end = min(entry_idx + h, n - 1)
+            if end <= entry_idx:
+                out[f"MFE_{h}"] = float("nan")
+                out[f"MAE_{h}"] = float("nan")
+                continue
+            window = mid[entry_idx + 1 : end + 1]
+            diff = s * (window - entry_mid) / tick_size
+            out[f"MFE_{h}"] = float(np.nanmax(diff)) if diff.size else float("nan")
+            out[f"MAE_{h}"] = float(np.nanmax(-diff)) if diff.size else float("nan")
+        return out
 
     def _exit_sm_v1_action(
         pos_state: Dict[str, object],
@@ -1308,7 +1435,7 @@ def _simulate_day(
                 gate_diag["blocked_none"] += 1
             elif weak_side_val is not None:
                 gate_diag["blocked_mismatch"] += 1
-        if not gate_diag_printed:
+        if gate_debug and not gate_diag_printed:
             print(
                 f"GATE_DIAG_DECISION {symbol_str} {day_str} weak_side={weak_side_val} "
                 f"weak_side_dir={weak_side_dir_val} desired_side={desired_side_val} "
@@ -1492,6 +1619,8 @@ def _simulate_day(
     flat_candidate_printed = 0
     flat_suppress_printed = 0
     event_debug_printed = False
+    srf_mode_printed = False
+    srf_trigger_printed = 0
     exit_mode_norm = (exit_mode or "").strip().lower()
     use_exit_sm_v1 = exit_mode_norm == "exit_sm_v1"
     use_exit_sm_v2 = exit_mode_norm == "exit_sm_v2"
@@ -1506,8 +1635,18 @@ def _simulate_day(
         )
         event_debug_printed = True
     while i <= max_i:
+        entry_time = None
+        exit_bar = -1
+        side = ""
+        entry_px = float("nan")
+        entry_bar = -1
+        tp_level = float("nan")
+        sl_level = float("nan")
         # Evaluate signals each bar; otherwise a flat day would never increment counters.
-        desired_side_top = _signal(i)
+        if strategy_mode == "srf_entry_v1":
+            desired_side_top = None
+        else:
+            desired_side_top = _signal(i)
         if desired_side_top is not None:
             total_signals += 1
             if in_position:
@@ -1517,7 +1656,7 @@ def _simulate_day(
                     entry_candidates_when_flat += 1
         # DEBUG: prove we have flat candidates in this exact code path
         if (not in_position) and (desired_side_top is not None) and (not pending_entry_active):
-            if flat_candidate_printed < 5:
+            if debug_entry_print and flat_candidate_printed < 5:
                 print(
                     f"FLAT_CANDIDATE {symbol_str} {day_str} i={i} side={desired_side_top} "
                     f"spread_ticks={spread_ticks if 'spread_ticks' in locals() else 'NA'}",
@@ -1542,7 +1681,7 @@ def _simulate_day(
             entry_px = float(pos["entry_px"])
             tp_level = float(pos["tp_level"])
             sl_level = float(pos["sl_level"])
-            exit_bar = int(pos["exit_bar"])
+            exit_bar = int(pos.get("exit_bar", -1))
             exit_px = float("nan")
             pnl_ticks = float("nan")
             exit_reason_raw = str(pos.get("exit_reason", "TIME"))
@@ -1929,10 +2068,18 @@ def _simulate_day(
                             lbo_rearm_used_long = True
                         else:
                             lbo_rearm_used_short = True
+                entry_time = pos.get("entry_time")
+                if entry_time is None:
+                    entry_time = df_day["Time"].iloc[entry_bar]
+                    pos["entry_time"] = entry_time
                 if not use_exit_exec_v2:
                     eps = 1e-9
                     entry_spread = float(pos.get("entry_spread_ticks", 0.0))
                     floor_ticks = -(sl_ticks_local + entry_spread + eps)
+                entry_time = pos.get("entry_time")
+                if entry_time is None:
+                    entry_time = df_day["Time"].iloc[entry_bar]
+                    pos["entry_time"] = entry_time
                 if not np.isfinite(pnl_ticks):
                     if pnl_bound_printed < 5:
                         try:
@@ -1941,7 +2088,7 @@ def _simulate_day(
                                 {
                                     "side": side,
                                     "reason": exit_reason,
-                                    "entry_time": str(pos["entry_time"]),
+                                    "entry_time": str(entry_time),
                                     "exit_time": str(df_day["Time"].iloc[exit_bar]),
                                     "entry_px": float(entry_px),
                                     "exit_px": float(exit_px),
@@ -1956,7 +2103,7 @@ def _simulate_day(
                     i += 1
                     continue
                 if (not use_exit_exec_v2) and pnl_ticks < floor_ticks and pnl_bound_printed < 5:
-                    dt_ms = (df_day["Time"].iloc[exit_bar] - pos["entry_time"]).total_seconds() * 1000.0
+                    dt_ms = (df_day["Time"].iloc[exit_bar] - entry_time).total_seconds() * 1000.0
                     try:
                         print(
                             "PnL below bound:",
@@ -1965,7 +2112,7 @@ def _simulate_day(
                                 "floor_ticks": float(floor_ticks),
                                 "side": side,
                                 "reason": exit_reason,
-                                "entry_time": str(pos["entry_time"]),
+                                "entry_time": str(entry_time),
                                 "exit_time": str(df_day["Time"].iloc[exit_bar]),
                                 "entry_px": float(entry_px),
                                 "exit_px": float(exit_px),
@@ -1977,14 +2124,14 @@ def _simulate_day(
                     except OSError:
                         pass
                     pnl_bound_printed += 1
-                if not debug_trigger_printed and exit_reason in {"TP", "SL"}:
+                if exit_debug and (not debug_trigger_printed) and exit_reason in {"TP", "SL"}:
                     j0 = entry_bar + 1
                     j1 = min(entry_bar + 5, exit_bar)
                     series = (bid[j0 : j1 + 1] if side == "long" else ask[j0 : j1 + 1]).tolist()
                     try:
                         print(
                             f"Exit trigger debug: side={side} entry_bar={entry_bar} exit_bar={exit_bar} "
-                            f"entry_time={pos['entry_time']} exit_time={df_day['Time'].iloc[exit_bar]} "
+                            f"entry_time={entry_time} exit_time={df_day['Time'].iloc[exit_bar]} "
                             f"entry_px={entry_px:.2f} exit_px={exit_px:.2f} tp_level={tp_level:.2f} sl_level={sl_level:.2f} "
                             f"series={series} first_cross_bar={exit_bar} reason={exit_reason}",
                             flush=True,
@@ -2005,7 +2152,7 @@ def _simulate_day(
                     passive_fallback_count += 1
                 trades.append(
                     {
-                        "entry_time": pos["entry_time"],
+                        "entry_time": entry_time,
                         "exit_time": df_day["Time"].iloc[exit_bar],
                         "side": side,
                         "entry_px": float(entry_px),
@@ -2052,6 +2199,10 @@ def _simulate_day(
                         "lbo_weak_side": str(pos.get("lbo_weak_side", "")),
                         "lbo_break_ticks": float(pos.get("lbo_break_ticks", float("nan"))),
                         "lbo_flow_align_sum": float(pos.get("lbo_flow_align_sum", 0.0)),
+                        "srf_disp_ticks": float(pos.get("srf_disp_ticks", float("nan"))),
+                        "srf_speed": float(pos.get("srf_speed", float("nan"))),
+                        "srf_refill_ratio": float(pos.get("srf_refill_ratio", float("nan"))),
+                        "srf_flow_sum": float(pos.get("srf_flow_sum", float("nan"))),
                     }
                 )
                 pnl_ticks_total += float(pnl_ticks)
@@ -2065,6 +2216,10 @@ def _simulate_day(
             # Still in a position after exit handling; skip entry logic.
             i += 1
             continue
+
+        if strategy_mode == "srf_entry_v1" and srf_debug and not srf_mode_printed:
+            print(f"{symbol_str} {day_str} SRF_SIDE_MODE={srf_side_mode}", flush=True)
+            srf_mode_printed = True
 
         pending_confirmed = False
         pending_payload: Dict[str, object] | None = None
@@ -2118,6 +2273,10 @@ def _simulate_day(
         break_level = float("nan")
         absorption_level = float("nan")
         absorption_bar = -1
+        srf_disp_ticks = float("nan")
+        srf_speed = float("nan")
+        srf_refill_ratio = float("nan")
+        srf_flow_sum = float("nan")
         lbo_break_ticks_entry = float("nan")
         lbo_flow_align_sum = 0.0
         lbo_direction = ""
@@ -2136,6 +2295,8 @@ def _simulate_day(
         if strategy_mode == "absorption_failure_v2":
             entry_bar = i
         if strategy_mode == "lrams_breakout_v1":
+            entry_bar = i
+        if strategy_mode == "srf_entry_v1":
             entry_bar = i
         if pending_confirmed:
             entry_bar = i
@@ -2188,6 +2349,44 @@ def _simulate_day(
             impulse_ticks = float(pending_payload.get("impulse_ticks", float("nan")))
             dmid_ticks = float(pending_payload.get("dmid_ticks", float("nan")))
 
+        use_srf_entry = strategy_mode == "srf_entry_v1"
+        srf_trigger = False
+        raw_side = None
+        if desired_side is None and use_srf_entry:
+            srf_checked += 1
+            srf_ok, srf_side, srf_feats = _check_srf_event(i)
+            if srf_ok and srf_side is not None:
+                srf_triggered += 1
+                srf_trigger = True
+                raw_side = srf_side
+                if raw_side == "long":
+                    srf_raw_long += 1
+                else:
+                    srf_raw_short += 1
+                if srf_side_mode == "fade":
+                    desired_side = "short" if raw_side == "long" else "long"
+                else:
+                    desired_side = raw_side
+                if srf_debug and srf_trigger_printed < 10:
+                    print(
+                        f"SRF trig bar={i} raw={raw_side} mode={srf_side_mode} desired={desired_side}",
+                        flush=True,
+                    )
+                    srf_trigger_printed += 1
+                entry_reason = "srf"
+                entry_reason_label = "srf_disp_refill"
+                entry_root_reason = "srf"
+                entry_exec_reason = "srf"
+                srf_disp_ticks = float(srf_feats.get("srf_disp_ticks", float("nan")))
+                srf_speed = float(srf_feats.get("srf_speed", float("nan")))
+                srf_refill_ratio = float(srf_feats.get("srf_refill_ratio", float("nan")))
+                srf_flow_sum = float(srf_feats.get("srf_flow_sum", float("nan")))
+            if desired_side is None:
+                i += 1
+                continue
+        if desired_side is None and use_srf_entry:
+            i += 1
+            continue
         if desired_side is None and strategy_mode == "impulse_confirm_v1":
             impulse_signals_checked += 1
             impulse_ticks = impulse_ticks_series[i]
@@ -3062,7 +3261,7 @@ def _simulate_day(
                 mmas_passed_filters += 1
             if desired_side is not None:
                 mmas_signaled += 1
-        else:
+        elif desired_side is None:
             desired_side = _signal(i)
             if desired_side is not None and i >= lookback_bars and np.isfinite(mid[i]) and np.isfinite(mid[i - lookback_bars]):
                 dmid = mid[i] - mid[i - lookback_bars]
@@ -3072,7 +3271,7 @@ def _simulate_day(
         if desired_side is None:
             i += 1
             continue
-        if flat_candidate_printed < 5:
+        if debug_entry_print and flat_candidate_printed < 5:
             print(
                 f"FLAT_CANDIDATE {symbol_str} {day_str} t={i} side={desired_side}",
                 flush=True,
@@ -3749,6 +3948,8 @@ def _simulate_day(
             entry_reason_std = "afr2"
         elif strategy_mode == "absorption_failure_v3":
             entry_reason_std = "afr3"
+        elif strategy_mode == "srf_entry_v1":
+            entry_reason_std = "srf"
         if entry_exec_reason is None:
             entry_exec_reason = entry_reason_std
         if entry_root_reason is None:
@@ -3813,12 +4014,21 @@ def _simulate_day(
             "lbo_weak_side": lbo_weak_side,
             "lbo_break_ticks": float(lbo_break_ticks_entry) if np.isfinite(lbo_break_ticks_entry) else float("nan"),
             "lbo_flow_align_sum": float(lbo_flow_align_sum),
+            "srf_disp_ticks": float(srf_disp_ticks) if np.isfinite(srf_disp_ticks) else float("nan"),
+            "srf_speed": float(srf_speed) if np.isfinite(srf_speed) else float("nan"),
+            "srf_refill_ratio": float(srf_refill_ratio) if np.isfinite(srf_refill_ratio) else float("nan"),
+            "srf_flow_sum": float(srf_flow_sum) if np.isfinite(srf_flow_sum) else float("nan"),
             "side": desired_side,
             "gate_event_age": int(gate_event_age),
             "gate_asym_val": float(gate_asym_val),
             "gate_thr_val": float(gate_thr_val),
         }
-        if gated and gate_enabled:
+        if strategy_mode == "srf_entry_v1":
+            if not srf_trigger:
+                raise RuntimeError("SRF entry without trigger.")
+            if entry_reason_std != "srf" or entry_root_reason != "srf":
+                raise RuntimeError("SRF entry missing entry_reason labels.")
+        if gate_debug and gated and gate_enabled:
             try:
                 print(
                     f"GATE_ENTRY {symbol_str} {day_str} mode={gate_mode} "
@@ -3840,6 +4050,19 @@ def _simulate_day(
             afr2_entered += 1
         if strategy_mode == "absorption_failure_v3":
             afr3_entered += 1
+        if strategy_mode == "srf_entry_v1":
+            srf_entered += 1
+            if desired_side == "long":
+                srf_exec_long += 1
+            else:
+                srf_exec_short += 1
+            srf_stat = _srf_perfect_exec_stats(entry_bar, desired_side)
+            srf_stat["srf_disp_ticks"] = float(srf_disp_ticks) if np.isfinite(srf_disp_ticks) else float("nan")
+            srf_stat["srf_speed"] = float(srf_speed) if np.isfinite(srf_speed) else float("nan")
+            srf_stat["srf_refill_ratio"] = float(srf_refill_ratio) if np.isfinite(srf_refill_ratio) else float("nan")
+            srf_stat["srf_flow_sum"] = float(srf_flow_sum) if np.isfinite(srf_flow_sum) else float("nan")
+            srf_stat["spread_ticks_entry"] = float(spread_ticks[entry_bar])
+            srf_event_stats.append(srf_stat)
         if strategy_mode == "lrams_breakout_v1":
             if lbo_entry_mode == "confirm":
                 lbo_confirm_entered += 1
@@ -3945,6 +4168,18 @@ def _simulate_day(
             f"mean_pnl_per_trade={mean_pnl:.4f}",
             flush=True,
         )
+    if strategy_mode == "srf_entry_v1":
+        # In SRF mode, candidate counts reflect post-viability gateable candidates.
+        if gated:
+            entry_candidates_when_flat = int(blocked_signals + gate_diag.get("allowed_count", 0))
+        else:
+            entry_candidates_when_flat = int(entries_taken)
+        if srf_debug:
+            print(
+                f"{symbol_str} {day_str} SRF raw long={srf_raw_long} short={srf_raw_short} | "
+                f"exec long={srf_exec_long} short={srf_exec_short}",
+                flush=True,
+            )
 
     return (
         pd.DataFrame(trades),
@@ -4023,6 +4258,10 @@ def _simulate_day(
         mmas_passed_filters,
         mmas_signaled,
         mmas_entered,
+        srf_checked,
+        srf_triggered,
+        srf_entered,
+        srf_event_stats,
         impulse_signals_checked,
         impulse_passed_threshold,
         impulse_passed_confirm,
@@ -4481,6 +4720,20 @@ def main() -> None:
     mmas_min_flow_abs = float(os.environ.get("MMAS_MIN_FLOW_ABS", "20"))
     mmas_require_agree = os.environ.get("MMAS_REQUIRE_AGREE", "1").strip() == "1"
     debug_first_mmas = os.environ.get("DEBUG_FIRST_MMAS", "0").strip() == "1"
+    srf_min_disp_ticks = int(os.environ.get("SRF_MIN_DISP_TICKS", "3"))
+    srf_disp_window_bars = int(os.environ.get("SRF_DISP_WINDOW_BARS", "5"))
+    srf_min_speed_ticks_per_bar = float(os.environ.get("SRF_MIN_SPEED_TICKS_PER_BAR", "0.6"))
+    srf_refill_window_bars = int(os.environ.get("SRF_REFILL_WINDOW_BARS", "5"))
+    srf_baseline_bars = int(os.environ.get("SRF_BASELINE_BARS", "20"))
+    srf_refill_ratio_max = float(os.environ.get("SRF_REFILL_RATIO_MAX", "0.6"))
+    srf_min_spread_ticks = int(os.environ.get("SRF_MIN_SPREAD_TICKS", "1"))
+    srf_flow_confirm = os.environ.get("SRF_FLOW_CONFIRM", "0").strip() == "1"
+    srf_flow_window_bars = int(os.environ.get("SRF_FLOW_WINDOW_BARS", "5"))
+    srf_min_flow = float(os.environ.get("SRF_MIN_FLOW", "0"))
+    srf_side_mode = os.environ.get("SRF_SIDE_MODE", "follow").strip().lower()
+    if srf_side_mode not in {"follow", "fade"}:
+        raise ValueError(f"Invalid SRF_SIDE_MODE: {srf_side_mode}")
+    srf_debug = os.environ.get("SRF_DEBUG", "0").strip().lower() in {"1", "true", "yes", "y"}
     trade_session = os.environ.get("TRADE_SESSION", "all").strip().lower()
     min_spread_ticks = int(os.environ.get("MIN_SPREAD_TICKS", "0"))
     entry_cooldown_bars = int(os.environ.get("ENTRY_COOLDOWN_BARS", "10"))
@@ -4549,6 +4802,18 @@ def main() -> None:
             "mmas_min_dmid_ticks": mmas_min_dmid_ticks,
             "mmas_min_flow_abs": mmas_min_flow_abs,
             "mmas_require_agree": mmas_require_agree,
+            "srf_min_disp_ticks": srf_min_disp_ticks,
+            "srf_disp_window_bars": srf_disp_window_bars,
+            "srf_min_speed_ticks_per_bar": srf_min_speed_ticks_per_bar,
+            "srf_refill_window_bars": srf_refill_window_bars,
+            "srf_baseline_bars": srf_baseline_bars,
+            "srf_refill_ratio_max": srf_refill_ratio_max,
+            "srf_min_spread_ticks": srf_min_spread_ticks,
+            "srf_flow_confirm": srf_flow_confirm,
+            "srf_flow_window_bars": srf_flow_window_bars,
+            "srf_min_flow": srf_min_flow,
+            "srf_side_mode": srf_side_mode,
+            "srf_debug": srf_debug,
             "trade_session": trade_session,
             "min_spread_ticks": min_spread_ticks,
             "entry_cooldown_bars": entry_cooldown_bars,
@@ -4580,6 +4845,18 @@ def main() -> None:
             "impulse_min_ticks": impulse_min_ticks,
             "confirm_bars": confirm_bars,
             "confirm_require_nonzero": confirm_require_nonzero,
+            "srf_min_disp_ticks": srf_min_disp_ticks,
+            "srf_disp_window_bars": srf_disp_window_bars,
+            "srf_min_speed_ticks_per_bar": srf_min_speed_ticks_per_bar,
+            "srf_refill_window_bars": srf_refill_window_bars,
+            "srf_baseline_bars": srf_baseline_bars,
+            "srf_refill_ratio_max": srf_refill_ratio_max,
+            "srf_min_spread_ticks": srf_min_spread_ticks,
+            "srf_flow_confirm": srf_flow_confirm,
+            "srf_flow_window_bars": srf_flow_window_bars,
+            "srf_min_flow": srf_min_flow,
+            "srf_side_mode": srf_side_mode,
+            "srf_debug": srf_debug,
             "afr_k_bars": afr_k_bars,
             "afr_min_flow_abs": afr_min_flow_abs,
             "afr_stall_ticks": afr_stall_ticks,
@@ -4802,6 +5079,8 @@ def main() -> None:
                     summaries = []
                     all_base = []
                     all_gated = []
+                    srf_events_base_all: List[Dict[str, float]] = []
+                    srf_events_gate_all: List[Dict[str, float]] = []
                     all_events = []
                     strategy_rows = []
                     gate_max_dds: List[float] = []
@@ -4944,10 +5223,14 @@ def main() -> None:
                             lbo_pull_resumed_entered_base,
                             lbo_pull_expired_base,
                             mmas_checked_base,
-                                    mmas_passed_base,
-                                    mmas_signaled_base,
-                                    mmas_entered_base,
-                                    impulse_checked_base,
+                            mmas_passed_base,
+                            mmas_signaled_base,
+                            mmas_entered_base,
+                            srf_checked_base,
+                            srf_triggered_base,
+                            srf_entered_base,
+                            srf_event_stats_base,
+                            impulse_checked_base,
                                     impulse_passed_thr_base,
                                     impulse_passed_confirm_base,
                                     impulse_entered_base,
@@ -4991,6 +5274,18 @@ def main() -> None:
                                     mmas_min_flow_abs=mmas_min_flow_abs,
                                     mmas_require_agree=mmas_require_agree,
                                     debug_first_mmas=debug_first_mmas,
+                                    srf_min_disp_ticks=srf_min_disp_ticks,
+                                    srf_disp_window_bars=srf_disp_window_bars,
+                                    srf_min_speed_ticks_per_bar=srf_min_speed_ticks_per_bar,
+                                    srf_refill_window_bars=srf_refill_window_bars,
+                                    srf_baseline_bars=srf_baseline_bars,
+                                    srf_refill_ratio_max=srf_refill_ratio_max,
+                                    srf_min_spread_ticks=srf_min_spread_ticks,
+                                    srf_flow_confirm=srf_flow_confirm,
+                                    srf_flow_window_bars=srf_flow_window_bars,
+                                    srf_min_flow=srf_min_flow,
+                                    srf_side_mode=srf_side_mode,
+                                    srf_debug=srf_debug,
                                     trade_session=trade_session,
                                     min_spread_ticks=min_spread_ticks,
                                     entry_cooldown_bars=entry_cooldown_bars,
@@ -5263,10 +5558,14 @@ def main() -> None:
                         lbo_pull_resumed_entered_gate,
                         lbo_pull_expired_gate,
                         mmas_checked_gate,
-                                mmas_passed_gate,
-                                mmas_signaled_gate,
-                                mmas_entered_gate,
-                                impulse_checked_gate,
+                        mmas_passed_gate,
+                        mmas_signaled_gate,
+                        mmas_entered_gate,
+                        srf_checked_gate,
+                        srf_triggered_gate,
+                        srf_entered_gate,
+                        srf_event_stats_gate,
+                        impulse_checked_gate,
                                 impulse_passed_thr_gate,
                                 impulse_passed_confirm_gate,
                                 impulse_entered_gate,
@@ -5307,10 +5606,22 @@ def main() -> None:
                                 max_spread_ticks_for_entry=max_spread_ticks_for_entry,
                                 mmas_k_bars=mmas_k_bars,
                                 mmas_min_dmid_ticks=mmas_min_dmid_ticks,
-                                mmas_min_flow_abs=mmas_min_flow_abs,
-                                mmas_require_agree=mmas_require_agree,
-                                debug_first_mmas=debug_first_mmas,
-                                trade_session=trade_session,
+                                    mmas_min_flow_abs=mmas_min_flow_abs,
+                                    mmas_require_agree=mmas_require_agree,
+                                    debug_first_mmas=debug_first_mmas,
+                                    srf_min_disp_ticks=srf_min_disp_ticks,
+                                    srf_disp_window_bars=srf_disp_window_bars,
+                                    srf_min_speed_ticks_per_bar=srf_min_speed_ticks_per_bar,
+                                    srf_refill_window_bars=srf_refill_window_bars,
+                                    srf_baseline_bars=srf_baseline_bars,
+                                    srf_refill_ratio_max=srf_refill_ratio_max,
+                                    srf_min_spread_ticks=srf_min_spread_ticks,
+                                    srf_flow_confirm=srf_flow_confirm,
+                                    srf_flow_window_bars=srf_flow_window_bars,
+                                    srf_min_flow=srf_min_flow,
+                                    srf_side_mode=srf_side_mode,
+                                    srf_debug=srf_debug,
+                                    trade_session=trade_session,
                                 min_spread_ticks=min_spread_ticks,
                                 entry_cooldown_bars=entry_cooldown_bars,
                                 gate_lookback_bars=gate_lookback_bars,
@@ -5480,6 +5791,16 @@ def main() -> None:
                             trades_gate["strategy_mode"] = strategy_mode
                             all_base.append(trades_base)
                             all_gated.append(trades_gate)
+                            for srf_stat in srf_event_stats_base:
+                                srf_stat["date"] = day
+                                srf_stat["Symbol"] = instrument
+                                srf_stat["strategy"] = "baseline"
+                                srf_events_base_all.append(srf_stat)
+                            for srf_stat in srf_event_stats_gate:
+                                srf_stat["date"] = day
+                                srf_stat["Symbol"] = instrument
+                                srf_stat["strategy"] = "gated"
+                                srf_events_gate_all.append(srf_stat)
                             if validate_debug and run_baseline:
                                 base_trade_count = int(len(trades_base))
                                 print(
@@ -5954,6 +6275,15 @@ def main() -> None:
                                     raise RuntimeError("LBO base pos-open count does not match trade count.")
                                 if len(trades_gate) != entries_taken_gate:
                                     raise RuntimeError("LBO gate pos-open count does not match trade count.")
+                            if strategy_mode == "srf_entry_v1":
+                                if len(trades_base) != srf_entered_base:
+                                    raise RuntimeError("SRF base entered count does not match trade count.")
+                                if len(trades_gate) != srf_entered_gate:
+                                    raise RuntimeError("SRF gate entered count does not match trade count.")
+                                if srf_entered_base > srf_triggered_base:
+                                    raise RuntimeError("SRF base entered exceeds SRF triggered count.")
+                                if srf_entered_gate > srf_triggered_gate:
+                                    raise RuntimeError("SRF gate entered exceeds SRF triggered count.")
                             if strategy_mode == "absorption_failure_v2":
                                 if afr_enter_on == "break" and (count_ft_entries_base > 0 or count_ft_entries_gate > 0):
                                     raise RuntimeError("AFR_ENTER_ON=break but FT entries were recorded.")
@@ -6043,6 +6373,12 @@ def main() -> None:
                                     "gate_entry_candidates_when_flat": int(entry_candidates_flat_gate),
                                     "base_long_candidates": int(strategy_long_base),
                                     "base_short_candidates": int(strategy_short_base),
+                                    "srf_checked_base": int(srf_checked_base),
+                                    "srf_triggered_base": int(srf_triggered_base),
+                                    "srf_entered_base": int(srf_entered_base),
+                                    "srf_checked_gate": int(srf_checked_gate),
+                                    "srf_triggered_gate": int(srf_triggered_gate),
+                                    "srf_entered_gate": int(srf_entered_gate),
                                     "impulse_checked_base": int(impulse_checked_base),
                                     "impulse_passed_threshold_base": int(impulse_passed_thr_base),
                                     "impulse_passed_confirm_base": int(impulse_passed_confirm_base),
@@ -6520,6 +6856,86 @@ def main() -> None:
             if not mfe_root_agg.empty:
                 print("MFE thresholds aggregate (entry_root_reason):", flush=True)
                 print(mfe_root_agg.to_string(index=False), flush=True)
+        if srf_events_base_all or srf_events_gate_all:
+            srf_all = pd.DataFrame(srf_events_base_all + srf_events_gate_all)
+            if not srf_all.empty:
+                srf_horizons = [2, 5, 10, 20, 50]
+                for strat in ["baseline", "gated"]:
+                    sub = srf_all[srf_all["strategy"] == strat].copy()
+                    if sub.empty:
+                        continue
+                    rows = []
+                    for h in srf_horizons:
+                        vals = pd.to_numeric(sub.get(f"R_{h}", pd.Series(dtype=float)), errors="coerce").dropna()
+                        rows.append(
+                            {
+                                "h_bars": h,
+                                "count": int(vals.size),
+                                "mean_R": float(vals.mean()) if not vals.empty else 0.0,
+                                "median_R": float(vals.median()) if not vals.empty else 0.0,
+                            }
+                        )
+                    print(f"SRF perfect-exec forward returns ({strat}):", flush=True)
+                    print(pd.DataFrame(rows).to_string(index=False), flush=True)
+                    for h in [20, 50]:
+                        mfe = pd.to_numeric(sub.get(f"MFE_{h}", pd.Series(dtype=float)), errors="coerce").dropna()
+                        mae = pd.to_numeric(sub.get(f"MAE_{h}", pd.Series(dtype=float)), errors="coerce").dropna()
+                        pct_mfe_ge_2 = float((mfe >= 2).mean()) if not mfe.empty else 0.0
+                        pct_mfe_ge_4 = float((mfe >= 4).mean()) if not mfe.empty else 0.0
+                        pct_mfe_ge_6 = float((mfe >= 6).mean()) if not mfe.empty else 0.0
+                        mae_q = mae.quantile([0.5, 0.9, 0.95, 0.99]).to_dict() if not mae.empty else {}
+                        print(
+                            f"SRF MFE/MAE H={h} ({strat}) count={int(len(mfe))} "
+                            f"pct_mfe_ge_2={pct_mfe_ge_2:.3f} pct_mfe_ge_4={pct_mfe_ge_4:.3f} pct_mfe_ge_6={pct_mfe_ge_6:.3f} "
+                            f"mae_med={mae_q.get(0.5, 0.0):.3f} mae_p90={mae_q.get(0.9, 0.0):.3f} "
+                            f"mae_p95={mae_q.get(0.95, 0.0):.3f} mae_p99={mae_q.get(0.99, 0.0):.3f}",
+                            flush=True,
+                        )
+                    mfe_20 = pd.to_numeric(sub.get("MFE_20", pd.Series(dtype=float)), errors="coerce")
+                    mae_20 = pd.to_numeric(sub.get("MAE_20", pd.Series(dtype=float)), errors="coerce")
+                    fail_mask = (mfe_20 < 2) & mfe_20.notna()
+                    fail_mae = mae_20[fail_mask].dropna()
+                    if not fail_mae.empty:
+                        q = fail_mae.quantile([0.5, 0.9, 0.95, 0.99]).to_dict()
+                        print(
+                            f"SRF fail MAE_20 ({strat}) count={int(fail_mae.size)} "
+                            f"med={q.get(0.5, 0.0):.3f} p90={q.get(0.9, 0.0):.3f} "
+                            f"p95={q.get(0.95, 0.0):.3f} p99={q.get(0.99, 0.0):.3f}",
+                            flush=True,
+                        )
+                    disp_abs = pd.to_numeric(sub.get("srf_disp_ticks", pd.Series(dtype=float)), errors="coerce").abs()
+                    spread_entry = pd.to_numeric(sub.get("spread_ticks_entry", pd.Series(dtype=float)), errors="coerce")
+                    disp_bucket = pd.Series(pd.NA, index=sub.index, dtype=object)
+                    disp_bucket[(disp_abs >= 3) & (disp_abs <= 4)] = "3-4"
+                    disp_bucket[(disp_abs >= 5) & (disp_abs <= 6)] = "5-6"
+                    disp_bucket[disp_abs >= 7] = "7+"
+                    spread_bucket = pd.Series(pd.NA, index=sub.index, dtype=object)
+                    spread_bucket[spread_entry == 1] = "1"
+                    spread_bucket[spread_entry >= 2] = "2+"
+                    bucket_rows = []
+                    for (db, sb), g in sub.groupby([disp_bucket, spread_bucket], dropna=True):
+                        r20 = pd.to_numeric(g.get("R_20", pd.Series(dtype=float)), errors="coerce").dropna()
+                        r50 = pd.to_numeric(g.get("R_50", pd.Series(dtype=float)), errors="coerce").dropna()
+                        if r20.empty and r50.empty:
+                            continue
+                        mean_spread = float(spread_entry.loc[g.index].mean()) if not spread_entry.loc[g.index].empty else 0.0
+                        mean_r20 = float(r20.mean()) if not r20.empty else 0.0
+                        mean_r50 = float(r50.mean()) if not r50.empty else 0.0
+                        bucket_rows.append(
+                            {
+                                "disp_bucket": db,
+                                "spread_bucket": sb,
+                                "count": int(len(g)),
+                                "mean_R20": mean_r20,
+                                "median_R20": float(r20.median()) if not r20.empty else 0.0,
+                                "mean_R50": mean_r50,
+                                "median_R50": float(r50.median()) if not r50.empty else 0.0,
+                                "EV_net_20": mean_r20 - mean_spread,
+                            }
+                        )
+                    if bucket_rows:
+                        print(f"SRF stratified buckets ({strat}):", flush=True)
+                        print(pd.DataFrame(bucket_rows).to_string(index=False), flush=True)
         exit_by_day = _exit_breakdown_stats(all_trades)
         if not exit_by_day.empty:
             exit_by_day_path = out_dir / f"exit_breakdown_by_day_{strategy_mode}_W{w_tag}_gate_{gate_tag}.csv"
