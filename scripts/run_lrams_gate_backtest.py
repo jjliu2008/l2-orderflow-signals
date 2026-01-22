@@ -589,6 +589,7 @@ def _simulate_day(
     srf_debug: bool,
     srf_arm_bars: int,
     srf_arm_mode: str,
+    srf_arm_source: str,
     runner_trail_start_ticks: int,
     runner_trail_giveback_ticks: int,
     passive_exit_enabled: bool,
@@ -1659,7 +1660,7 @@ def _simulate_day(
         event_debug_printed = True
     if validate_debug:
         print(
-            f"SRF_ARM_DEBUG {symbol_str} {day_str} bars={srf_arm_bars} mode={srf_arm_mode}",
+            f"SRF_ARM_DEBUG {symbol_str} {day_str} bars={srf_arm_bars} source={srf_arm_source} mode={srf_arm_mode}",
             flush=True,
         )
     while i <= max_i:
@@ -4392,11 +4393,25 @@ def _simulate_day(
             delta_med = 0.0
             delta_p90 = 0.0
             delta_max = -1
+        avg_armed = float(srf_armed_bars_total / srf_arm_events) if srf_arm_events > 0 else 0.0
         print(
-            f"SRF_ARM_STATS {symbol_str} {day_str} triggers={srf_arm_events} "
-            f"armed_bars={srf_armed_bars_total} candidates={len(srf_candidate_deltas)} "
-            f"cand_outside_window={srf_candidates_outside_window} "
+            f"SRF_ARM_STATS {symbol_str} {day_str} bars={srf_arm_bars} source={srf_arm_source} "
+            f"triggers={srf_arm_events} armed_bars={srf_armed_bars_total} avg_armed={avg_armed:.2f} "
+            f"candidates={len(srf_candidate_deltas)} cand_outside_window={srf_candidates_outside_window} "
             f"delta_min={delta_min} delta_med={delta_med:.1f} delta_p90={delta_p90:.1f} delta_max={delta_max}",
+            flush=True,
+        )
+        if srf_arm_events > 0 and abs(avg_armed - float(srf_arm_bars)) > 1.5:
+            print(
+                f"SRF_ARM_WARN {symbol_str} {day_str} avg_armed={avg_armed:.2f} "
+                f"expected~{float(srf_arm_bars):.2f}",
+                flush=True,
+            )
+    if strategy_mode == "srf_entry_v1" and gate_mode == "srf_compatible":
+        avg_armed_day = float(srf_armed_bars_total / srf_arm_events) if srf_arm_events > 0 else 0.0
+        print(
+            f"SRF_ARM_DAY {symbol_str} {day_str} bars={srf_arm_bars} source={srf_arm_source} "
+            f"armed_bars={srf_armed_bars_total} arm_events={srf_arm_events} avg_armed={avg_armed_day:.2f}",
             flush=True,
         )
         if strategy_mode == "srf_entry_v1" and entry_candidates_when_flat > 0:
@@ -5554,7 +5569,22 @@ def main() -> None:
                             )
 
                             debug_entry = strategy_mode == "micro_momo_v1" and day == selected_days[0]
-                            srf_arm_bars_eff = srf_arm_bars if srf_arm_bars is not None else gate_lookback_bars
+                            if strategy_mode == "srf_entry_v1" and gate_mode == "srf_compatible":
+                                if srf_arm_bars is not None:
+                                    srf_arm_bars_eff = srf_arm_bars
+                                    srf_arm_source_eff = "env"
+                                else:
+                                    srf_arm_bars_eff = gate_lookback_bars
+                                    srf_arm_source_eff = "W"
+                            else:
+                                srf_arm_bars_eff = srf_arm_bars if srf_arm_bars is not None else gate_lookback_bars
+                                srf_arm_source_eff = "env" if srf_arm_bars is not None else "W"
+                            if strategy_mode == "srf_entry_v1" and gate_mode == "srf_compatible" and day_index == 1:
+                                print(
+                                    f"SRF_ARM_RESOLVED W={gate_lookback_bars} bars={srf_arm_bars_eff} "
+                                    f"source={srf_arm_source_eff}",
+                                    flush=True,
+                                )
                             run_baseline = run_mode != "gated_only"
                             if run_baseline:
                                 (
@@ -5699,6 +5729,7 @@ def main() -> None:
                                     srf_debug=srf_debug,
                                     srf_arm_bars=srf_arm_bars_eff,
                                     srf_arm_mode=srf_arm_mode,
+                                    srf_arm_source=srf_arm_source_eff,
                                     trade_session=trade_session,
                                     min_spread_ticks=min_spread_ticks,
                                     entry_cooldown_bars=entry_cooldown_bars,
@@ -6046,6 +6077,7 @@ def main() -> None:
                                     srf_debug=srf_debug,
                                 srf_arm_bars=srf_arm_bars_eff,
                                 srf_arm_mode=srf_arm_mode,
+                                srf_arm_source=srf_arm_source_eff,
                                     trade_session=trade_session,
                                 min_spread_ticks=min_spread_ticks,
                                 entry_cooldown_bars=entry_cooldown_bars,
