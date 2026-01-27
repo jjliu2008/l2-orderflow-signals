@@ -22,7 +22,7 @@ Baseline:
   HOLD_BARS               holding horizon H (default: 20)
   BASELINE_MODE           flat|not_awful|mmas (default: flat)
   BASELINE_K_BARS         window for not_awful (default: 5)
-  STRATEGY_MODE           baseline_flat|micro_momo_v1|impulse_confirm_v1|absorption_failure_v1|absorption_failure_v2|absorption_failure_v3|lrams_breakout_v1|srf_entry_v1 (default: micro_momo_v1)
+  STRATEGY_MODE           baseline_flat|micro_momo_v1|impulse_confirm_v1|absorption_failure_v1|absorption_failure_v2|absorption_failure_v3|lrams_breakout_v1|srf_entry_v1|entry_alpha_v1 (default: micro_momo_v1)
   MICRO_K_BARS            micro momentum window (default: 5)
   MICRO_IMPULSE_TICKS     min impulse ticks (default: 1)
   MICRO_FLOW_MIN          min abs flow (default: 0)
@@ -185,6 +185,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from src.data_loader import load_all_raw_data
+from src.entry_alpha import EntryAlphaEngine, EntryAlphaParams, entry_alpha_self_test
 
 
 def _forward_roll_min(arr: np.ndarray, window: int) -> np.ndarray:
@@ -594,6 +595,8 @@ def _simulate_day(
     runner_trail_giveback_ticks: int,
     passive_exit_enabled: bool,
     passive_exit_bars: int,
+    entry_alpha_params: EntryAlphaParams | None = None,
+    entry_alpha_gate_mode: str | None = None,
 ) -> Tuple[object, ...]:
     bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
     ask = pd.to_numeric(df_day["ask_price_1"], errors="coerce").to_numpy()
@@ -612,6 +615,33 @@ def _simulate_day(
         lbo_confirm_price = pd.to_numeric(df_day["last_price"], errors="coerce").fillna(np.nan).to_numpy()
     else:
         lbo_confirm_price = mid
+    if "last_price" in df_day.columns:
+        last = pd.to_numeric(df_day["last_price"], errors="coerce").fillna(mid).to_numpy()
+    elif "last" in df_day.columns:
+        last = pd.to_numeric(df_day["last"], errors="coerce").fillna(mid).to_numpy()
+    else:
+        last = mid
+    has_high = "high" in df_day.columns
+    if has_high:
+        high = pd.to_numeric(df_day["high"], errors="coerce").fillna(last).to_numpy()
+    else:
+        high = last
+    has_low = "low" in df_day.columns
+    if has_low:
+        low = pd.to_numeric(df_day["low"], errors="coerce").fillna(last).to_numpy()
+    else:
+        low = last
+    range_ticks = (high - low) / tick_size
+    if not has_high and not has_low:
+        last_shift = np.roll(last, 1)
+        last_shift[0] = last[0]
+        range_ticks = np.abs(last - last_shift) / tick_size
+    if "trades" in df_day.columns:
+        trades_arr = pd.to_numeric(df_day["trades"], errors="coerce").fillna(0.0).to_numpy()
+    elif "trade_count" in df_day.columns:
+        trades_arr = pd.to_numeric(df_day["trade_count"], errors="coerce").fillna(0.0).to_numpy()
+    else:
+        trades_arr = np.zeros(len(df_day), dtype=float)
     day_str = str(df_day["date"].iloc[0]) if "date" in df_day.columns and not df_day.empty else "unknown"
     symbol_str = str(df_day["Symbol"].iloc[0]) if "Symbol" in df_day.columns and not df_day.empty else "NA"
     entry_confirm_style = entry_confirm_style.strip().lower()
@@ -629,6 +659,13 @@ def _simulate_day(
     n = len(df_day)
     trades: List[Dict[str, float]] = []
     pnl_ticks_total = 0.0
+    entry_alpha_engine: EntryAlphaEngine | None = None
+    entry_alpha_gate_mode_norm = (entry_alpha_gate_mode or "").strip().lower()
+    if strategy_mode == "entry_alpha_v1":
+        if entry_alpha_params is None:
+            entry_alpha_params = EntryAlphaParams()
+        _apply_entry_alpha_overrides(entry_alpha_params)
+        entry_alpha_engine = EntryAlphaEngine(entry_alpha_params, tick_size)
     skipped = 0
     srf_checked = 0
     srf_triggered = 0
@@ -1397,6 +1434,33 @@ def _simulate_day(
             return "ask_weak"
         return "bid_weak"
 
+    def _entry_alpha_lrams_gate_ok(entry_bar_val: int, desired_side_val: str) -> bool:
+        if event_pos_all.size == 0:
+            return False
+        if gate_mode == "side_matched":
+            weak_side_val = _lbo_weak_side(entry_bar_val)
+            if weak_side_val is None:
+                return False
+            weak_side_dir_val = "long" if weak_side_val == "ask_weak" else "short"
+            if desired_side_val != weak_side_dir_val:
+                return False
+            if desired_side_val == "long":
+                event_pos_val = event_pos_buy
+                event_asym_val = event_asym_buy
+                event_thr_val = event_thr_buy
+            else:
+                event_pos_val = event_pos_sell
+                event_asym_val = event_asym_sell
+                event_thr_val = event_thr_sell
+        else:
+            event_pos_val = event_pos_all
+            event_asym_val = event_asym_all
+            event_thr_val = event_thr_all
+        idx_pos, _ = _lbo_latest_event_idx(
+            event_pos_val, event_asym_val, event_thr_val, entry_bar_val, gate_lookback_bars
+        )
+        return idx_pos is not None
+
     def _mark_lbo_break_for_ft_on_block(
         entry_reason_val: str | None,
         side_val: str | None,
@@ -1684,7 +1748,9 @@ def _simulate_day(
             srf_precheck_done = True
             srf_ok_arm, srf_side_arm, srf_feats_arm = _check_srf_event(i)
             if srf_ok_arm and srf_side_arm is not None:
-                _arm_from_srf(i)
+                # For SRF-only mode, arm on actual trigger below to avoid double-counting.
+                if strategy_mode != "srf_entry_v1":
+                    _arm_from_srf(i)
                 srf_precheck_ok = True
                 srf_precheck_side = srf_side_arm
                 srf_precheck_feats = srf_feats_arm
@@ -2314,6 +2380,7 @@ def _simulate_day(
                         "entry_root_reason": entry_root_reason_out if entry_root_reason_out else "other",
                         "entry_reason_raw": entry_reason_raw_out if entry_reason_raw_out else "",
                         "entry_reason_label": entry_reason_label_out if entry_reason_label_out else "",
+                        "entry_family": str(pos.get("entry_family", "")),
                         "absorption_level": float(pos.get("absorption_level", float("nan"))),
                         "break_level": float(pos.get("break_level", float("nan"))),
                         "flow_align_sum_at_entry": float(pos.get("flow_align_sum_at_entry", 0.0)),
@@ -2424,6 +2491,11 @@ def _simulate_day(
         lbo_weak_side = ""
         entry_reason = None
         entry_reason_label = None
+        entry_family = None
+        entry_alpha_stop_px: float | None = None
+        entry_alpha_tp1_px: float | None = None
+        entry_alpha_tp2_px: float | None = None
+        entry_alpha_time_stop: int | None = None
         confirm_bars_waited = 0
         confirm_price_ref = float("nan")
         lbo_entry_mode = ""
@@ -2535,6 +2607,53 @@ def _simulate_day(
         if desired_side is None and use_srf_entry:
             i += 1
             continue
+        if desired_side is None and strategy_mode == "entry_alpha_v1" and entry_alpha_engine is not None:
+            entry_candidates_when_flat += 1
+            entry_alpha_hist = {
+                "last": last,
+                "high": high,
+                "low": low,
+                "spread_ticks": spread_ticks,
+                "range_ticks": range_ticks,
+                "ofid": signed_vol,
+                "trades": trades_arr,
+                "depth_bid": top_bid_depth,
+                "depth_ask": top_ask_depth,
+            }
+            if entry_alpha_gate_mode_norm in {"srf", "both"}:
+                srf_ok, _, _ = _check_srf_event(i)
+                if srf_ok:
+                    _arm_from_srf(i)
+            srf_gate_ok = bool(srf_arm_bars > 0 and entry_bar <= armed_until_bar)
+            lrams_gate_long = _entry_alpha_lrams_gate_ok(entry_bar, "long")
+            lrams_gate_short = _entry_alpha_lrams_gate_ok(entry_bar, "short")
+            if entry_alpha_gate_mode_norm == "lrams":
+                gates_ok_long = lrams_gate_long
+                gates_ok_short = lrams_gate_short
+            elif entry_alpha_gate_mode_norm == "srf":
+                gates_ok_long = srf_gate_ok
+                gates_ok_short = srf_gate_ok
+            elif entry_alpha_gate_mode_norm == "both":
+                gates_ok_long = lrams_gate_long and srf_gate_ok
+                gates_ok_short = lrams_gate_short and srf_gate_ok
+            else:
+                gates_ok_long = True
+                gates_ok_short = True
+            decision = entry_alpha_engine.compute(i, entry_alpha_hist, gates_ok_long, gates_ok_short)
+            if decision.signal != 0:
+                desired_side = "long" if decision.signal > 0 else "short"
+                entry_reason = decision.reason
+                entry_reason_label = decision.family
+                entry_family = decision.family
+                entry_root_reason = decision.family
+                entry_exec_reason = decision.family
+                entry_alpha_stop_px = decision.stop_price
+                entry_alpha_tp1_px = decision.tp1_price
+                entry_alpha_tp2_px = decision.tp2_price
+                entry_alpha_time_stop = decision.time_stop_bars
+            if desired_side is None:
+                i += 1
+                continue
         if desired_side is None and strategy_mode == "impulse_confirm_v1":
             impulse_signals_checked += 1
             impulse_ticks = impulse_ticks_series[i]
@@ -3429,10 +3548,14 @@ def _simulate_day(
             total_signals += 1
             entry_candidates_when_flat += 1
             if validate_debug and srf_arm_bars > 0 and last_srf_trigger_bar >= 0:
-                delta_bars = int(entry_bar - last_srf_trigger_bar)
-                srf_candidate_deltas.append(delta_bars)
-                if delta_bars >= srf_arm_bars:
-                    srf_candidates_outside_window += 1
+                if strategy_mode == "srf_entry_v1":
+                    delta_bars = 0
+                    srf_candidate_deltas.append(delta_bars)
+                else:
+                    delta_bars = int(entry_bar - last_srf_trigger_bar)
+                    srf_candidate_deltas.append(delta_bars)
+                    if delta_bars >= srf_arm_bars:
+                        srf_candidates_outside_window += 1
         if desired_side == "long":
             strategy_long_signals += 1
         else:
@@ -4090,6 +4213,9 @@ def _simulate_day(
         if strategy_mode == "srf_entry_v1" and np.isfinite(srf_disp_ticks):
             progress_vals.append(abs(float(srf_disp_ticks)))
         progress_metric = max(progress_vals) if progress_vals else 0.0
+        if strategy_mode == "entry_alpha_v1":
+            # EntryAlpha has its own internal viability checks; do not block on generic progress metrics.
+            progress_metric = min_viable_ticks
         if entry_viability_flow_confirm:
             if not np.isfinite(flow_align_sum):
                 i += 1
@@ -4141,6 +4267,8 @@ def _simulate_day(
             entry_reason_std = "afr3"
         elif strategy_mode == "srf_entry_v1":
             entry_reason_std = "srf"
+        elif strategy_mode == "entry_alpha_v1":
+            entry_reason_std = entry_family if entry_family else (entry_reason or "other")
         if entry_exec_reason is None:
             entry_exec_reason = entry_reason_std
         if entry_root_reason is None:
@@ -4164,6 +4292,13 @@ def _simulate_day(
             hold_bars_local = lbo_max_hold_bars
             if lbo_breakeven_after_ticks is not None:
                 breakeven_ticks_local = lbo_breakeven_after_ticks
+        if strategy_mode == "entry_alpha_v1":
+            if entry_alpha_stop_px is not None and np.isfinite(entry_alpha_stop_px):
+                sl_ticks_local = int(max(1, round(abs(entry_px - entry_alpha_stop_px) / tick_size)))
+            if entry_alpha_tp1_px is not None and np.isfinite(entry_alpha_tp1_px):
+                tp_ticks_local = int(max(1, round(abs(entry_px - entry_alpha_tp1_px) / tick_size)))
+            if entry_alpha_time_stop is not None:
+                hold_bars_local = int(entry_alpha_time_stop)
         tp_level = entry_px + (tp_ticks_local * tick_size if desired_side == "long" else -tp_ticks_local * tick_size)
         sl_level = entry_px - (sl_ticks_local * tick_size if desired_side == "long" else -sl_ticks_local * tick_size)
         pos = {
@@ -4188,6 +4323,7 @@ def _simulate_day(
             "entry_root_reason": entry_root_reason,
             "entry_reason_raw": entry_reason_raw,
             "entry_reason_label": entry_reason_label if entry_reason_label is not None else "",
+            "entry_family": entry_family if entry_family is not None else "",
             "lbo_entry_mode": lbo_entry_mode,
             "absorption_level": float(absorption_level) if np.isfinite(absorption_level) else float("nan"),
             "break_level": float(break_level) if np.isfinite(break_level) else float("nan"),
@@ -4414,12 +4550,16 @@ def _simulate_day(
             f"armed_bars={srf_armed_bars_total} arm_events={srf_arm_events} avg_armed={avg_armed_day:.2f}",
             flush=True,
         )
-        if strategy_mode == "srf_entry_v1" and entry_candidates_when_flat > 0:
-            if len(srf_candidate_deltas) != int(entry_candidates_when_flat):
-                raise RuntimeError(
-                    f"SRF arm candidate count mismatch: candidates={entry_candidates_when_flat} "
-                    f"deltas={len(srf_candidate_deltas)}"
-                )
+        if (
+            strategy_mode == "srf_entry_v1"
+            and entry_candidates_when_flat > 0
+            and len(srf_candidate_deltas) > 0
+            and len(srf_candidate_deltas) != int(entry_candidates_when_flat)
+        ):
+            raise RuntimeError(
+                f"SRF arm candidate count mismatch: candidates={entry_candidates_when_flat} "
+                f"deltas={len(srf_candidate_deltas)}"
+            )
 
     return (
         pd.DataFrame(trades),
@@ -4537,6 +4677,182 @@ def _equity_stats(pnl: np.ndarray) -> Dict[str, float]:
         "peak": float(running_peak.max()) if running_peak.size else 0.0,
         "max_dd": float(drawdown.max()) if drawdown.size else 0.0,
     }
+
+
+def _apply_entry_alpha_overrides(params: EntryAlphaParams) -> None:
+    ofi_th_env = os.environ.get("ENTRY_ALPHA_OFI_TH", "").strip()
+    trades_min_env = os.environ.get("ENTRY_ALPHA_TRADES_MIN", "").strip()
+    spread_max_env = os.environ.get("ENTRY_ALPHA_SPREAD_MAX", "").strip()
+    impulse_min_env = os.environ.get("ENTRY_ALPHA_IMPULSE_MIN_RANGE", "").strip()
+    break_min_env = os.environ.get("ENTRY_ALPHA_BREAK_MIN_RANGE", "").strip()
+    brk_pad_env = os.environ.get("ENTRY_ALPHA_BRK_PAD", "").strip()
+    accept_tol_env = os.environ.get("ENTRY_ALPHA_ACCEPT_TOL", "").strip()
+    fail_ticks_env = os.environ.get("ENTRY_ALPHA_FAIL_TICKS", "").strip()
+
+    if ofi_th_env:
+        ofi_th = float(ofi_th_env)
+        params.obra.OFI_TH = ofi_th
+        params.apb.OFI_TH = ofi_th
+        params.pbra.OFI_TH = ofi_th
+    if trades_min_env:
+        trades_min = int(trades_min_env)
+        params.obra.TRADES_MIN = trades_min
+        params.apb.TRADES_MIN = trades_min
+        params.pbra.TRADES_MIN = trades_min
+    if spread_max_env:
+        spread_max = int(spread_max_env)
+        params.obra.SPREAD_MAX = spread_max
+        params.apb.SPREAD_MAX = spread_max
+        params.pbra.SPREAD_MAX = spread_max
+    if impulse_min_env:
+        params.obra.IMPULSE_MIN_RANGE = int(impulse_min_env)
+    if break_min_env:
+        params.pbra.BREAK_MIN_RANGE = int(break_min_env)
+    if brk_pad_env:
+        params.obra.BRK_PAD = int(brk_pad_env)
+    if accept_tol_env:
+        params.obra.ACCEPT_TOL = int(accept_tol_env)
+    if fail_ticks_env:
+        params.obra.FAIL_TICKS = int(fail_ticks_env)
+
+def _entry_alpha_forward_stats(
+    trades: pd.DataFrame, df_day: pd.DataFrame, tick_size: float, horizons: List[int]
+) -> Tuple[Dict[int, float], Dict[int, float], np.ndarray, np.ndarray]:
+    if trades.empty:
+        return {h: float("nan") for h in horizons}, {h: float("nan") for h in horizons}, np.array([]), np.array([])
+    bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
+    ask = pd.to_numeric(df_day["ask_price_1"], errors="coerce").to_numpy()
+    mid = 0.5 * (bid + ask)
+    mean_R = {h: [] for h in horizons}
+    median_R = {h: [] for h in horizons}
+    mfe_vals = []
+    mae_vals = []
+    max_h = max(horizons) if horizons else 0
+    for _, t in trades.iterrows():
+        entry_bar = int(t["entry_bar"])
+        side = str(t["side"])
+        if entry_bar + 1 >= len(mid):
+            continue
+        sgn = 1.0 if side == "long" else -1.0
+        for h in horizons:
+            if entry_bar + h < len(mid):
+                r = sgn * (mid[entry_bar + h] - mid[entry_bar]) / tick_size
+                mean_R[h].append(float(r))
+                median_R[h].append(float(r))
+        if entry_bar + 1 < len(mid):
+            h_end = min(entry_bar + 20, len(mid) - 1)
+            window = mid[entry_bar + 1 : h_end + 1]
+            if window.size:
+                rel = sgn * (window - mid[entry_bar]) / tick_size
+                mfe_vals.append(float(np.max(rel)))
+                mae_vals.append(float(np.min(rel)))
+    mean_R_out = {h: float(np.mean(mean_R[h])) if mean_R[h] else float("nan") for h in horizons}
+    med_R_out = {h: float(np.median(median_R[h])) if median_R[h] else float("nan") for h in horizons}
+    return mean_R_out, med_R_out, np.array(mfe_vals), np.array(mae_vals)
+
+
+def _run_entry_alpha_ablation(
+    df: pd.DataFrame,
+    events: pd.DataFrame,
+    selected_days: List[str],
+    tick_size: float,
+    base_kwargs: Dict[str, object],
+    entry_alpha_params: EntryAlphaParams,
+    cost_ticks: float,
+    instrument: str,
+    gate_mode: str,
+    srf_arm_bars: int,
+    srf_arm_mode: str,
+    srf_arm_source: str,
+) -> None:
+    modes = {
+        "A": "none",
+        "B": "lrams",
+        "C": "srf",
+        "D": "both",
+    }
+    horizons = [20, 50, 100]
+    rows = []
+    for label, entry_alpha_gate_mode in modes.items():
+        all_trades: List[pd.DataFrame] = []
+        total_candidates = 0
+        total_trades = 0
+        pnl_ticks_all: List[float] = []
+        net_pnl_ticks_all: List[float] = []
+        ret_by_h = {h: [] for h in horizons}
+        mfe_vals = []
+        mae_vals = []
+        for day in selected_days:
+            df_day = df[df["date"] == day].sort_values("Time").reset_index(drop=True)
+            if df_day.empty:
+                continue
+            events_day = events[(events["date"] == day) & (events["Symbol"] == instrument)].sort_values(
+                "event_pos"
+            )
+            trades_day, pnl_ticks_total, _, _, entry_candidates_when_flat, _, _, _, _, _, _, _, _, _, _, *_ = _simulate_day(
+                df_day,
+                events_day,
+                entry_alpha_params=entry_alpha_params,
+                entry_alpha_gate_mode=entry_alpha_gate_mode,
+                strategy_mode="entry_alpha_v1",
+                gated=False,
+                disable_gate=True,
+                gate_mode=gate_mode,
+                srf_arm_bars=srf_arm_bars,
+                srf_arm_mode=srf_arm_mode,
+                srf_arm_source=srf_arm_source,
+                **base_kwargs,
+            )
+            total_candidates += int(entry_candidates_when_flat)
+            if not trades_day.empty:
+                all_trades.append(trades_day)
+                total_trades += int(len(trades_day))
+                pnl_ticks_all.extend(trades_day["pnl_ticks"].astype(float).tolist())
+                net_pnl_ticks_all.extend((trades_day["pnl_ticks"] - float(cost_ticks)).astype(float).tolist())
+                bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
+                ask = pd.to_numeric(df_day["ask_price_1"], errors="coerce").to_numpy()
+                mid = 0.5 * (bid + ask)
+                for _, t in trades_day.iterrows():
+                    entry_bar = int(t["entry_bar"])
+                    side = str(t["side"])
+                    if entry_bar + 1 >= len(mid):
+                        continue
+                    sgn = 1.0 if side == "long" else -1.0
+                    for h in horizons:
+                        if entry_bar + h < len(mid):
+                            r = sgn * (mid[entry_bar + h] - mid[entry_bar]) / tick_size
+                            ret_by_h[h].append(float(r))
+                    h_end = min(entry_bar + 20, len(mid) - 1)
+                    window = mid[entry_bar + 1 : h_end + 1]
+                    if window.size:
+                        rel = sgn * (window - mid[entry_bar]) / tick_size
+                        mfe_vals.append(float(np.max(rel)))
+                        mae_vals.append(float(np.min(rel)))
+        coverage = float(total_trades / total_candidates) if total_candidates > 0 else 0.0
+        win_rate = float(np.mean([p > 0 for p in pnl_ticks_all])) if pnl_ticks_all else 0.0
+        mean_r = {h: float(np.mean(ret_by_h[h])) if ret_by_h[h] else float("nan") for h in horizons}
+        eq = _equity_stats(np.array(net_pnl_ticks_all, dtype=float))
+        rows.append(
+            {
+                "mode": label,
+                "gate": entry_alpha_gate_mode,
+                "trades": int(total_trades),
+                "coverage": coverage,
+                "gross_ticks": float(np.sum(pnl_ticks_all)) if pnl_ticks_all else 0.0,
+                "net_ticks": float(np.sum(net_pnl_ticks_all)) if net_pnl_ticks_all else 0.0,
+                "max_dd_ticks": float(eq["max_dd"]),
+                "worst_trade": float(np.min(net_pnl_ticks_all)) if net_pnl_ticks_all else 0.0,
+                "win_rate": win_rate,
+                "mean_R20": mean_r[20],
+                "mean_R50": mean_r[50],
+                "mean_R100": mean_r[100],
+                "mfe20_med": float(np.median(mfe_vals)) if mfe_vals else float("nan"),
+                "mae20_med": float(np.median(mae_vals)) if mae_vals else float("nan"),
+            }
+        )
+    out = pd.DataFrame(rows)
+    print("ENTRY_ALPHA ABLATION:", flush=True)
+    print(out.to_string(index=False), flush=True)
 
 
 def _metrics(trades: pd.DataFrame) -> Dict[str, float]:
@@ -5041,6 +5357,8 @@ def main() -> None:
         "yes",
         "y",
     }
+    entry_alpha_ablation = os.environ.get("ENTRY_ALPHA_ABLATION", "0").strip() == "1"
+    entry_alpha_cost_ticks = float(os.environ.get("ENTRY_ALPHA_COST_TICKS", "1"))
     be_arm_ticks = int(os.environ.get("BE_ARM_TICKS", "1"))
     be_offset_env = os.environ.get("BE_OFFSET_TICKS", "").strip()
     be_offset_ticks = int(be_offset_env) if be_offset_env else None
@@ -5150,6 +5468,11 @@ def main() -> None:
     print(f"SRF_ARM: bars={srf_arm_label} mode={srf_arm_mode}", flush=True)
     if os.environ.get("SRF_ARM_SELF_TEST", "0").strip() == "1":
         _self_test_srf_arm_window()
+        return
+    if os.environ.get("ENTRY_ALPHA_SELF_TEST", "0").strip() == "1":
+        print("ENTRY_ALPHA_SELF_TEST: start", flush=True)
+        entry_alpha_self_test(tick_size=tick_size)
+        print("ENTRY_ALPHA_SELF_TEST: ok", flush=True)
         return
     trade_session = os.environ.get("TRADE_SESSION", "all").strip().lower()
     min_spread_ticks = int(os.environ.get("MIN_SPREAD_TICKS", "0"))
@@ -5458,6 +5781,162 @@ def main() -> None:
         tick_size=tick_size,
     )
     events = _compute_thresholds(events, worst_q=worst_q)
+
+    entry_alpha_params = EntryAlphaParams()
+    _apply_entry_alpha_overrides(entry_alpha_params)
+    if strategy_mode == "entry_alpha_v1" and entry_alpha_ablation:
+        base_kwargs = {
+            "tick_size": tick_size,
+            "lookback_bars": lookback_bars,
+            "entry_threshold_ticks": entry_threshold_ticks,
+            "hold_bars": hold_bars,
+            "tp_ticks": tp_ticks,
+            "sl_ticks": sl_ticks,
+            "baseline_mode": baseline_mode,
+            "baseline_k_bars": baseline_k_bars,
+            "micro_k_bars": micro_k_bars,
+            "micro_impulse_ticks": micro_impulse_ticks,
+            "micro_flow_min": micro_flow_min,
+            "impulse_lookback_bars": impulse_lookback_bars,
+            "impulse_min_ticks": impulse_min_ticks,
+            "confirm_bars": confirm_bars,
+            "confirm_require_nonzero": confirm_require_nonzero,
+            "debug_first_impulse": debug_first_impulse,
+            "max_spread_ticks_for_entry": max_spread_ticks_for_entry,
+            "mmas_k_bars": mmas_k_bars,
+            "mmas_min_dmid_ticks": mmas_min_dmid_ticks,
+            "mmas_min_flow_abs": mmas_min_flow_abs,
+            "mmas_require_agree": mmas_require_agree,
+            "debug_first_mmas": debug_first_mmas,
+            "trade_session": trade_session,
+            "min_spread_ticks": min_spread_ticks,
+            "entry_cooldown_bars": entry_cooldown_bars,
+            "gate_lookback_bars": gate_lookback_bars,
+            "weak_side_lookback_bars": weak_side_lookback_bars,
+            "afr_k_bars": afr_k_bars,
+            "afr_min_flow_abs": afr_min_flow_abs,
+            "afr_stall_ticks": afr_stall_ticks,
+            "afr_break_ticks": afr_break_ticks,
+            "afr_require_flow_sign": afr_require_flow_sign,
+            "afr_use_mid_for_stall": afr_use_mid_for_stall,
+            "afr_use_signed_volume": afr_use_signed_volume,
+            "afr_ft_bars": afr_ft_bars,
+            "afr_ft_min_ticks": afr_ft_min_ticks,
+            "afr_ft_no_backtrack": afr_ft_no_backtrack,
+            "afr_enter_on": afr_enter_on,
+            "afr_break_quality_min_flow_abs": afr_break_quality_min_flow_abs,
+            "afr_break_quality_max_spread_ticks": afr_break_quality_max_spread_ticks,
+            "afr_snapback_bars": afr_snapback_bars,
+            "afr_snapback_band_ticks": afr_snapback_band_ticks,
+            "lbo_break_ticks": lbo_break_ticks,
+            "lbo_confirm_bars": lbo_confirm_bars,
+            "lbo_min_flow_abs": lbo_min_flow_abs,
+            "lbo_max_spread_ticks": lbo_max_spread_ticks,
+            "lbo_ft_bars": lbo_ft_bars,
+            "lbo_ft_min_ticks": lbo_ft_min_ticks,
+            "lbo_rearm_enabled": lbo_rearm_enabled,
+            "lbo_rearm_band_ticks": lbo_rearm_band_ticks,
+            "lbo_rearm_max_bars": lbo_rearm_max_bars,
+            "lbo_tp_ticks": lbo_tp_ticks,
+            "lbo_sl_ticks": lbo_sl_ticks,
+            "lbo_max_hold_bars": lbo_max_hold_bars,
+            "lbo_scratch_bars": lbo_scratch_bars,
+            "lbo_scratch_min_progress_ticks": lbo_scratch_min_progress_ticks,
+            "lbo_decay_bars": lbo_decay_bars,
+            "lbo_breakeven_after_ticks": lbo_breakeven_after_ticks,
+            "lbo_ignore_thr": lbo_ignore_thr,
+            "lbo_flip_direction": lbo_flip_direction,
+            "lbo_confirm_mode": lbo_confirm_mode,
+            "lbo_confirm_ticks": lbo_confirm_ticks,
+            "lbo_confirm_max_bars": lbo_confirm_max_bars,
+            "lbo_confirm_use_mid": lbo_confirm_use_mid,
+            "lbo_confirm_require_flow_align": lbo_confirm_require_flow_align,
+            "lbo_confirm_flow_align_bars": lbo_confirm_flow_align_bars,
+            "lbo_confirm_min_flow_abs_align": lbo_confirm_min_flow_abs_align,
+            "lbo_pullback_max_bars": lbo_pullback_max_bars,
+            "lbo_pullback_ticks": lbo_pullback_ticks,
+            "lbo_resume_ticks": lbo_resume_ticks,
+            "lbo_resume_max_bars": lbo_resume_max_bars,
+            "allow_gate_on_none": allow_gate_on_none,
+            "gate_debug": gate_debug,
+            "debug_first_afr": debug_first_afr,
+            "debug_first_afr2": debug_first_afr2,
+            "afr_scratch_bars": afr_scratch_bars,
+            "afr_scratch_min_progress_ticks": afr_scratch_min_progress_ticks,
+            "afr3_break_min_flow_abs": afr3_break_min_flow_abs,
+            "afr3_break_max_spread_ticks": afr3_break_max_spread_ticks,
+            "afr3_snapback_check": afr3_snapback_check,
+            "debug_first_afr3": debug_first_afr3,
+            "afr_tp_ticks": afr_tp_ticks,
+            "afr_sl_ticks": afr_sl_ticks,
+            "afr_max_hold_bars": afr_max_hold_bars,
+            "afr_breakeven_after_ticks": afr_breakeven_after_ticks,
+            "afr_enter_mode": afr_enter_mode,
+            "afr_flow_align_bars": afr_flow_align_bars,
+            "afr_min_flow_abs_align": afr_min_flow_abs_align,
+            "afr_rearm_band_ticks": afr_rearm_band_ticks,
+            "afr_rearm_max_bars": afr_rearm_max_bars,
+            "afr_rearm_stop_max_bars": afr_rearm_stop_max_bars,
+            "afr_momentum_decay_bars": afr_momentum_decay_bars,
+            "afr_momentum_decay_min_flow": afr_momentum_decay_min_flow,
+            "debug_entry_print": False,
+            "debug_entry_limit": 0,
+            "debug_entry_tag": "entry_alpha",
+            "validate_debug": validate_debug,
+            "entry_confirm_bars": entry_confirm_bars,
+            "entry_min_progress_ticks": entry_min_progress_ticks,
+            "entry_confirm_style": entry_confirm_style,
+            "exit_debug": exit_debug,
+            "exit_mode": exit_mode,
+            "validate_bars": validate_bars,
+            "min_progress_ticks": min_progress_ticks,
+            "be_arm_ticks": be_arm_ticks,
+            "be_offset_ticks": be_offset_ticks,
+            "decay_bars": decay_bars,
+            "scratch_bars": scratch_bars,
+            "scratch_min_progress_ticks": scratch_min_progress_ticks,
+            "be_after_ticks": be_after_ticks,
+            "decay_min_flow": decay_min_flow,
+            "be_grace_bars": be_grace_bars,
+            "scratch_require_mfe_ticks": scratch_require_mfe_ticks,
+            "scratch_grace_bars": scratch_grace_bars,
+            "fail_fast_bars": fail_fast_bars,
+            "fail_fast_max_adverse_ticks": fail_fast_max_adverse_ticks,
+            "fail_fast_enabled": fail_fast_enabled,
+            "entry_viability_mode": entry_viability_mode,
+            "entry_viability_flow_confirm": entry_viability_flow_confirm,
+            "srf_min_disp_ticks": srf_min_disp_ticks,
+            "srf_disp_window_bars": srf_disp_window_bars,
+            "srf_min_speed_ticks_per_bar": srf_min_speed_ticks_per_bar,
+            "srf_refill_window_bars": srf_refill_window_bars,
+            "srf_baseline_bars": srf_baseline_bars,
+            "srf_refill_ratio_max": srf_refill_ratio_max,
+            "srf_min_spread_ticks": srf_min_spread_ticks,
+            "srf_flow_confirm": srf_flow_confirm,
+            "srf_flow_window_bars": srf_flow_window_bars,
+            "srf_min_flow": srf_min_flow,
+            "srf_side_mode": srf_side_mode,
+            "srf_debug": srf_debug,
+            "runner_trail_start_ticks": runner_trail_start_ticks,
+            "runner_trail_giveback_ticks": runner_trail_giveback_ticks,
+            "passive_exit_enabled": passive_exit_enabled,
+            "passive_exit_bars": passive_exit_bars,
+        }
+        _run_entry_alpha_ablation(
+            df=df,
+            events=events,
+            selected_days=selected_days,
+            tick_size=tick_size,
+            base_kwargs=base_kwargs,
+            entry_alpha_params=entry_alpha_params,
+            cost_ticks=entry_alpha_cost_ticks,
+            instrument=instrument,
+            gate_mode=gate_mode,
+            srf_arm_bars=srf_arm_bars if srf_arm_bars is not None else gate_lookback_bars,
+            srf_arm_mode=srf_arm_mode,
+            srf_arm_source="env" if srf_arm_bars is not None else "W",
+        )
+        return
 
     sweep_rows = []
     skipped_days: List[str] = []
