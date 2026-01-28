@@ -661,6 +661,7 @@ def _simulate_day(
     pnl_ticks_total = 0.0
     entry_alpha_engine: EntryAlphaEngine | None = None
     entry_alpha_gate_mode_norm = (entry_alpha_gate_mode or "").strip().lower()
+    entry_alpha_hist: Dict[str, np.ndarray] = {}
     if strategy_mode == "entry_alpha_v1":
         if entry_alpha_params is None:
             entry_alpha_params = EntryAlphaParams()
@@ -812,6 +813,10 @@ def _simulate_day(
     mmas_passed_filters = 0
     mmas_signaled = 0
     mmas_entered = 0
+    entry_alpha_events = 0
+    entry_alpha_fires = 0
+    entry_alpha_candidates = 0
+    entry_alpha_blocked = 0
     impulse_signals_checked = 0
     impulse_passed_threshold = 0
     impulse_passed_confirm = 0
@@ -838,6 +843,7 @@ def _simulate_day(
         "blocked_not_armed": 0,
         "blocked_none": 0,
         "blocked_mismatch": 0,
+        "blocked_entry_alpha": 0,
         "allowed_count": 0,
         "allow_on_none": 0,
         "bypass_on_none": 0,
@@ -864,6 +870,18 @@ def _simulate_day(
         else:
             afr_flow_series = signed_vol
     spread_ticks = np.rint((ask - bid) / tick_size).astype(np.int64)
+    if strategy_mode == "entry_alpha_v1":
+        entry_alpha_hist = {
+            "last": last,
+            "high": high,
+            "low": low,
+            "spread_ticks": spread_ticks,
+            "range_ticks": range_ticks,
+            "ofid": signed_vol,
+            "trades": trades_arr,
+            "depth_bid": top_bid_depth,
+            "depth_ask": top_ask_depth,
+        }
     cs = np.concatenate([[0.0], np.cumsum(signed_vol)])
     if tick_size <= 0:
         raise ValueError("tick_size must be positive for micro_momo_v1.")
@@ -1736,7 +1754,7 @@ def _simulate_day(
         tp_level = float("nan")
         sl_level = float("nan")
         # Evaluate signals each bar; otherwise a flat day would never increment counters.
-        if strategy_mode == "srf_entry_v1":
+        if strategy_mode in {"srf_entry_v1", "entry_alpha_v1"}:
             desired_side_top = None
         else:
             desired_side_top = _signal(i)
@@ -2496,6 +2514,9 @@ def _simulate_day(
         entry_alpha_tp1_px: float | None = None
         entry_alpha_tp2_px: float | None = None
         entry_alpha_time_stop: int | None = None
+        entry_alpha_gate_override: bool | None = None
+        entry_alpha_gate_reason: str | None = None
+        entry_alpha_decision_signal = 0
         confirm_bars_waited = 0
         confirm_price_ref = float("nan")
         lbo_entry_mode = ""
@@ -2607,53 +2628,73 @@ def _simulate_day(
         if desired_side is None and use_srf_entry:
             i += 1
             continue
+        did_entry_alpha_eval = False
         if desired_side is None and strategy_mode == "entry_alpha_v1" and entry_alpha_engine is not None:
-            entry_candidates_when_flat += 1
-            entry_alpha_hist = {
-                "last": last,
-                "high": high,
-                "low": low,
-                "spread_ticks": spread_ticks,
-                "range_ticks": range_ticks,
-                "ofid": signed_vol,
-                "trades": trades_arr,
-                "depth_bid": top_bid_depth,
-                "depth_ask": top_ask_depth,
-            }
-            if entry_alpha_gate_mode_norm in {"srf", "both"}:
-                srf_ok, _, _ = _check_srf_event(i)
-                if srf_ok:
-                    _arm_from_srf(i)
-            srf_gate_ok = bool(srf_arm_bars > 0 and entry_bar <= armed_until_bar)
-            lrams_gate_long = _entry_alpha_lrams_gate_ok(entry_bar, "long")
-            lrams_gate_short = _entry_alpha_lrams_gate_ok(entry_bar, "short")
-            if entry_alpha_gate_mode_norm == "lrams":
-                gates_ok_long = lrams_gate_long
-                gates_ok_short = lrams_gate_short
-            elif entry_alpha_gate_mode_norm == "srf":
-                gates_ok_long = srf_gate_ok
-                gates_ok_short = srf_gate_ok
-            elif entry_alpha_gate_mode_norm == "both":
-                gates_ok_long = lrams_gate_long and srf_gate_ok
-                gates_ok_short = lrams_gate_short and srf_gate_ok
-            else:
-                gates_ok_long = True
-                gates_ok_short = True
-            decision = entry_alpha_engine.compute(i, entry_alpha_hist, gates_ok_long, gates_ok_short)
+            entry_alpha_events += 1
+            decision = entry_alpha_engine.compute(i, entry_alpha_hist, True, True)
+            did_entry_alpha_eval = True
+            entry_alpha_decision_signal = int(decision.signal)
             if decision.signal != 0:
+                entry_alpha_candidates += 1
                 desired_side = "long" if decision.signal > 0 else "short"
-                entry_reason = decision.reason
-                entry_reason_label = decision.family
-                entry_family = decision.family
-                entry_root_reason = decision.family
-                entry_exec_reason = decision.family
+                entry_bar = i
+                entry_family = decision.family or "entry_alpha_v1"
+                entry_reason = decision.reason or "ENTRY_ALPHA"
+                entry_reason_label = entry_reason
+                entry_root_reason = entry_reason
+                entry_exec_reason = entry_reason
                 entry_alpha_stop_px = decision.stop_price
                 entry_alpha_tp1_px = decision.tp1_price
                 entry_alpha_tp2_px = decision.tp2_price
                 entry_alpha_time_stop = decision.time_stop_bars
-            if desired_side is None:
-                i += 1
-                continue
+                gate_ok_long = True
+                gate_ok_short = True
+                if gated and not disable_gate:
+                    gate_mode_alpha = entry_alpha_gate_mode_norm or gate_mode
+                    if gate_mode_alpha in {"srf", "both"}:
+                        srf_ok_arm, _, _ = _check_srf_event(i)
+                        if srf_ok_arm:
+                            _arm_from_srf(i)
+                    if srf_arm_bars > 0 and i > armed_until_bar:
+                        gate_ok_long = False
+                        gate_ok_short = False
+                    elif gate_mode_alpha in {"none", ""}:
+                        gate_ok_long = True
+                        gate_ok_short = True
+                    elif gate_mode_alpha == "lrams":
+                        gate_ok_long = _entry_alpha_lrams_gate_ok(i, "long")
+                        gate_ok_short = _entry_alpha_lrams_gate_ok(i, "short")
+                    elif gate_mode_alpha == "srf":
+                        srf_gate_ok = bool(srf_arm_bars > 0 and i <= armed_until_bar)
+                        gate_ok_long = srf_gate_ok
+                        gate_ok_short = srf_gate_ok
+                    elif gate_mode_alpha == "both":
+                        srf_gate_ok = bool(srf_arm_bars > 0 and i <= armed_until_bar)
+                        lrams_long = _entry_alpha_lrams_gate_ok(i, "long")
+                        lrams_short = _entry_alpha_lrams_gate_ok(i, "short")
+                        gate_ok_long = lrams_long and srf_gate_ok
+                        gate_ok_short = lrams_short and srf_gate_ok
+                    elif gate_mode_alpha == "side_matched":
+                        gate_ok_long = _entry_alpha_lrams_gate_ok(i, "long")
+                        gate_ok_short = _entry_alpha_lrams_gate_ok(i, "short")
+                    else:
+                        idx_pos, _ = _lbo_latest_event_idx(
+                            event_pos_all, event_asym_all, event_thr_all, i, gate_lookback_bars
+                        )
+                        gate_ok_long = idx_pos is not None
+                        gate_ok_short = gate_ok_long
+                    if decision.signal > 0:
+                        entry_alpha_gate_override = bool(gate_ok_long)
+                    else:
+                        entry_alpha_gate_override = bool(gate_ok_short)
+                    entry_alpha_gate_reason = "allowed" if entry_alpha_gate_override else "blocked_entry_alpha"
+                else:
+                    entry_alpha_gate_override = None
+                    entry_alpha_gate_reason = None
+        if strategy_mode == "entry_alpha_v1" and did_entry_alpha_eval and entry_alpha_decision_signal == 0:
+            desired_side = None
+            i += 1
+            continue
         if desired_side is None and strategy_mode == "impulse_confirm_v1":
             impulse_signals_checked += 1
             impulse_ticks = impulse_ticks_series[i]
@@ -3587,14 +3628,9 @@ def _simulate_day(
         if gate_enabled:
             gate_allowed = True
             gate_reason = "allowed"
-            if srf_arm_bars > 0 and entry_bar > armed_until_bar:
-                gate_allowed = False
-                gate_reason = "not_armed_by_srf"
-                gate_blocked_not_armed += 1
-                skip_reasons["gate_not_armed"] += 1
-                skipped += 1
-                blocked_signals += 1
-                gate_diag["blocked_not_armed"] += 1
+            if strategy_mode == "entry_alpha_v1" and entry_alpha_gate_override is not None:
+                gate_allowed = bool(entry_alpha_gate_override)
+                gate_reason = entry_alpha_gate_reason or ("allowed" if gate_allowed else "blocked_entry_alpha")
                 _log_gate_decision(
                     gate_allowed_val=gate_allowed,
                     gate_reason_val=gate_reason,
@@ -3603,79 +3639,122 @@ def _simulate_day(
                     desired_side_val=desired_side,
                     event_stream_val=event_stream,
                 )
-                if strategy_mode == "lrams_breakout_v1":
-                    _mark_lbo_break_for_ft_on_block(
-                        entry_reason,
-                        desired_side,
-                        entry_bar,
-                        absorption_level,
-                        absorption_bar,
-                        break_level,
+                if not gate_allowed:
+                    blocked_signals += 1
+                    entry_alpha_blocked += 1
+                    skip_reasons["gated_blocked"] += 1
+                    skipped += 1
+                    gate_diag["blocked_entry_alpha"] += 1
+                    i += 1
+                    continue
+                gate_bypass = True
+            if not gate_bypass:
+                if srf_arm_bars > 0 and entry_bar > armed_until_bar:
+                    gate_allowed = False
+                    gate_reason = "not_armed_by_srf"
+                    gate_blocked_not_armed += 1
+                    skip_reasons["gate_not_armed"] += 1
+                    skipped += 1
+                    blocked_signals += 1
+                    gate_diag["blocked_not_armed"] += 1
+                    _log_gate_decision(
+                        gate_allowed_val=gate_allowed,
+                        gate_reason_val=gate_reason,
+                        weak_side_val=weak_side,
+                        weak_side_dir_val=weak_side_dir,
+                        desired_side_val=desired_side,
+                        event_stream_val=event_stream,
                     )
-                _mark_break_for_ft_on_block(entry_reason, desired_side, entry_bar)
-                if strategy_mode.startswith("absorption_failure") and desired_side is not None:
-                    _arm_rearm(desired_side, absorption_bar)
-                i += 1
-                continue
-            if gate_mode == "side_matched":
-                event_stream = "buy" if desired_side == "long" else "sell"
-                if desired_side == "long":
-                    event_pos = event_pos_buy
-                    event_asym = event_asym_buy
-                    event_thr = event_thr_buy
+                    if strategy_mode == "lrams_breakout_v1":
+                        _mark_lbo_break_for_ft_on_block(
+                            entry_reason,
+                            desired_side,
+                            entry_bar,
+                            absorption_level,
+                            absorption_bar,
+                            break_level,
+                        )
+                    _mark_break_for_ft_on_block(entry_reason, desired_side, entry_bar)
+                    if strategy_mode.startswith("absorption_failure") and desired_side is not None:
+                        _arm_rearm(desired_side, absorption_bar)
+                    i += 1
+                    continue
+                if gate_mode == "side_matched":
+                    event_stream = "buy" if desired_side == "long" else "sell"
+                    if desired_side == "long":
+                        event_pos = event_pos_buy
+                        event_asym = event_asym_buy
+                        event_thr = event_thr_buy
+                    else:
+                        event_pos = event_pos_sell
+                        event_asym = event_asym_sell
+                        event_thr = event_thr_sell
+                    gate_avail["weak_side_checks"] += 1
+                    idx_buy_any = _lbo_latest_event_idx_any(event_pos_buy, entry_bar, weak_side_lookback_bars)
+                    idx_sell_any = _lbo_latest_event_idx_any(event_pos_sell, entry_bar, weak_side_lookback_bars)
+                    if idx_buy_any is not None:
+                        gate_avail["any_buy"] += 1
+                    if idx_sell_any is not None:
+                        gate_avail["any_sell"] += 1
+                    idx_buy_qual, _ = _lbo_latest_event_idx(
+                        event_pos_buy, event_asym_buy, event_thr_buy, entry_bar, weak_side_lookback_bars
+                    )
+                    idx_sell_qual, _ = _lbo_latest_event_idx(
+                        event_pos_sell, event_asym_sell, event_thr_sell, entry_bar, weak_side_lookback_bars
+                    )
+                    if idx_buy_qual is not None:
+                        gate_avail["qual_buy"] += 1
+                    if idx_sell_qual is not None:
+                        gate_avail["qual_sell"] += 1
+                    weak_side = _lbo_weak_side(entry_bar)
+                    weak_side_dir = None
+                    if weak_side is None:
+                        gate_diag["weak_side_none"] += 1
+                        if allow_gate_on_none:
+                            gate_diag["allow_on_none"] += 1
+                            weak_side_dir = desired_side
+                            gate_reason = "allowed_none"
+                            gate_allowed = True
+                            gate_bypass = True
+                            gate_diag["bypass_on_none"] += 1
+                    elif weak_side == "ask_weak":
+                        gate_diag["weak_side_ask"] += 1
+                        weak_side_dir = "long"
+                        event_pos = event_pos_buy
+                        event_asym = event_asym_buy
+                        event_thr = event_thr_buy
+                        event_stream = "buy"
+                    else:
+                        gate_diag["weak_side_bid"] += 1
+                        weak_side_dir = "short"
+                        event_pos = event_pos_sell
+                        event_asym = event_asym_sell
+                        event_thr = event_thr_sell
+                        event_stream = "sell"
+                    gate_weak_side = weak_side
+                    if weak_side_dir is None:
+                        gate_allowed = False
+                        gate_reason = "blocked_none"
+                        if validate_debug and strategy_mode == "entry_alpha_v1":
+                            print(
+                                f"EA_BLOCK_NONE i={i} entry_bar={entry_bar} "
+                                f"signal={entry_alpha_decision_signal} override={entry_alpha_gate_override} "
+                                f"gate_mode={gate_mode}",
+                                flush=True,
+                            )
+                    elif desired_side != weak_side_dir:
+                        gate_allowed = False
+                        gate_reason = "blocked_mismatch"
+                elif gate_mode == "srf_compatible" and strategy_mode == "srf_entry_v1":
+                    event_stream = "all"
+                    event_pos = event_pos_all
+                    event_asym = event_asym_all
+                    event_thr = event_thr_all
+                    gate_weak_side = None
                 else:
-                    event_pos = event_pos_sell
-                    event_asym = event_asym_sell
-                    event_thr = event_thr_sell
-                gate_avail["weak_side_checks"] += 1
-                idx_buy_any = _lbo_latest_event_idx_any(event_pos_buy, entry_bar, weak_side_lookback_bars)
-                idx_sell_any = _lbo_latest_event_idx_any(event_pos_sell, entry_bar, weak_side_lookback_bars)
-                if idx_buy_any is not None:
-                    gate_avail["any_buy"] += 1
-                if idx_sell_any is not None:
-                    gate_avail["any_sell"] += 1
-                idx_buy_qual, _ = _lbo_latest_event_idx(
-                    event_pos_buy, event_asym_buy, event_thr_buy, entry_bar, weak_side_lookback_bars
-                )
-                idx_sell_qual, _ = _lbo_latest_event_idx(
-                    event_pos_sell, event_asym_sell, event_thr_sell, entry_bar, weak_side_lookback_bars
-                )
-                if idx_buy_qual is not None:
-                    gate_avail["qual_buy"] += 1
-                if idx_sell_qual is not None:
-                    gate_avail["qual_sell"] += 1
-                weak_side = _lbo_weak_side(entry_bar)
-                weak_side_dir = None
-                if weak_side is None:
-                    gate_diag["weak_side_none"] += 1
-                    if allow_gate_on_none:
-                        gate_diag["allow_on_none"] += 1
-                        weak_side_dir = desired_side
-                        gate_reason = "allowed_none"
-                        gate_allowed = True
-                        gate_bypass = True
-                        gate_diag["bypass_on_none"] += 1
-                elif weak_side == "ask_weak":
-                    gate_diag["weak_side_ask"] += 1
-                    weak_side_dir = "long"
-                    event_pos = event_pos_buy
-                    event_asym = event_asym_buy
-                    event_thr = event_thr_buy
-                    event_stream = "buy"
-                else:
-                    gate_diag["weak_side_bid"] += 1
-                    weak_side_dir = "short"
-                    event_pos = event_pos_sell
-                    event_asym = event_asym_sell
-                    event_thr = event_thr_sell
-                    event_stream = "sell"
-                gate_weak_side = weak_side
-                if weak_side_dir is None:
-                    gate_allowed = False
-                    gate_reason = "blocked_none"
-                elif desired_side != weak_side_dir:
-                    gate_allowed = False
-                    gate_reason = "blocked_mismatch"
+                    event_pos = event_pos_all
+                    event_asym = event_asym_all
+                    event_thr = event_thr_all
                 _log_gate_decision(
                     gate_allowed_val=gate_allowed,
                     gate_reason_val=gate_reason,
@@ -3717,16 +3796,6 @@ def _simulate_day(
                         _arm_rearm(desired_side, absorption_bar)
                     i += 1
                     continue
-            elif gate_mode == "srf_compatible" and strategy_mode == "srf_entry_v1":
-                event_stream = "all"
-                event_pos = event_pos_all
-                event_asym = event_asym_all
-                event_thr = event_thr_all
-                gate_weak_side = None
-            else:
-                event_pos = event_pos_all
-                event_asym = event_asym_all
-                event_thr = event_thr_all
             if gate_bypass:
                 eligible_signals += 1
             elif event_pos.size == 0:
@@ -4369,6 +4438,8 @@ def _simulate_day(
         in_position = True
         entries_taken += 1
         signals_when_flat += 1
+        if strategy_mode == "entry_alpha_v1":
+            entry_alpha_fires += 1
         if strategy_mode == "impulse_confirm_v1":
             impulse_entered += 1
         if strategy_mode == "absorption_failure_v1":
@@ -4460,6 +4531,13 @@ def _simulate_day(
         f"exit_bar={int(pos.get('exit_bar', -1)) if pos else -1}",
         flush=True,
     )
+    if strategy_mode == "entry_alpha_v1" and validate_debug:
+        print(
+            f"ENTRY_ALPHA_STATS {symbol_str} {day_str} gated={bool(gated)} "
+            f"events={entry_alpha_events} candidates={entry_alpha_candidates} "
+            f"blocked={entry_alpha_blocked} fires={entry_alpha_fires} trades={len(trades)}",
+            flush=True,
+        )
     skip_total = sum(skip_reasons.values())
     if skip_total != skipped:
         print(
@@ -4789,14 +4867,15 @@ def _run_entry_alpha_ablation(
             events_day = events[(events["date"] == day) & (events["Symbol"] == instrument)].sort_values(
                 "event_pos"
             )
+            gated_mode = entry_alpha_gate_mode in {"lrams", "srf", "both"}
             trades_day, pnl_ticks_total, _, _, entry_candidates_when_flat, _, _, _, _, _, _, _, _, _, _, *_ = _simulate_day(
                 df_day,
                 events_day,
                 entry_alpha_params=entry_alpha_params,
                 entry_alpha_gate_mode=entry_alpha_gate_mode,
                 strategy_mode="entry_alpha_v1",
-                gated=False,
-                disable_gate=True,
+                gated=gated_mode,
+                disable_gate=not gated_mode,
                 gate_mode=gate_mode,
                 srf_arm_bars=srf_arm_bars,
                 srf_arm_mode=srf_arm_mode,
