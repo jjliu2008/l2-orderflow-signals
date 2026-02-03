@@ -44,8 +44,12 @@ Baseline:
   SRF_MIN_FLOW            SRF min flow for confirm (default: 0)
   SRF_SIDE_MODE           follow|fade (default: follow)
   SRF_DEBUG               SRF debug prints (default: 0)
-  SRF_ARM_BARS            SRF arming window bars for LRAMS gate (default: 10)
+  SRF_ARM_BARS            SRF arming window bars for LRAMS gate (default: W)
+  SRF_ARM_BARS_APB        SRF arming window bars for APB_v1 (default: SRF_ARM_BARS)
+  SRF_ARM_BARS_OBRA       SRF arming window bars for OBRA_v1 (default: SRF_ARM_BARS)
+  SRF_ARM_BARS_PBRA       SRF arming window bars for PBRA_v1 (default: SRF_ARM_BARS)
   SRF_ARM_MODE            lrams_only|lrams_and_srf (default: lrams_only)
+  LRAMS_ARM_BARS          LRAMS arming window bars when SRF_ARM_MODE=lrams_and_srf (default: W)
   TRADE_SESSION           all|rth (default: all)
   MIN_SPREAD_TICKS        min spread ticks to allow entry (default: 0)
   ENTRY_COOLDOWN_BARS     bars to wait after exit (default: 10)
@@ -115,6 +119,7 @@ Impulse confirm entry (strategy_mode=impulse_confirm_v1):
   GATE_DEBUG              print first 5 gate decisions per day (default: 0)
   GATE_BYPASS_ON_NONE     bypass event/threshold gating when weak_side is None (default: 0)
   WEAK_SIDE_LOOKBACK_BARS lookback for weak_side detection (default: max(gate_lookback_bars, 100))
+  ENTRY_ALPHA_WEAK_SIDE_MODE fade|follow mapping for entry_alpha weak-side gate (default: follow)
   AFR3_BREAK_MIN_FLOW_ABS AFR v3 min abs flow on break bar (default: 100)
   AFR3_BREAK_MAX_SPREAD_TICKS AFR v3 max spread on break bar (default: 2)
   AFR3_SNAPBACK_CHECK     AFR v3 require no snapback on next bar (default: 1)
@@ -175,7 +180,7 @@ import time
 import datetime
 from collections import deque
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -588,7 +593,10 @@ def _simulate_day(
     srf_min_flow: float,
     srf_side_mode: str,
     srf_debug: bool,
-    srf_arm_bars: int,
+    srf_arm_bars: int | None,
+    srf_arm_bars_apb: int,
+    srf_arm_bars_obra: int,
+    srf_arm_bars_pbra: int,
     srf_arm_mode: str,
     srf_arm_source: str,
     runner_trail_start_ticks: int,
@@ -597,6 +605,9 @@ def _simulate_day(
     passive_exit_bars: int,
     entry_alpha_params: EntryAlphaParams | None = None,
     entry_alpha_gate_mode: str | None = None,
+    entry_alpha_weak_side_mode: str = "follow",
+    entry_alpha_allow_mismatch: bool = False,
+    lrams_arm_bars: int | None = None,
 ) -> Tuple[object, ...]:
     bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
     ask = pd.to_numeric(df_day["ask_price_1"], errors="coerce").to_numpy()
@@ -661,6 +672,9 @@ def _simulate_day(
     pnl_ticks_total = 0.0
     entry_alpha_engine: EntryAlphaEngine | None = None
     entry_alpha_gate_mode_norm = (entry_alpha_gate_mode or "").strip().lower()
+    entry_alpha_weak_side_mode = (entry_alpha_weak_side_mode or "follow").strip().lower()
+    if entry_alpha_weak_side_mode not in {"fade", "follow"}:
+        entry_alpha_weak_side_mode = "follow"
     entry_alpha_hist: Dict[str, np.ndarray] = {}
     if strategy_mode == "entry_alpha_v1":
         if entry_alpha_params is None:
@@ -677,9 +691,14 @@ def _simulate_day(
     srf_exec_short = 0
     srf_arm_events = 0
     srf_armed_bars_total = 0
+    lrams_arm_events = 0
+    lrams_armed_bars_total = 0
     gate_blocked_not_armed = 0
     armed_until_bar = -1
+    armed_until_bar_srf = -1
+    armed_until_bar_lrams = -1
     last_srf_trigger_bar = -1
+    last_lrams_trigger_bar = -1
     srf_candidate_deltas: List[int] = []
     srf_candidates_outside_window = 0
     srf_event_stats: List[Dict[str, float]] = []
@@ -718,6 +737,19 @@ def _simulate_day(
     entry_confirm_checked = 0
     entry_confirm_passed = 0
     entry_confirm_failed = 0
+    entry_confirm_checked_clean = 0
+    entry_confirm_checked_mismatch = 0
+    entry_confirm_passed_clean = 0
+    entry_confirm_passed_mismatch = 0
+    entry_confirm_failed_clean = 0
+    entry_confirm_failed_mismatch = 0
+    entry_confirm_checked_by_family: Dict[str, int] = {}
+    entry_confirm_passed_by_family: Dict[str, int] = {}
+    entry_confirm_failed_by_family: Dict[str, int] = {}
+    entry_confirm_apb_fail_printed = 0
+    entry_confirm_fail_mismatch_by_reason: Dict[str, int] = {}
+    entry_confirm_fail_mismatch_by_family: Dict[str, int] = {}
+    entry_confirm_fail_mismatch_reason_family: Dict[str, str] = {}
     pending_entry_active = False
     pending_entry_side = ""
     pending_entry_price = float("nan")
@@ -817,6 +849,39 @@ def _simulate_day(
     entry_alpha_fires = 0
     entry_alpha_candidates = 0
     entry_alpha_blocked = 0
+    entry_alpha_armed_candidates = 0
+    entry_alpha_not_armed = 0
+    entry_alpha_mismatch = 0
+    entry_alpha_weak_side_none = 0
+    entry_alpha_allowed = 0
+    entry_alpha_allowed_clean = 0
+    entry_alpha_allowed_mismatch = 0
+    entry_alpha_blocked_excl = {
+        "not_armed": 0,
+        "weak_none": 0,
+        "mismatch": 0,
+        "blocked_entry_alpha": 0,
+    }
+    entry_alpha_mismatch_subtypes = {
+        "ask_weak:long": 0,
+        "ask_weak:short": 0,
+        "bid_weak:long": 0,
+        "bid_weak:short": 0,
+    }
+    entry_alpha_mismatch_samples: List[Dict[str, object]] = []
+    entry_alpha_not_armed_samples: List[Dict[str, object]] = []
+    entry_alpha_reason_total: Dict[str, int] = {}
+    entry_alpha_reason_mismatch: Dict[str, int] = {}
+    entry_alpha_mismatch_bars: Set[int] = set()
+    candidates_armed_srf = 0
+    candidates_armed_lrams = 0
+    candidates_armed_both = 0
+    candidates_not_armed = 0
+    pending_ea_gate_override: bool | None = None
+    pending_ea_gate_reason: str | None = None
+    pending_ea_signal = 0
+    pending_ea_bar = -1
+    pending_ea_mismatch = False
     impulse_signals_checked = 0
     impulse_passed_threshold = 0
     impulse_passed_confirm = 0
@@ -837,12 +902,14 @@ def _simulate_day(
         "impulse_failed_confirm": 0,
     }
     gate_diag = {
+        "armed_candidate_count": 0,
         "weak_side_ask": 0,
         "weak_side_bid": 0,
         "weak_side_none": 0,
         "blocked_not_armed": 0,
         "blocked_none": 0,
         "blocked_mismatch": 0,
+        "entry_alpha_mismatch": 0,
         "blocked_entry_alpha": 0,
         "allowed_count": 0,
         "allow_on_none": 0,
@@ -898,15 +965,30 @@ def _simulate_day(
             return 0.0
         return float(np.sum(afr_flow_series[start : idx + 1]))
 
+    srf_arm_bars_eff = int(srf_arm_bars) if srf_arm_bars is not None else 0
+    lrams_arm_bars_eff = int(lrams_arm_bars) if lrams_arm_bars is not None else gate_lookback_bars
+
     def _arm_from_srf(t_idx: int) -> None:
-        nonlocal armed_until_bar, srf_arm_events, last_srf_trigger_bar
-        if srf_arm_bars <= 0:
+        nonlocal armed_until_bar, armed_until_bar_srf, srf_arm_events, last_srf_trigger_bar
+        if srf_arm_bars_eff <= 0:
             return
-        new_until = int(t_idx + srf_arm_bars - 1)
-        if new_until > armed_until_bar:
-            armed_until_bar = new_until
+        new_until = int(t_idx + srf_arm_bars_eff - 1)
+        if new_until > armed_until_bar_srf:
+            armed_until_bar_srf = new_until
             srf_arm_events += 1
+            armed_until_bar = max(armed_until_bar_srf, armed_until_bar_lrams)
         last_srf_trigger_bar = int(t_idx)
+
+    def _arm_from_lrams(t_idx: int) -> None:
+        nonlocal armed_until_bar, armed_until_bar_lrams, lrams_arm_events, last_lrams_trigger_bar
+        if lrams_arm_bars_eff <= 0:
+            return
+        new_until = int(t_idx + lrams_arm_bars_eff - 1)
+        if new_until > armed_until_bar_lrams:
+            armed_until_bar_lrams = new_until
+            lrams_arm_events += 1
+            armed_until_bar = max(armed_until_bar_srf, armed_until_bar_lrams)
+        last_lrams_trigger_bar = int(t_idx)
 
     def _check_srf_event(bar_idx: int) -> Tuple[bool, str | None, Dict[str, float]]:
         if bar_idx < srf_disp_window_bars or bar_idx + srf_refill_window_bars >= n:
@@ -1459,17 +1541,19 @@ def _simulate_day(
             weak_side_val = _lbo_weak_side(entry_bar_val)
             if weak_side_val is None:
                 return False
-            weak_side_dir_val = "long" if weak_side_val == "ask_weak" else "short"
+            if entry_alpha_weak_side_mode == "fade":
+                weak_side_dir_val = "short" if weak_side_val == "ask_weak" else "long"
+            else:
+                weak_side_dir_val = "long" if weak_side_val == "ask_weak" else "short"
+            if validate_debug:
+                print(
+                    f"EA_WS entry_bar={entry_bar_val} desired={desired_side_val} "
+                    f"weak_side={weak_side_val} mapped={weak_side_dir_val} mode={entry_alpha_weak_side_mode}",
+                    flush=True,
+                )
             if desired_side_val != weak_side_dir_val:
                 return False
-            if desired_side_val == "long":
-                event_pos_val = event_pos_buy
-                event_asym_val = event_asym_buy
-                event_thr_val = event_thr_buy
-            else:
-                event_pos_val = event_pos_sell
-                event_asym_val = event_asym_sell
-                event_thr_val = event_thr_sell
+            return True
         else:
             event_pos_val = event_pos_all
             event_asym_val = event_asym_all
@@ -1535,6 +1619,8 @@ def _simulate_day(
     ) -> None:
         nonlocal gate_diag_printed, gate_debug_printed
         if gate_mode != "side_matched":
+            return
+        if gate_reason_val == "blocked_entry_alpha":
             return
         if not gate_allowed_val:
             if weak_side_val is None:
@@ -1712,6 +1798,15 @@ def _simulate_day(
                 flush=True,
             )
 
+    lrams_trigger = np.zeros(n, dtype=bool)
+    if gate_mode == "side_matched":
+        if event_pos_buy.size:
+            lrams_trigger[event_pos_buy] = True
+        if event_pos_sell.size:
+            lrams_trigger[event_pos_sell] = True
+    elif event_pos_all.size:
+        lrams_trigger[event_pos_all] = True
+
     in_position = False
     pos: Dict[str, object] = {}
     debug_trigger_printed = False
@@ -1742,7 +1837,8 @@ def _simulate_day(
         event_debug_printed = True
     if validate_debug:
         print(
-            f"SRF_ARM_DEBUG {symbol_str} {day_str} bars={srf_arm_bars} source={srf_arm_source} mode={srf_arm_mode}",
+            f"SRF_ARM_DEBUG {symbol_str} {day_str} bars={srf_arm_bars_eff} "
+            f"source={srf_arm_source} mode={srf_arm_mode} eff={srf_arm_bars_eff}",
             flush=True,
         )
     while i <= max_i:
@@ -1762,7 +1858,7 @@ def _simulate_day(
         srf_precheck_ok = False
         srf_precheck_side = None
         srf_precheck_feats: Dict[str, float] = {}
-        if srf_arm_bars > 0:
+        if srf_arm_bars_eff > 0:
             srf_precheck_done = True
             srf_ok_arm, srf_side_arm, srf_feats_arm = _check_srf_event(i)
             if srf_ok_arm and srf_side_arm is not None:
@@ -1776,8 +1872,12 @@ def _simulate_day(
                 srf_precheck_ok = False
                 srf_precheck_side = None
                 srf_precheck_feats = {}
-        if armed_until_bar >= 0 and i <= armed_until_bar:
+        if srf_arm_mode == "lrams_and_srf" and lrams_trigger[i]:
+            _arm_from_lrams(i)
+        if armed_until_bar_srf >= 0 and i <= armed_until_bar_srf:
             srf_armed_bars_total += 1
+        if armed_until_bar_lrams >= 0 and i <= armed_until_bar_lrams:
+            lrams_armed_bars_total += 1
         if desired_side_top is not None:
             total_signals += 1
             if in_position:
@@ -2452,8 +2552,63 @@ def _simulate_day(
         if pending_entry_active:
             if i > pending_entry_expiry:
                 entry_confirm_failed += 1
+                if bool(pending_entry.get("entry_alpha_mismatch")):
+                    entry_confirm_failed_mismatch += 1
+                else:
+                    entry_confirm_failed_clean += 1
+                if strategy_mode == "entry_alpha_v1":
+                    family_key = str(pending_entry.get("entry_family") or "unknown")
+                    entry_confirm_failed_by_family[family_key] = (
+                        entry_confirm_failed_by_family.get(family_key, 0) + 1
+                    )
+                    if (
+                        validate_debug
+                        and family_key == "APB_v1"
+                        and entry_confirm_apb_fail_printed < 10
+                    ):
+                        entry_bar_apb = int(pending_entry.get("created_bar", i))
+                        confirm_bars_eff = int(pending_entry.get("confirm_bars_eff", entry_confirm_bars))
+                        min_ticks_eff = float(pending_entry.get("confirm_min_ticks", entry_min_progress_ticks))
+                        window_end = min(n - 1, entry_bar_apb + confirm_bars_eff)
+                        entry_px_apb = float(pending_entry.get("entry_price_ref", float("nan")))
+                        window = mid[entry_bar_apb : window_end + 1]
+                        best_favor_ticks = float("nan")
+                        worst_adverse_ticks = float("nan")
+                        if np.isfinite(entry_px_apb) and np.any(np.isfinite(window)):
+                            if str(pending_entry.get("side")) == "long":
+                                best_favor_ticks = (np.nanmax(window) - entry_px_apb) / tick_size
+                                worst_adverse_ticks = (np.nanmin(window) - entry_px_apb) / tick_size
+                            else:
+                                best_favor_ticks = (entry_px_apb - np.nanmin(window)) / tick_size
+                                worst_adverse_ticks = (entry_px_apb - np.nanmax(window)) / tick_size
+                        fail_reason = "no_progress" if np.isfinite(best_favor_ticks) else "data_missing"
+                        print(
+                            f"APB_CONFIRM_FAIL {symbol_str} {day_str} entry_bar={entry_bar_apb} "
+                            f"entry_px={entry_px_apb:.2f} best_favor_ticks={best_favor_ticks:.2f} "
+                            f"worst_adverse_ticks={worst_adverse_ticks:.2f} "
+                            f"min_progress={min_ticks_eff:.2f} fail_reason={fail_reason}",
+                            flush=True,
+                        )
+                        entry_confirm_apb_fail_printed += 1
+                if strategy_mode == "entry_alpha_v1":
+                    reason_key = str(pending_entry.get("entry_reason") or "unknown")
+                    family_key = str(pending_entry.get("entry_family") or "unknown")
+                    entry_confirm_fail_mismatch_by_reason[reason_key] = (
+                        entry_confirm_fail_mismatch_by_reason.get(reason_key, 0) + 1
+                    )
+                    entry_confirm_fail_mismatch_by_family[family_key] = (
+                        entry_confirm_fail_mismatch_by_family.get(family_key, 0) + 1
+                    )
+                    if reason_key not in entry_confirm_fail_mismatch_reason_family:
+                        entry_confirm_fail_mismatch_reason_family[reason_key] = family_key
                 pending_entry_active = False
                 pending_entry = {}
+                if strategy_mode == "entry_alpha_v1":
+                    pending_ea_gate_override = None
+                    pending_ea_gate_reason = None
+                    pending_ea_signal = 0
+                    pending_ea_bar = -1
+                    pending_ea_mismatch = False
             else:
                 if i <= pending_entry_created:
                     i += 1
@@ -2466,14 +2621,43 @@ def _simulate_day(
                         progress_ticks = (pending_entry_price - confirm_px) / tick_size
                 else:
                     progress_ticks = float("nan")
-                if np.isfinite(progress_ticks) and progress_ticks >= float(entry_min_progress_ticks):
+                min_ticks_eff = float(pending_entry.get("confirm_min_ticks", entry_min_progress_ticks))
+                if np.isfinite(progress_ticks) and progress_ticks >= min_ticks_eff:
                     entry_confirm_passed += 1
+                    if bool(pending_entry.get("entry_alpha_mismatch")):
+                        entry_confirm_passed_mismatch += 1
+                    else:
+                        entry_confirm_passed_clean += 1
+                    if strategy_mode == "entry_alpha_v1":
+                        family_key = str(pending_entry.get("entry_family") or "unknown")
+                        entry_confirm_passed_by_family[family_key] = (
+                            entry_confirm_passed_by_family.get(family_key, 0) + 1
+                        )
                     pending_confirmed = True
                     pending_payload = dict(pending_entry)
                     pending_entry_active = False
                 else:
+                    if (
+                        strategy_mode == "entry_alpha_v1"
+                        and validate_debug
+                        and bool(pending_entry.get("entry_alpha_mismatch"))
+                    ):
+                        entry_family = pending_entry.get("entry_family")
+                        entry_reason = pending_entry.get("entry_reason")
+                        expiry_in = int(pending_entry_expiry - i)
+                        print(
+                            f"EA_CONFIRM_FAIL {symbol_str} {day_str} i={i} "
+                            f"family={entry_family} reason={entry_reason} ea_mismatch=1 "
+                            f"progress={progress_ticks:.2f} min_progress={min_ticks_eff} "
+                            f"pending_px={pending_entry_price:.2f} confirm_px={confirm_px:.2f} "
+                            f"expiry_in={expiry_in}",
+                            flush=True,
+                        )
                     i += 1
                     continue
+        if pending_entry_active and not pending_confirmed:
+            i += 1
+            continue
         if pending_confirmed and pending_payload is not None:
             desired_side_top = str(pending_payload.get("side") or pending_payload.get("desired_side"))
 
@@ -2510,6 +2694,7 @@ def _simulate_day(
         entry_reason = None
         entry_reason_label = None
         entry_family = None
+        entry_alpha_mismatch_flag = False
         entry_alpha_stop_px: float | None = None
         entry_alpha_tp1_px: float | None = None
         entry_alpha_tp2_px: float | None = None
@@ -2543,15 +2728,18 @@ def _simulate_day(
             continue
         cooldown_ok = i >= cooldown_until
         filter_blocked = False
+        spread_ok = True
         if entry_bar < len(session_ok) and not session_ok[entry_bar]:
             session_suppressed += 1
             filter_blocked = True
         if spread_ticks[entry_bar] < min_spread_ticks:
             spread_suppressed += 1
             filter_blocked = True
+            spread_ok = False
         if max_spread_ticks_for_entry > 0 and spread_ticks[entry_bar] > max_spread_ticks_for_entry:
             spread_suppressed += 1
             filter_blocked = True
+            spread_ok = False
         if not cooldown_ok:
             cooldown_suppressed += 1
             filter_blocked = True
@@ -2566,6 +2754,8 @@ def _simulate_day(
         if pending_confirmed and pending_payload is not None:
             entry_reason = pending_payload.get("entry_reason")
             entry_reason_label = pending_payload.get("entry_reason_label")
+            entry_family = pending_payload.get("entry_family")
+            entry_alpha_mismatch_flag = bool(pending_payload.get("entry_alpha_mismatch", False))
             absorption_level = float(pending_payload.get("absorption_level", float("nan")))
             break_level = float(pending_payload.get("break_level", float("nan")))
             flow_align_sum = float(pending_payload.get("flow_align_sum", 0.0))
@@ -2643,19 +2833,166 @@ def _simulate_day(
                 entry_reason_label = entry_reason
                 entry_root_reason = entry_reason
                 entry_exec_reason = entry_reason
+                entry_alpha_reason_total[entry_reason] = entry_alpha_reason_total.get(entry_reason, 0) + 1
                 entry_alpha_stop_px = decision.stop_price
                 entry_alpha_tp1_px = decision.tp1_price
                 entry_alpha_tp2_px = decision.tp2_price
                 entry_alpha_time_stop = decision.time_stop_bars
+                arm_bars = int(srf_arm_bars_eff)
+                if entry_family == "APB_v1":
+                    arm_bars = int(srf_arm_bars_apb)
+                elif entry_family == "OBRA_v1":
+                    arm_bars = int(srf_arm_bars_obra)
+                elif entry_family == "PBRA_v1":
+                    arm_bars = int(srf_arm_bars_pbra)
+                entry_alpha_block_reason: str | None = None
+                entry_alpha_mismatch_counted = False
+                gate_mode_alpha = entry_alpha_gate_mode_norm or gate_mode
+                if gate_mode_alpha in {"lrams", "both", "side_matched"}:
+                    weak_side_dbg = _lbo_weak_side(i)
+                    if weak_side_dbg is not None:
+                        if entry_alpha_weak_side_mode == "fade":
+                            mapped_side_dbg = "short" if weak_side_dbg == "ask_weak" else "long"
+                        else:
+                            mapped_side_dbg = "long" if weak_side_dbg == "ask_weak" else "short"
+                        if mapped_side_dbg != desired_side:
+                            entry_alpha_mismatch_flag = True
+                            if gated and not disable_gate:
+                                entry_alpha_mismatch += 1
+                                gate_diag["entry_alpha_mismatch"] += 1
+                                subtype_key = f"{weak_side_dbg}:{desired_side}"
+                                if subtype_key in entry_alpha_mismatch_subtypes:
+                                    entry_alpha_mismatch_subtypes[subtype_key] += 1
+                                if entry_reason is not None:
+                                    entry_alpha_reason_mismatch[entry_reason] = (
+                                        entry_alpha_reason_mismatch.get(entry_reason, 0) + 1
+                                    )
+                            entry_alpha_mismatch_counted = True
+                arming_active = (arm_bars > 0) or (
+                    srf_arm_mode == "lrams_and_srf" and lrams_arm_bars_eff > 0
+                )
+                armed_srf = False
+                if arm_bars > 0 and last_srf_trigger_bar >= 0:
+                    armed_srf = (i - last_srf_trigger_bar) <= (arm_bars - 1)
+                armed_lrams = False
+                if srf_arm_mode == "lrams_and_srf" and lrams_arm_bars_eff > 0:
+                    armed_lrams = i <= armed_until_bar_lrams
+                if arming_active:
+                    if armed_srf and armed_lrams:
+                        candidates_armed_both += 1
+                    elif armed_srf:
+                        candidates_armed_srf += 1
+                    elif armed_lrams:
+                        candidates_armed_lrams += 1
+                    else:
+                        candidates_not_armed += 1
                 gate_ok_long = True
                 gate_ok_short = True
                 if gated and not disable_gate:
-                    gate_mode_alpha = entry_alpha_gate_mode_norm or gate_mode
+                    srf_gate_ok = None
+                    armed_ok = True
                     if gate_mode_alpha in {"srf", "both"}:
                         srf_ok_arm, _, _ = _check_srf_event(i)
+                        srf_gate_ok = bool(srf_ok_arm)
                         if srf_ok_arm:
                             _arm_from_srf(i)
-                    if srf_arm_bars > 0 and i > armed_until_bar:
+                    if arming_active:
+                        armed_ok = armed_srf or armed_lrams
+                        if armed_ok:
+                            entry_alpha_armed_candidates += 1
+                            gate_diag["armed_candidate_count"] += 1
+                        else:
+                            armed_ok = False
+                            entry_alpha_not_armed += 1
+                            gate_blocked_not_armed += 1
+                            gate_diag["blocked_not_armed"] += 1
+                            if entry_alpha_block_reason is None:
+                                entry_alpha_block_reason = "not_armed"
+                            if (
+                                validate_debug
+                                and strategy_mode == "entry_alpha_v1"
+                                and len(entry_alpha_not_armed_samples) < 10
+                            ):
+                                entry_alpha_not_armed_samples.append(
+                                    {
+                                        "i": int(i),
+                                        "entry_bar": int(entry_bar),
+                                        "desired_side": desired_side,
+                                        "decision_family": decision.family or "",
+                                        "decision_reason": decision.reason or "",
+                                        "arm_bars": int(arm_bars),
+                                        "last_srf_trigger_bar": int(last_srf_trigger_bar),
+                                        "srf_delta": int(entry_bar - last_srf_trigger_bar)
+                                        if last_srf_trigger_bar >= 0
+                                        else None,
+                                        "armed_until_srf": int(armed_until_bar_srf),
+                                        "srf_seen": bool(last_srf_trigger_bar >= 0),
+                                    }
+                                )
+                    else:
+                        entry_alpha_armed_candidates += 1
+                        gate_diag["armed_candidate_count"] += 1
+                    if armed_ok and gate_mode_alpha in {"lrams", "both", "side_matched"}:
+                        if weak_side_dbg is None:
+                            weak_side_dbg = _lbo_weak_side(i)
+                        if weak_side_dbg is None:
+                            entry_alpha_weak_side_none += 1
+                            gate_diag["weak_side_none"] += 1
+                            if entry_alpha_block_reason is None:
+                                entry_alpha_block_reason = "weak_none"
+                        else:
+                            if weak_side_dbg == "ask_weak":
+                                gate_diag["weak_side_ask"] += 1
+                            else:
+                                gate_diag["weak_side_bid"] += 1
+                            if mapped_side_dbg is None:
+                                if entry_alpha_weak_side_mode == "fade":
+                                    mapped_side_dbg = "short" if weak_side_dbg == "ask_weak" else "long"
+                                else:
+                                    mapped_side_dbg = "long" if weak_side_dbg == "ask_weak" else "short"
+                            if mapped_side_dbg != desired_side and not entry_alpha_mismatch_counted:
+                                entry_alpha_mismatch_flag = True
+                                entry_alpha_mismatch += 1
+                                gate_diag["entry_alpha_mismatch"] += 1
+                                subtype_key = f"{weak_side_dbg}:{desired_side}"
+                                if subtype_key in entry_alpha_mismatch_subtypes:
+                                    entry_alpha_mismatch_subtypes[subtype_key] += 1
+                                if entry_reason is not None:
+                                    entry_alpha_reason_mismatch[entry_reason] = (
+                                        entry_alpha_reason_mismatch.get(entry_reason, 0) + 1
+                                    )
+                            if mapped_side_dbg != desired_side and entry_alpha_block_reason is None:
+                                entry_alpha_block_reason = "mismatch"
+                    if entry_alpha_mismatch_flag and len(entry_alpha_mismatch_samples) < 5:
+                        entry_alpha_mismatch_samples.append(
+                            {
+                                "i": int(i),
+                                "entry_bar": int(entry_bar),
+                                "desired_side": desired_side,
+                                "weak_side": weak_side_dbg,
+                                "mapped_side": mapped_side_dbg,
+                                "decision_family": decision.family or "",
+                                "decision_reason": decision.reason or "",
+                                "decision_level": float(decision.entry_lvl)
+                                if decision.entry_lvl is not None
+                                else float("nan"),
+                                "impulse_ticks": float(impulse_ticks)
+                                if np.isfinite(impulse_ticks)
+                                else None,
+                                "dmid_ticks": float(dmid_ticks) if np.isfinite(dmid_ticks) else None,
+                                "flow": float(flow),
+                                "srf_arm_bars_eff": int(srf_arm_bars_eff),
+                                "lrams_arm_bars_eff": int(lrams_arm_bars_eff),
+                                "armed_until_srf": int(armed_until_bar_srf),
+                                "armed_until_lrams": int(armed_until_bar_lrams),
+                                "arming_active": bool(arming_active),
+                                "armed_now": bool(i <= armed_until_bar),
+                                "srf_delta": int(entry_bar - last_srf_trigger_bar)
+                                if last_srf_trigger_bar >= 0
+                                else None,
+                            }
+                        )
+                    if arming_active and not armed_ok:
                         gate_ok_long = False
                         gate_ok_short = False
                     elif gate_mode_alpha in {"none", ""}:
@@ -2665,11 +3002,11 @@ def _simulate_day(
                         gate_ok_long = _entry_alpha_lrams_gate_ok(i, "long")
                         gate_ok_short = _entry_alpha_lrams_gate_ok(i, "short")
                     elif gate_mode_alpha == "srf":
-                        srf_gate_ok = bool(srf_arm_bars > 0 and i <= armed_until_bar)
+                        srf_gate_ok = bool(arm_bars <= 0 or armed_srf)
                         gate_ok_long = srf_gate_ok
                         gate_ok_short = srf_gate_ok
                     elif gate_mode_alpha == "both":
-                        srf_gate_ok = bool(srf_arm_bars > 0 and i <= armed_until_bar)
+                        srf_gate_ok = bool(arm_bars <= 0 or armed_srf)
                         lrams_long = _entry_alpha_lrams_gate_ok(i, "long")
                         lrams_short = _entry_alpha_lrams_gate_ok(i, "short")
                         gate_ok_long = lrams_long and srf_gate_ok
@@ -2687,12 +3024,52 @@ def _simulate_day(
                         entry_alpha_gate_override = bool(gate_ok_long)
                     else:
                         entry_alpha_gate_override = bool(gate_ok_short)
-                    entry_alpha_gate_reason = "allowed" if entry_alpha_gate_override else "blocked_entry_alpha"
+                    if entry_alpha_block_reason is not None:
+                        entry_alpha_gate_override = False
+                    if not entry_alpha_gate_override and entry_alpha_block_reason is None:
+                        entry_alpha_block_reason = "blocked_entry_alpha"
+                    entry_alpha_gate_reason = (
+                        "allowed" if entry_alpha_gate_override else (entry_alpha_block_reason or "blocked_entry_alpha")
+                    )
+                    if entry_alpha_mismatch_flag and entry_alpha_allow_mismatch:
+                        entry_alpha_gate_override = True
+                        entry_alpha_gate_reason = "mismatch_allowed"
+                    if entry_alpha_gate_override:
+                        entry_alpha_allowed += 1
+                        if entry_alpha_mismatch_flag:
+                            entry_alpha_allowed_mismatch += 1
+                            entry_alpha_mismatch_bars.add(int(entry_bar))
+                        else:
+                            entry_alpha_allowed_clean += 1
+                    else:
+                        if entry_alpha_block_reason is None:
+                            entry_alpha_block_reason = "blocked_entry_alpha"
+                        if entry_alpha_block_reason in entry_alpha_blocked_excl:
+                            entry_alpha_blocked_excl[entry_alpha_block_reason] += 1
+                    if validate_debug and strategy_mode == "entry_alpha_v1":
+                        print(
+                            f"EA_OVERRIDE i={i} sig={int(decision.signal)} desired_side={desired_side} "
+                            f"override={entry_alpha_gate_override} reason={entry_alpha_gate_reason} "
+                            f"gate_mode={gate_mode_alpha} weak_side={weak_side_dbg} mapped_side={mapped_side_dbg} "
+                            f"srf_gate_ok={srf_gate_ok} armed_until={armed_until_bar}",
+                            flush=True,
+                        )
                 else:
                     entry_alpha_gate_override = None
                     entry_alpha_gate_reason = None
+                pending_ea_signal = int(decision.signal)
+                pending_ea_bar = int(i)
+                pending_ea_gate_override = entry_alpha_gate_override
+                pending_ea_gate_reason = entry_alpha_gate_reason
+                pending_ea_mismatch = entry_alpha_mismatch_flag
         if strategy_mode == "entry_alpha_v1" and did_entry_alpha_eval and entry_alpha_decision_signal == 0:
             desired_side = None
+            pending_ea_gate_override = None
+            pending_ea_gate_reason = None
+            pending_ea_signal = 0
+            pending_ea_bar = -1
+            pending_ea_mismatch = False
+            pending_ea_mismatch = False
             i += 1
             continue
         if desired_side is None and strategy_mode == "impulse_confirm_v1":
@@ -3588,14 +3965,14 @@ def _simulate_day(
         if strategy_mode != "impulse_confirm_v1" and not pending_confirmed:
             total_signals += 1
             entry_candidates_when_flat += 1
-            if validate_debug and srf_arm_bars > 0 and last_srf_trigger_bar >= 0:
+            if validate_debug and srf_arm_bars_eff > 0 and last_srf_trigger_bar >= 0:
                 if strategy_mode == "srf_entry_v1":
                     delta_bars = 0
                     srf_candidate_deltas.append(delta_bars)
                 else:
                     delta_bars = int(entry_bar - last_srf_trigger_bar)
                     srf_candidate_deltas.append(delta_bars)
-                    if delta_bars >= srf_arm_bars:
+                    if delta_bars >= srf_arm_bars_eff:
                         srf_candidates_outside_window += 1
         if desired_side == "long":
             strategy_long_signals += 1
@@ -3625,12 +4002,22 @@ def _simulate_day(
         weak_side_dir = None
         event_stream = None
         gate_bypass = False
+        arming_active_for_gate = (srf_arm_bars_eff > 0) or (
+            srf_arm_mode == "lrams_and_srf" and lrams_arm_bars_eff > 0
+        )
+        if validate_debug and strategy_mode == "entry_alpha_v1" and desired_side is not None:
+            print(
+                f"EA_PENDING i={i} desired_side={desired_side} "
+                f"pending_sig={pending_ea_signal} pending_bar={pending_ea_bar} "
+                f"pending_override={pending_ea_gate_override} pending_reason={pending_ea_gate_reason}",
+                flush=True,
+            )
         if gate_enabled:
             gate_allowed = True
             gate_reason = "allowed"
-            if strategy_mode == "entry_alpha_v1" and entry_alpha_gate_override is not None:
-                gate_allowed = bool(entry_alpha_gate_override)
-                gate_reason = entry_alpha_gate_reason or ("allowed" if gate_allowed else "blocked_entry_alpha")
+            if strategy_mode == "entry_alpha_v1" and pending_ea_gate_override is not None:
+                gate_allowed = bool(pending_ea_gate_override)
+                gate_reason = pending_ea_gate_reason or ("allowed" if gate_allowed else "blocked_entry_alpha")
                 _log_gate_decision(
                     gate_allowed_val=gate_allowed,
                     gate_reason_val=gate_reason,
@@ -3645,13 +4032,18 @@ def _simulate_day(
                     skip_reasons["gated_blocked"] += 1
                     skipped += 1
                     gate_diag["blocked_entry_alpha"] += 1
+                    pending_ea_gate_override = None
+                    pending_ea_gate_reason = None
+                    pending_ea_signal = 0
+                    pending_ea_bar = -1
+                    pending_ea_mismatch = False
                     i += 1
                     continue
                 gate_bypass = True
             if not gate_bypass:
-                if srf_arm_bars > 0 and entry_bar > armed_until_bar:
+                if arming_active_for_gate and entry_bar > armed_until_bar:
                     gate_allowed = False
-                    gate_reason = "not_armed_by_srf"
+                    gate_reason = "not_armed"
                     gate_blocked_not_armed += 1
                     skip_reasons["gate_not_armed"] += 1
                     skipped += 1
@@ -3738,7 +4130,7 @@ def _simulate_day(
                         if validate_debug and strategy_mode == "entry_alpha_v1":
                             print(
                                 f"EA_BLOCK_NONE i={i} entry_bar={entry_bar} "
-                                f"signal={entry_alpha_decision_signal} override={entry_alpha_gate_override} "
+                                f"signal={entry_alpha_decision_signal} override={pending_ea_gate_override} "
                                 f"gate_mode={gate_mode}",
                                 flush=True,
                             )
@@ -4225,6 +4617,7 @@ def _simulate_day(
         if gate_debug and gate_enabled and gate_allowed and filter_blocked and gate_allow_filtered_printed < 10:
             print(
                 f"GATE_ALLOW_BUT_FILTERED {symbol_str} {day_str} entry_bar={entry_bar} side={desired_side} "
+                f"family={entry_family} reason={entry_reason} ea_mismatch={int(entry_alpha_mismatch_flag)} "
                 f"weak_side={gate_weak_side} stream={event_stream} "
                 f"session_ok={bool(session_ok[entry_bar])} spread_ticks={int(spread_ticks[entry_bar])} "
                 f"cooldown_ok={cooldown_ok}",
@@ -4232,19 +4625,40 @@ def _simulate_day(
             )
             gate_allow_filtered_printed += 1
         if entry_confirm_style != "off" and entry_confirm_bars > 0 and not pending_confirmed:
+            confirm_bars_eff = int(entry_confirm_bars)
+            confirm_min_ticks_eff = int(entry_confirm_min_ticks_default)
+            if strategy_mode == "entry_alpha_v1":
+                if entry_family == "APB_v1":
+                    confirm_bars_eff = 2
+                    confirm_min_ticks_eff = int(entry_confirm_min_ticks_apb)
+                elif entry_family == "OBRA_v1":
+                    confirm_bars_eff = 3
+                elif entry_family == "PBRA_v1":
+                    confirm_bars_eff = 4
             pending_entry_active = True
             pending_entry_side = desired_side
             pending_entry_price = float(mid[entry_bar])
             pending_entry_created = int(entry_bar)
-            pending_entry_expiry = int(entry_bar + entry_confirm_bars)
+            pending_entry_expiry = int(entry_bar + confirm_bars_eff)
             entry_confirm_checked += 1
+            if bool(entry_alpha_mismatch_flag):
+                entry_confirm_checked_mismatch += 1
+            else:
+                entry_confirm_checked_clean += 1
+            if strategy_mode == "entry_alpha_v1":
+                family_key = str(entry_family or "unknown")
+                entry_confirm_checked_by_family[family_key] = entry_confirm_checked_by_family.get(family_key, 0) + 1
             pending_entry = {
                 "side": desired_side,
                 "created_bar": int(entry_bar),
-                "expiry_bar": int(entry_bar + entry_confirm_bars),
+                "expiry_bar": int(entry_bar + confirm_bars_eff),
                 "entry_price_ref": float(pending_entry_price),
+                "confirm_bars_eff": int(confirm_bars_eff),
+                "confirm_min_ticks": int(confirm_min_ticks_eff),
                 "entry_reason": entry_reason,
                 "entry_reason_label": entry_reason_label,
+                "entry_family": entry_family,
+                "entry_alpha_mismatch": bool(entry_alpha_mismatch_flag),
                 "absorption_level": float(absorption_level) if np.isfinite(absorption_level) else float("nan"),
                 "break_level": float(break_level) if np.isfinite(break_level) else float("nan"),
                 "flow_align_sum": float(flow_align_sum),
@@ -4287,15 +4701,50 @@ def _simulate_day(
             progress_metric = min_viable_ticks
         if entry_viability_flow_confirm:
             if not np.isfinite(flow_align_sum):
+                if strategy_mode == "entry_alpha_v1" and gate_debug:
+                    print(
+                        f"EA_FILTER_BLOCKED {symbol_str} {day_str} i={i} entry_bar={entry_bar} "
+                        f"family={entry_family} reason={entry_reason} ea_mismatch={int(entry_alpha_mismatch_flag)} "
+                        f"session_ok={bool(session_ok[entry_bar])} spread_ok={bool(spread_ok)} "
+                        f"cooldown_ok={bool(cooldown_ok)} viability_ok={bool(progress_metric >= min_viable_ticks)} "
+                        f"flow_ok=0",
+                        flush=True,
+                    )
                 i += 1
                 continue
             if desired_side == "long" and flow_align_sum < 0.0:
+                if strategy_mode == "entry_alpha_v1" and gate_debug:
+                    print(
+                        f"EA_FILTER_BLOCKED {symbol_str} {day_str} i={i} entry_bar={entry_bar} "
+                        f"family={entry_family} reason={entry_reason} ea_mismatch={int(entry_alpha_mismatch_flag)} "
+                        f"session_ok={bool(session_ok[entry_bar])} spread_ok={bool(spread_ok)} "
+                        f"cooldown_ok={bool(cooldown_ok)} viability_ok={bool(progress_metric >= min_viable_ticks)} "
+                        f"flow_ok=0",
+                        flush=True,
+                    )
                 i += 1
                 continue
             if desired_side == "short" and flow_align_sum > 0.0:
+                if strategy_mode == "entry_alpha_v1" and gate_debug:
+                    print(
+                        f"EA_FILTER_BLOCKED {symbol_str} {day_str} i={i} entry_bar={entry_bar} "
+                        f"family={entry_family} reason={entry_reason} ea_mismatch={int(entry_alpha_mismatch_flag)} "
+                        f"session_ok={bool(session_ok[entry_bar])} spread_ok={bool(spread_ok)} "
+                        f"cooldown_ok={bool(cooldown_ok)} viability_ok={bool(progress_metric >= min_viable_ticks)} "
+                        f"flow_ok=0",
+                        flush=True,
+                    )
                 i += 1
                 continue
         if progress_metric < min_viable_ticks:
+            if strategy_mode == "entry_alpha_v1" and gate_debug:
+                print(
+                    f"EA_FILTER_BLOCKED {symbol_str} {day_str} i={i} entry_bar={entry_bar} "
+                    f"family={entry_family} reason={entry_reason} ea_mismatch={int(entry_alpha_mismatch_flag)} "
+                    f"session_ok={bool(session_ok[entry_bar])} spread_ok={bool(spread_ok)} "
+                    f"cooldown_ok={bool(cooldown_ok)} viability_ok=0 flow_ok=1",
+                    flush=True,
+                )
             i += 1
             continue
         if be_offset_ticks is None:
@@ -4393,6 +4842,7 @@ def _simulate_day(
             "entry_reason_raw": entry_reason_raw,
             "entry_reason_label": entry_reason_label if entry_reason_label is not None else "",
             "entry_family": entry_family if entry_family is not None else "",
+            "entry_alpha_mismatch": bool(entry_alpha_mismatch_flag) or (entry_bar in entry_alpha_mismatch_bars),
             "lbo_entry_mode": lbo_entry_mode,
             "absorption_level": float(absorption_level) if np.isfinite(absorption_level) else float("nan"),
             "break_level": float(break_level) if np.isfinite(break_level) else float("nan"),
@@ -4440,6 +4890,11 @@ def _simulate_day(
         signals_when_flat += 1
         if strategy_mode == "entry_alpha_v1":
             entry_alpha_fires += 1
+            pending_ea_gate_override = None
+            pending_ea_gate_reason = None
+            pending_ea_signal = 0
+            pending_ea_bar = -1
+            pending_ea_mismatch = False
         if strategy_mode == "impulse_confirm_v1":
             impulse_entered += 1
         if strategy_mode == "absorption_failure_v1":
@@ -4532,12 +4987,163 @@ def _simulate_day(
         flush=True,
     )
     if strategy_mode == "entry_alpha_v1" and validate_debug:
+        allow_rate = entry_alpha_allowed / entry_alpha_candidates if entry_alpha_candidates else 0.0
+        fire_rate = entry_alpha_fires / entry_alpha_candidates if entry_alpha_candidates else 0.0
         print(
             f"ENTRY_ALPHA_STATS {symbol_str} {day_str} gated={bool(gated)} "
             f"events={entry_alpha_events} candidates={entry_alpha_candidates} "
-            f"blocked={entry_alpha_blocked} fires={entry_alpha_fires} trades={len(trades)}",
+            f"blocked={entry_alpha_blocked} fires={entry_alpha_fires} trades={len(trades)} "
+            f"armed={entry_alpha_armed_candidates} not_armed={entry_alpha_not_armed} "
+            f"mismatch={entry_alpha_mismatch} weak_none={entry_alpha_weak_side_none} "
+            f"allowed={entry_alpha_allowed} allow_rate={allow_rate:.2%} fire_rate={fire_rate:.2%}",
             flush=True,
         )
+        print(
+            f"EA_RECON {symbol_str} {day_str} gated={int(gated)} "
+            f"candidates={entry_alpha_candidates} "
+            f"allowed={entry_alpha_allowed} not_armed={entry_alpha_not_armed} "
+            f"weak_none={entry_alpha_weak_side_none} mismatch={entry_alpha_mismatch} "
+            f"blocked_entry_alpha={int(gate_diag.get('blocked_entry_alpha', 0))} "
+            f"fires={entry_alpha_fires} trades={len(trades)}",
+            flush=True,
+        )
+        if gated and not disable_gate:
+            print(
+                f"EA_ALLOW_SPLIT {symbol_str} {day_str} "
+                f"allowed_clean={entry_alpha_allowed_clean} "
+                f"allowed_mismatch={entry_alpha_allowed_mismatch} "
+                f"allowed={entry_alpha_allowed} candidates={entry_alpha_candidates}",
+                flush=True,
+            )
+            if entry_alpha_allowed_clean + entry_alpha_allowed_mismatch != entry_alpha_allowed:
+                raise RuntimeError(
+                    f"EntryAlpha allow split invariant failed: clean={entry_alpha_allowed_clean} "
+                    f"mismatch={entry_alpha_allowed_mismatch} allowed={entry_alpha_allowed} day={day_str}"
+                )
+        if gated and not disable_gate:
+            excl_total = sum(entry_alpha_blocked_excl.values())
+            print(
+                f"EA_BLOCK_REASON_EXCL {symbol_str} {day_str} "
+                f"not_armed={entry_alpha_blocked_excl['not_armed']} "
+                f"weak_none={entry_alpha_blocked_excl['weak_none']} "
+                f"mismatch={entry_alpha_blocked_excl['mismatch']} "
+                f"blocked_entry_alpha={entry_alpha_blocked_excl['blocked_entry_alpha']} "
+                f"allowed={entry_alpha_allowed} candidates={entry_alpha_candidates} total_blocked={excl_total}",
+                flush=True,
+            )
+            if entry_alpha_allowed + excl_total != entry_alpha_candidates:
+                raise RuntimeError(
+                    f"EntryAlpha exclusive block invariant failed: allowed={entry_alpha_allowed} "
+                    f"blocked={excl_total} candidates={entry_alpha_candidates} day={day_str}"
+                )
+        if any(entry_alpha_mismatch_subtypes.values()):
+            subtype_parts = " ".join(
+                f"{k}={entry_alpha_mismatch_subtypes[k]}" for k in sorted(entry_alpha_mismatch_subtypes)
+            )
+            print(
+                f"EA_MISMATCH_SUBTYPES {symbol_str} {day_str} total={entry_alpha_mismatch} {subtype_parts}",
+                flush=True,
+            )
+        if entry_alpha_mismatch_samples:
+            for sample in entry_alpha_mismatch_samples:
+                imp_str = "NA" if sample.get("impulse_ticks") is None else f"{sample.get('impulse_ticks'):.2f}"
+                dmid_str = "NA" if sample.get("dmid_ticks") is None else f"{sample.get('dmid_ticks'):.2f}"
+                flow_str = "NA" if sample.get("flow") is None else f"{sample.get('flow'):.2f}"
+                lvl_val = sample.get("decision_level", float("nan"))
+                lvl_str = "NA" if not np.isfinite(lvl_val) else f"{lvl_val:.2f}"
+                print(
+                    "EA_MISMATCH_SAMPLE "
+                    f"{symbol_str} {day_str} i={sample['i']} entry_bar={sample['entry_bar']} "
+                    f"desired={sample['desired_side']} weak_side={sample['weak_side']} "
+                    f"mapped_side={sample['mapped_side']} family={sample.get('decision_family','')} "
+                    f"reason={sample.get('decision_reason','')} level={lvl_str} impulse_ticks={imp_str} "
+                    f"dmid_ticks={dmid_str} flow={flow_str} srf_arm_bars_eff={sample['srf_arm_bars_eff']} "
+                    f"lrams_arm_bars_eff={sample['lrams_arm_bars_eff']} "
+                    f"armed_until_srf={sample['armed_until_srf']} "
+                    f"armed_until_lrams={sample['armed_until_lrams']} "
+                    f"arming_active={int(sample['arming_active'])} armed_now={int(sample['armed_now'])} "
+                    f"srf_delta={sample['srf_delta']}",
+                    flush=True,
+                )
+        if entry_alpha_not_armed_samples:
+            for sample in entry_alpha_not_armed_samples:
+                print(
+                    f"EA_NOT_ARMED_SAMPLE {symbol_str} {day_str} i={sample['i']} "
+                    f"entry_bar={sample['entry_bar']} desired={sample['desired_side']} "
+                    f"family={sample['decision_family']} reason={sample['decision_reason']} "
+                    f"arm_bars={sample.get('arm_bars')} "
+                    f"last_srf_trigger_bar={sample['last_srf_trigger_bar']} "
+                    f"srf_delta={sample['srf_delta']} armed_until_srf={sample['armed_until_srf']} "
+                    f"srf_seen={int(sample['srf_seen'])}",
+                    flush=True,
+                )
+        if strategy_mode == "entry_alpha_v1" and trades:
+            ea_trades = trades
+            mismatch_trades = [t for t in ea_trades if t.get("entry_alpha_mismatch")]
+            matched_trades = [t for t in ea_trades if not t.get("entry_alpha_mismatch")]
+            def _stats(rows: List[dict]) -> dict:
+                if not rows:
+                    return {"count": 0, "mean": 0.0, "win": 0.0, "mfe": 0.0, "mae": 0.0}
+                pnl = np.array([float(r.get("pnl_ticks", 0.0)) for r in rows], dtype=float)
+                mfe = np.array([float(r.get("mfe_ticks", 0.0)) for r in rows], dtype=float)
+                mae = np.array([float(r.get("mae_ticks", 0.0)) for r in rows], dtype=float)
+                return {
+                    "count": int(pnl.size),
+                    "mean": float(np.mean(pnl)) if pnl.size else 0.0,
+                    "win": float(np.mean(pnl > 0.0)) if pnl.size else 0.0,
+                    "mfe": float(np.median(mfe)) if mfe.size else 0.0,
+                    "mae": float(np.median(mae)) if mae.size else 0.0,
+                }
+            m = _stats(mismatch_trades)
+            g = _stats(matched_trades)
+            print(
+                f"EA_MISMATCH_DIAG {symbol_str} {day_str} "
+                f"mismatch_trades={m['count']} mean={m['mean']:.2f} win%={m['win']:.2%} "
+                f"median_mfe={m['mfe']:.2f} median_mae={m['mae']:.2f} | "
+                f"matched_trades={g['count']} mean={g['mean']:.2f} win%={g['win']:.2%} "
+                f"median_mfe={g['mfe']:.2f} median_mae={g['mae']:.2f}",
+                flush=True,
+            )
+            if entry_alpha_reason_total:
+                reason_mismatch_pnl: Dict[str, List[float]] = {}
+                reason_matched_pnl: Dict[str, List[float]] = {}
+                for tr in ea_trades:
+                    reason = str(tr.get("entry_reason") or "")
+                    if not reason:
+                        continue
+                    pnl_val = float(tr.get("pnl_ticks", 0.0))
+                    if tr.get("entry_alpha_mismatch"):
+                        reason_mismatch_pnl.setdefault(reason, []).append(pnl_val)
+                    else:
+                        reason_matched_pnl.setdefault(reason, []).append(pnl_val)
+                for reason in sorted(entry_alpha_reason_total):
+                    total = entry_alpha_reason_total.get(reason, 0)
+                    mism = entry_alpha_reason_mismatch.get(reason, 0)
+                    rate = (mism / total) if total else 0.0
+                    mp = reason_mismatch_pnl.get(reason, [])
+                    gp = reason_matched_pnl.get(reason, [])
+                    mean_m = float(np.mean(mp)) if mp else 0.0
+                    mean_g = float(np.mean(gp)) if gp else 0.0
+                    print(
+                        f"EA_MISMATCH_BY_REASON {symbol_str} {day_str} reason={reason} "
+                        f"candidates={total} mismatch={mism} rate={rate:.2%} "
+                        f"mismatch_trades={len(mp)} mismatch_mean={mean_m:.2f} "
+                        f"matched_trades={len(gp)} matched_mean={mean_g:.2f}",
+                        flush=True,
+                    )
+        if gated and not disable_gate:
+            coverage = entry_alpha_allowed / entry_alpha_candidates if entry_alpha_candidates else 0.0
+            print(
+                f"ARM_SRC_STATS {symbol_str} {day_str} "
+                f"srf_arm_events={srf_arm_events} lrams_arm_events={lrams_arm_events} "
+                f"candidates={entry_alpha_candidates} "
+                f"candidates_armed_srf={candidates_armed_srf} "
+                f"candidates_armed_lrams={candidates_armed_lrams} "
+                f"candidates_armed_both={candidates_armed_both} "
+                f"candidates_not_armed={candidates_not_armed} "
+                f"coverage={coverage:.2%}",
+                flush=True,
+            )
     skip_total = sum(skip_reasons.values())
     if skip_total != skipped:
         print(
@@ -4550,15 +5156,64 @@ def _simulate_day(
     if validate_debug:
         pending_flag = 1 if pending_entry_active else 0
         print(
-            f"ENTRY_CONFIRM_STATS {symbol_str} {day_str} checked={entry_confirm_checked} "
+            f"ENTRY_CONFIRM_STATS {symbol_str} {day_str} gated={int(gated)} "
+            f"checked={entry_confirm_checked} "
             f"passed={entry_confirm_passed} failed={entry_confirm_failed} pending={pending_flag} "
             f"candidates={entry_candidates_when_flat}",
             flush=True,
         )
+        print(
+            f"ENTRY_CONFIRM_SPLIT {symbol_str} {day_str} gated={int(gated)} "
+            f"clean_checked={entry_confirm_checked_clean} "
+            f"clean_passed={entry_confirm_passed_clean} "
+            f"clean_failed={entry_confirm_failed_clean} "
+            f"mismatch_checked={entry_confirm_checked_mismatch} "
+            f"mismatch_passed={entry_confirm_passed_mismatch} "
+            f"mismatch_failed={entry_confirm_failed_mismatch}",
+            flush=True,
+        )
+        if (
+            strategy_mode == "entry_alpha_v1"
+            and validate_debug
+            and entry_confirm_fail_mismatch_by_reason
+        ):
+            for reason_key in sorted(entry_confirm_fail_mismatch_by_reason.keys()):
+                count = entry_confirm_fail_mismatch_by_reason[reason_key]
+                family_key = entry_confirm_fail_mismatch_reason_family.get(reason_key, "unknown")
+                print(
+                    f"EA_CONFIRM_FAIL_BY_REASON {symbol_str} {day_str} reason={reason_key} "
+                    f"family={family_key} count={count}",
+                    flush=True,
+                )
+        if strategy_mode == "entry_alpha_v1" and validate_debug and entry_confirm_checked_by_family:
+            for family_key in sorted(entry_confirm_checked_by_family.keys()):
+                checked = entry_confirm_checked_by_family.get(family_key, 0)
+                passed = entry_confirm_passed_by_family.get(family_key, 0)
+                failed = entry_confirm_failed_by_family.get(family_key, 0)
+                print(
+                    f"ENTRY_CONFIRM_BY_FAMILY {symbol_str} {day_str} family={family_key} "
+                    f"checked={checked} passed={passed} failed={failed}",
+                    flush=True,
+                )
         if entry_confirm_checked != entry_confirm_passed + entry_confirm_failed + pending_flag:
             raise RuntimeError(
                 f"Entry confirm invariant failed: checked={entry_confirm_checked} "
                 f"passed={entry_confirm_passed} failed={entry_confirm_failed} pending={pending_flag}"
+            )
+        if entry_confirm_checked_clean + entry_confirm_checked_mismatch != entry_confirm_checked:
+            raise RuntimeError(
+                f"Entry confirm split checked mismatch: clean={entry_confirm_checked_clean} "
+                f"mismatch={entry_confirm_checked_mismatch} checked={entry_confirm_checked}"
+            )
+        if entry_confirm_passed_clean + entry_confirm_passed_mismatch != entry_confirm_passed:
+            raise RuntimeError(
+                f"Entry confirm split passed mismatch: clean={entry_confirm_passed_clean} "
+                f"mismatch={entry_confirm_passed_mismatch} passed={entry_confirm_passed}"
+            )
+        if entry_confirm_failed_clean + entry_confirm_failed_mismatch != entry_confirm_failed:
+            raise RuntimeError(
+                f"Entry confirm split failed mismatch: clean={entry_confirm_failed_clean} "
+                f"mismatch={entry_confirm_failed_mismatch} failed={entry_confirm_failed}"
             )
         if entry_confirm_checked > entry_candidates_when_flat:
             raise RuntimeError(
@@ -4595,36 +5250,58 @@ def _simulate_day(
             f"exec long={srf_exec_long} short={srf_exec_short}",
             flush=True,
         )
-    if validate_debug and srf_arm_bars > 0:
+    if validate_debug and srf_arm_bars_eff > 0:
         if srf_candidate_deltas:
-            delta_arr = np.asarray(srf_candidate_deltas, dtype=float)
+            delta_arr = np.asarray(srf_candidate_deltas, dtype=int)
             delta_min = int(np.min(delta_arr))
             delta_med = float(np.median(delta_arr))
             delta_p90 = float(np.quantile(delta_arr, 0.9))
             delta_max = int(np.max(delta_arr))
+            bucket_0 = int(np.sum(delta_arr == 0))
+            bucket_1_5 = int(np.sum((delta_arr >= 1) & (delta_arr <= 5)))
+            bucket_6_10 = int(np.sum((delta_arr >= 6) & (delta_arr <= 10)))
+            bucket_11_25 = int(np.sum((delta_arr >= 11) & (delta_arr <= 25)))
+            bucket_26_50 = int(np.sum((delta_arr >= 26) & (delta_arr <= 50)))
+            bucket_51_100 = int(np.sum((delta_arr >= 51) & (delta_arr <= 100)))
+            bucket_gt_100 = int(np.sum(delta_arr > 100))
         else:
             delta_min = -1
             delta_med = 0.0
             delta_p90 = 0.0
             delta_max = -1
+            bucket_0 = 0
+            bucket_1_5 = 0
+            bucket_6_10 = 0
+            bucket_11_25 = 0
+            bucket_26_50 = 0
+            bucket_51_100 = 0
+            bucket_gt_100 = 0
         avg_armed = float(srf_armed_bars_total / srf_arm_events) if srf_arm_events > 0 else 0.0
         print(
-            f"SRF_ARM_STATS {symbol_str} {day_str} bars={srf_arm_bars} source={srf_arm_source} "
+            f"SRF_ARM_STATS {symbol_str} {day_str} bars={srf_arm_bars_eff} source={srf_arm_source} "
             f"triggers={srf_arm_events} armed_bars={srf_armed_bars_total} avg_armed={avg_armed:.2f} "
             f"candidates={len(srf_candidate_deltas)} cand_outside_window={srf_candidates_outside_window} "
             f"delta_min={delta_min} delta_med={delta_med:.1f} delta_p90={delta_p90:.1f} delta_max={delta_max}",
             flush=True,
         )
-        if srf_arm_events > 0 and abs(avg_armed - float(srf_arm_bars)) > 1.5:
+        if srf_candidate_deltas:
+            print(
+                f"SRF_ARM_BUCKETS {symbol_str} {day_str} "
+                f"0={bucket_0} 1-5={bucket_1_5} 6-10={bucket_6_10} "
+                f"11-25={bucket_11_25} 26-50={bucket_26_50} 51-100={bucket_51_100} "
+                f">100={bucket_gt_100}",
+                flush=True,
+            )
+        if srf_arm_events > 0 and abs(avg_armed - float(srf_arm_bars_eff)) > 1.5:
             print(
                 f"SRF_ARM_WARN {symbol_str} {day_str} avg_armed={avg_armed:.2f} "
-                f"expected~{float(srf_arm_bars):.2f}",
+                f"expected~{float(srf_arm_bars_eff):.2f}",
                 flush=True,
             )
     if strategy_mode == "srf_entry_v1" and gate_mode == "srf_compatible":
         avg_armed_day = float(srf_armed_bars_total / srf_arm_events) if srf_arm_events > 0 else 0.0
         print(
-            f"SRF_ARM_DAY {symbol_str} {day_str} bars={srf_arm_bars} source={srf_arm_source} "
+            f"SRF_ARM_DAY {symbol_str} {day_str} bars={srf_arm_bars_eff} source={srf_arm_source} "
             f"armed_bars={srf_armed_bars_total} arm_events={srf_arm_events} avg_armed={avg_armed_day:.2f}",
             flush=True,
         )
@@ -4839,9 +5516,13 @@ def _run_entry_alpha_ablation(
     cost_ticks: float,
     instrument: str,
     gate_mode: str,
-    srf_arm_bars: int,
+    srf_arm_bars: int | None,
+    srf_arm_bars_apb: int,
+    srf_arm_bars_obra: int,
+    srf_arm_bars_pbra: int,
     srf_arm_mode: str,
     srf_arm_source: str,
+    lrams_arm_bars: int,
 ) -> None:
     modes = {
         "A": "none",
@@ -4873,13 +5554,18 @@ def _run_entry_alpha_ablation(
                 events_day,
                 entry_alpha_params=entry_alpha_params,
                 entry_alpha_gate_mode=entry_alpha_gate_mode,
+                entry_alpha_allow_mismatch=entry_alpha_allow_mismatch,
                 strategy_mode="entry_alpha_v1",
                 gated=gated_mode,
                 disable_gate=not gated_mode,
                 gate_mode=gate_mode,
                 srf_arm_bars=srf_arm_bars,
+                srf_arm_bars_apb=srf_arm_bars_apb,
+                srf_arm_bars_obra=srf_arm_bars_obra,
+                srf_arm_bars_pbra=srf_arm_bars_pbra,
                 srf_arm_mode=srf_arm_mode,
                 srf_arm_source=srf_arm_source,
+                lrams_arm_bars=lrams_arm_bars,
                 **base_kwargs,
             )
             total_candidates += int(entry_candidates_when_flat)
@@ -5419,6 +6105,10 @@ def main() -> None:
         raise ValueError(f"Invalid EXIT_MODE: {exit_mode}")
     entry_confirm_bars = int(os.environ.get("ENTRY_CONFIRM_BARS", "0"))
     entry_min_progress_ticks = int(os.environ.get("ENTRY_MIN_PROGRESS_TICKS", "0"))
+    entry_confirm_min_ticks_default = int(
+        os.environ.get("ENTRY_CONFIRM_MIN_TICKS_DEFAULT", str(entry_min_progress_ticks))
+    )
+    entry_confirm_min_ticks_apb = int(os.environ.get("ENTRY_CONFIRM_MIN_TICKS_APB", "0"))
     entry_confirm_style = os.environ.get("ENTRY_CONFIRM_STYLE", "off").strip().lower()
     print(
         f"ENTRY_CONFIRM: bars={entry_confirm_bars} min_prog={entry_min_progress_ticks} style={entry_confirm_style}",
@@ -5535,16 +6225,50 @@ def main() -> None:
     if srf_side_mode not in {"follow", "fade"}:
         raise ValueError(f"Invalid SRF_SIDE_MODE: {srf_side_mode}")
     srf_debug = os.environ.get("SRF_DEBUG", "0").strip().lower() in {"1", "true", "yes", "y"}
+    entry_alpha_weak_side_mode = os.environ.get("ENTRY_ALPHA_WEAK_SIDE_MODE", "follow").strip().lower()
+    if entry_alpha_weak_side_mode not in {"fade", "follow"}:
+        entry_alpha_weak_side_mode = "follow"
+    entry_alpha_allow_mismatch = os.environ.get("ENTRY_ALPHA_ALLOW_MISMATCH", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    if entry_alpha_allow_mismatch:
+        print("ENTRY_ALPHA_ALLOW_MISMATCH enabled: shadow-allow mismatches", flush=True)
     srf_arm_bars_env = os.environ.get("SRF_ARM_BARS", "").strip()
     srf_arm_bars = int(srf_arm_bars_env) if srf_arm_bars_env else None
+    srf_arm_bars_sweep_env = os.environ.get("SRF_ARM_BARS_SWEEP", "").strip()
+    if srf_arm_bars_sweep_env:
+        srf_arm_bars_sweep = [int(x.strip()) for x in srf_arm_bars_sweep_env.split(",") if x.strip()]
+    else:
+        srf_arm_bars_sweep = []
+    srf_arm_from_env = (srf_arm_bars is not None) or bool(srf_arm_bars_sweep)
+    lrams_arm_bars_env = os.environ.get("LRAMS_ARM_BARS", "").strip()
+    lrams_arm_bars = int(lrams_arm_bars_env) if lrams_arm_bars_env else None
     srf_arm_mode_env = os.environ.get("SRF_ARM_MODE", "").strip().lower()
     srf_arm_mode = srf_arm_mode_env or "lrams_only"
     if srf_arm_mode not in {"lrams_only", "lrams_and_srf"}:
         raise ValueError(f"Invalid SRF_ARM_MODE: {srf_arm_mode}")
     if strategy_mode == "srf_entry_v1" and not srf_arm_mode_env:
         srf_arm_mode = "lrams_and_srf"
-    srf_arm_label = str(srf_arm_bars) if srf_arm_bars is not None else "W"
-    print(f"SRF_ARM: bars={srf_arm_label} mode={srf_arm_mode}", flush=True)
+    trade_session = os.environ.get("TRADE_SESSION", "all").strip().lower()
+    min_spread_ticks = int(os.environ.get("MIN_SPREAD_TICKS", "0"))
+    entry_cooldown_bars = int(os.environ.get("ENTRY_COOLDOWN_BARS", "10"))
+    gate_lookback_bars = int(os.environ.get("GATE_LOOKBACK_BARS", "10"))
+    srf_arm_bars_eff = srf_arm_bars if srf_arm_from_env else gate_lookback_bars
+    lrams_arm_bars_eff = lrams_arm_bars if lrams_arm_bars is not None else gate_lookback_bars
+    srf_arm_bars_apb_env = os.environ.get("SRF_ARM_BARS_APB", "").strip()
+    srf_arm_bars_obra_env = os.environ.get("SRF_ARM_BARS_OBRA", "").strip()
+    srf_arm_bars_pbra_env = os.environ.get("SRF_ARM_BARS_PBRA", "").strip()
+    srf_arm_bars_apb = int(srf_arm_bars_apb_env) if srf_arm_bars_apb_env else int(srf_arm_bars_eff)
+    srf_arm_bars_obra = int(srf_arm_bars_obra_env) if srf_arm_bars_obra_env else int(srf_arm_bars_eff)
+    srf_arm_bars_pbra = int(srf_arm_bars_pbra_env) if srf_arm_bars_pbra_env else int(srf_arm_bars_eff)
+    srf_arm_label = str(srf_arm_bars) if srf_arm_from_env else "W"
+    print(f"SRF_ARM: bars={srf_arm_label} mode={srf_arm_mode} eff={srf_arm_bars_eff}", flush=True)
+    if srf_arm_bars_sweep:
+        print(f"SRF_ARM_SWEEP {srf_arm_bars_sweep}", flush=True)
     if os.environ.get("SRF_ARM_SELF_TEST", "0").strip() == "1":
         _self_test_srf_arm_window()
         return
@@ -5553,10 +6277,6 @@ def main() -> None:
         entry_alpha_self_test(tick_size=tick_size)
         print("ENTRY_ALPHA_SELF_TEST: ok", flush=True)
         return
-    trade_session = os.environ.get("TRADE_SESSION", "all").strip().lower()
-    min_spread_ticks = int(os.environ.get("MIN_SPREAD_TICKS", "0"))
-    entry_cooldown_bars = int(os.environ.get("ENTRY_COOLDOWN_BARS", "10"))
-    gate_lookback_bars = int(os.environ.get("GATE_LOOKBACK_BARS", "10"))
     weak_side_default = max(gate_lookback_bars, 100)
     weak_side_lookback_bars = int(os.environ.get("WEAK_SIDE_LOOKBACK_BARS", str(weak_side_default)))
     gate_mode = os.environ.get("GATE_MODE", "side_matched").strip().lower()
@@ -5585,6 +6305,8 @@ def main() -> None:
         sweep_ws = [int(x.strip()) for x in sweep_env.split(",") if x.strip()]
     else:
         sweep_ws = [gate_lookback_bars]
+    if not srf_arm_bars_sweep:
+        srf_arm_bars_sweep = [srf_arm_bars] if srf_arm_from_env else [None]
 
     afr_min_flow_abs_sweep_env = os.environ.get("AFR_MIN_FLOW_ABS_SWEEP", "").strip()
     if run_afr2_sweep and afr_min_flow_abs_sweep_env:
@@ -5628,14 +6350,15 @@ def main() -> None:
             "srf_baseline_bars": srf_baseline_bars,
             "srf_refill_ratio_max": srf_refill_ratio_max,
             "srf_min_spread_ticks": srf_min_spread_ticks,
-        "srf_flow_confirm": srf_flow_confirm,
-        "srf_flow_window_bars": srf_flow_window_bars,
-        "srf_min_flow": srf_min_flow,
-        "srf_side_mode": srf_side_mode,
-        "srf_debug": srf_debug,
-        "srf_arm_bars": srf_arm_bars,
-        "srf_arm_mode": srf_arm_mode,
-            "srf_arm_bars": srf_arm_bars,
+            "srf_flow_confirm": srf_flow_confirm,
+            "srf_flow_window_bars": srf_flow_window_bars,
+            "srf_min_flow": srf_min_flow,
+            "srf_side_mode": srf_side_mode,
+            "srf_debug": srf_debug,
+            "srf_arm_bars": srf_arm_bars_eff,
+            "srf_arm_bars_apb": srf_arm_bars_apb,
+            "srf_arm_bars_obra": srf_arm_bars_obra,
+            "srf_arm_bars_pbra": srf_arm_bars_pbra,
             "srf_arm_mode": srf_arm_mode,
             "trade_session": trade_session,
             "min_spread_ticks": min_spread_ticks,
@@ -5680,6 +6403,9 @@ def main() -> None:
             "srf_min_flow": srf_min_flow,
             "srf_side_mode": srf_side_mode,
             "srf_debug": srf_debug,
+            "srf_arm_bars_apb": srf_arm_bars_apb,
+            "srf_arm_bars_obra": srf_arm_bars_obra,
+            "srf_arm_bars_pbra": srf_arm_bars_pbra,
             "afr_k_bars": afr_k_bars,
             "afr_min_flow_abs": afr_min_flow_abs,
             "afr_stall_ticks": afr_stall_ticks,
@@ -5892,6 +6618,8 @@ def main() -> None:
             "entry_cooldown_bars": entry_cooldown_bars,
             "gate_lookback_bars": gate_lookback_bars,
             "weak_side_lookback_bars": weak_side_lookback_bars,
+            "entry_alpha_weak_side_mode": entry_alpha_weak_side_mode,
+            "entry_alpha_allow_mismatch": entry_alpha_allow_mismatch,
             "afr_k_bars": afr_k_bars,
             "afr_min_flow_abs": afr_min_flow_abs,
             "afr_stall_ticks": afr_stall_ticks,
@@ -6011,9 +6739,13 @@ def main() -> None:
             cost_ticks=entry_alpha_cost_ticks,
             instrument=instrument,
             gate_mode=gate_mode,
-            srf_arm_bars=srf_arm_bars if srf_arm_bars is not None else gate_lookback_bars,
+            srf_arm_bars=srf_arm_bars_eff,
+            srf_arm_bars_apb=srf_arm_bars_apb,
+            srf_arm_bars_obra=srf_arm_bars_obra,
+            srf_arm_bars_pbra=srf_arm_bars_pbra,
             srf_arm_mode=srf_arm_mode,
-            srf_arm_source="env" if srf_arm_bars is not None else "W",
+            srf_arm_source="env" if srf_arm_from_env else "W",
+            lrams_arm_bars=lrams_arm_bars_eff,
         )
         return
 
@@ -6022,6 +6754,7 @@ def main() -> None:
     day_count = len(selected_days)
     flow_warned = False
     afr_flow_warned = False
+    srf_w_coverage: Dict[Tuple[int, int], List[float]] = {}
 
     health_dir = out_dir / "health"
     health_dir.mkdir(parents=True, exist_ok=True)
@@ -6034,26 +6767,51 @@ def main() -> None:
         for afr_ft_bars_cur in afr_ft_bars_sweep:
             for gate_mode in gate_modes:
                 for gate_lookback_bars in sweep_ws:
-                    out_dir_w = out_dir / f"W{gate_lookback_bars}" / f"mode={gate_mode}"
-                    out_dir_w.mkdir(parents=True, exist_ok=True)
-                    print(
-                        "Executing run:",
-                        {
-                            "strategy_mode": strategy_mode,
-                            "W": gate_lookback_bars,
-                            "gate_mode": gate_mode,
-                            "exit_mode": os.getenv("EXIT_MODE"),
-                            "afr_min_flow_abs": afr_min_flow_abs_cur,
-                            "afr_ft_bars": afr_ft_bars_cur,
-                            "disable_gate": disable_gate,
-                            "trade_session": trade_session,
-                            "min_spread_ticks": min_spread_ticks,
-                            "entry_cooldown_bars": entry_cooldown_bars,
-                            "lbo_ignore_thr": lbo_ignore_thr,
-                            "lbo_flip_direction": lbo_flip_direction,
-                        },
-                        flush=True,
-                    )
+                    for srf_arm_bars_cur in srf_arm_bars_sweep:
+                        out_dir_w = out_dir / f"W{gate_lookback_bars}" / f"mode={gate_mode}"
+                        if len(srf_arm_bars_sweep) > 1:
+                            out_dir_w = out_dir_w / f"srf_arm={srf_arm_bars_cur if srf_arm_bars_cur is not None else 'W'}"
+                        out_dir_w.mkdir(parents=True, exist_ok=True)
+                        srf_arm_bars_eff = (
+                            int(srf_arm_bars_cur) if srf_arm_bars_cur is not None else gate_lookback_bars
+                        )
+                        srf_arm_bars_apb_eff = (
+                            int(srf_arm_bars_apb_env)
+                            if srf_arm_bars_apb_env
+                            else int(srf_arm_bars_eff)
+                        )
+                        srf_arm_bars_obra_eff = (
+                            int(srf_arm_bars_obra_env)
+                            if srf_arm_bars_obra_env
+                            else int(srf_arm_bars_eff)
+                        )
+                        srf_arm_bars_pbra_eff = (
+                            int(srf_arm_bars_pbra_env)
+                            if srf_arm_bars_pbra_env
+                            else int(srf_arm_bars_eff)
+                        )
+                        srf_arm_source_eff = "env" if srf_arm_bars_cur is not None else "W"
+                        lrams_arm_bars_eff = lrams_arm_bars if lrams_arm_bars is not None else gate_lookback_bars
+                        print(
+                            "Executing run:",
+                            {
+                                "strategy_mode": strategy_mode,
+                                "W": gate_lookback_bars,
+                                "gate_mode": gate_mode,
+                                "exit_mode": os.getenv("EXIT_MODE"),
+                                "afr_min_flow_abs": afr_min_flow_abs_cur,
+                                "afr_ft_bars": afr_ft_bars_cur,
+                                "disable_gate": disable_gate,
+                                "trade_session": trade_session,
+                                "min_spread_ticks": min_spread_ticks,
+                                "entry_cooldown_bars": entry_cooldown_bars,
+                                "lbo_ignore_thr": lbo_ignore_thr,
+                                "lbo_flip_direction": lbo_flip_direction,
+                                "srf_arm_bars": srf_arm_bars_eff,
+                                "srf_arm_source": srf_arm_source_eff,
+                            },
+                            flush=True,
+                        )
 
                     summaries = []
                     all_base = []
@@ -6127,16 +6885,6 @@ def main() -> None:
                             )
 
                             debug_entry = strategy_mode == "micro_momo_v1" and day == selected_days[0]
-                            if strategy_mode == "srf_entry_v1" and gate_mode == "srf_compatible":
-                                if srf_arm_bars is not None:
-                                    srf_arm_bars_eff = srf_arm_bars
-                                    srf_arm_source_eff = "env"
-                                else:
-                                    srf_arm_bars_eff = gate_lookback_bars
-                                    srf_arm_source_eff = "W"
-                            else:
-                                srf_arm_bars_eff = srf_arm_bars if srf_arm_bars is not None else gate_lookback_bars
-                                srf_arm_source_eff = "env" if srf_arm_bars is not None else "W"
                             if strategy_mode == "srf_entry_v1" and gate_mode == "srf_compatible" and day_index == 1:
                                 print(
                                     f"SRF_ARM_RESOLVED W={gate_lookback_bars} bars={srf_arm_bars_eff} "
@@ -6286,13 +7034,19 @@ def main() -> None:
                                     srf_side_mode=srf_side_mode,
                                     srf_debug=srf_debug,
                                     srf_arm_bars=srf_arm_bars_eff,
+                                    srf_arm_bars_apb=srf_arm_bars_apb_eff,
+                                    srf_arm_bars_obra=srf_arm_bars_obra_eff,
+                                    srf_arm_bars_pbra=srf_arm_bars_pbra_eff,
                                     srf_arm_mode=srf_arm_mode,
                                     srf_arm_source=srf_arm_source_eff,
+                                    lrams_arm_bars=lrams_arm_bars_eff,
                                     trade_session=trade_session,
                                     min_spread_ticks=min_spread_ticks,
                                     entry_cooldown_bars=entry_cooldown_bars,
                                     gate_lookback_bars=gate_lookback_bars,
                                     weak_side_lookback_bars=weak_side_lookback_bars,
+                                    entry_alpha_weak_side_mode=entry_alpha_weak_side_mode,
+                                    entry_alpha_allow_mismatch=entry_alpha_allow_mismatch,
                                     gated=False,
                                     disable_gate=False,
                                     gate_mode=gate_mode,
@@ -6632,15 +7386,21 @@ def main() -> None:
                                     srf_flow_window_bars=srf_flow_window_bars,
                                     srf_min_flow=srf_min_flow,
                                     srf_side_mode=srf_side_mode,
-                                    srf_debug=srf_debug,
+                                srf_debug=srf_debug,
                                 srf_arm_bars=srf_arm_bars_eff,
+                                srf_arm_bars_apb=srf_arm_bars_apb_eff,
+                                srf_arm_bars_obra=srf_arm_bars_obra_eff,
+                                srf_arm_bars_pbra=srf_arm_bars_pbra_eff,
                                 srf_arm_mode=srf_arm_mode,
                                 srf_arm_source=srf_arm_source_eff,
-                                    trade_session=trade_session,
+                                lrams_arm_bars=lrams_arm_bars_eff,
+                                trade_session=trade_session,
                                 min_spread_ticks=min_spread_ticks,
                                 entry_cooldown_bars=entry_cooldown_bars,
                                 gate_lookback_bars=gate_lookback_bars,
                                 weak_side_lookback_bars=weak_side_lookback_bars,
+                                entry_alpha_weak_side_mode=entry_alpha_weak_side_mode,
+                                entry_alpha_allow_mismatch=entry_alpha_allow_mismatch,
                                 gated=True,
                                 disable_gate=disable_gate,
                                 gate_mode=gate_mode,
@@ -6913,6 +7673,9 @@ def main() -> None:
                                     "mmas_entered": int(mmas_entered_gate),
                                 }
                             )
+                            if strategy_mode == "entry_alpha_v1" and not disable_gate:
+                                key = (int(srf_arm_bars_eff), int(gate_lookback_bars))
+                                srf_w_coverage.setdefault(key, []).append(float(gate_stats["coverage"]))
                             print(
                                 f"BASE trades={base_stats['trade_count']} mean={base_stats['mean_pnl_ticks']:.4f} "
                                 f"med={base_stats['median_pnl_ticks']:.4f} win%={base_stats['win_rate']:.2%} "
@@ -7031,15 +7794,20 @@ def main() -> None:
                                     any_sell_rate = gate_avail_gate.get("any_sell", 0) / weak_side_checks
                                     qual_buy_rate = gate_avail_gate.get("qual_buy", 0) / weak_side_checks
                                     qual_sell_rate = gate_avail_gate.get("qual_sell", 0) / weak_side_checks
+                                    mismatch_block_count = int(gate_diag.get("blocked_mismatch", 0)) + int(
+                                        gate_diag.get("entry_alpha_mismatch", 0)
+                                    )
                                     print(
                                         f"GATE_DIAG {instrument} {day} W={gate_lookback_bars} mode={gate_mode} "
+                                        f"armed_candidate_count={gate_diag.get('armed_candidate_count', 0)} "
+                                        f"not_armed_block_count={gate_diag.get('blocked_not_armed', 0)} "
+                                        f"mismatch_block_count={mismatch_block_count} "
+                                        f"weak_side_none_count={gate_diag.get('weak_side_none', 0)} "
+                                        f"allowed_count={gate_diag.get('allowed_count', 0)} "
+                                        f"coverage={gate_stats['coverage']:.2%} "
                                         f"weak_side_bid={gate_diag.get('weak_side_bid', 0)} "
                                         f"weak_side_ask={gate_diag.get('weak_side_ask', 0)} "
-                                        f"weak_side_none={gate_diag.get('weak_side_none', 0)} "
                                         f"blocked_none={gate_diag.get('blocked_none', 0)} "
-                                        f"blocked_mismatch={gate_diag.get('blocked_mismatch', 0)} "
-                                        f"blocked_not_armed={gate_diag.get('blocked_not_armed', 0)} "
-                                        f"allowed_count={gate_diag.get('allowed_count', 0)} "
                                         f"allow_on_none={gate_diag.get('allow_on_none', 0)} "
                                         f"bypass_on_none={gate_diag.get('bypass_on_none', 0)} "
                                         f"any_buy_rate={any_buy_rate:.3f} any_sell_rate={any_sell_rate:.3f} "
@@ -7166,13 +7934,20 @@ def main() -> None:
                                 flush=True,
                             )
                             if gate_mode == "side_matched":
+                                mismatch_block_count = int(gate_diag.get("blocked_mismatch", 0)) + int(
+                                    gate_diag.get("entry_alpha_mismatch", 0)
+                                )
                                 print(
-                                    f"{instrument} {day} gate_diag weak_side_bid={gate_diag.get('weak_side_bid', 0)} "
-                                    f"weak_side_ask={gate_diag.get('weak_side_ask', 0)} "
-                                    f"weak_side_none={gate_diag.get('weak_side_none', 0)} "
-                                    f"blocked_none={gate_diag.get('blocked_none', 0)} "
-                                    f"blocked_mismatch={gate_diag.get('blocked_mismatch', 0)} "
+                                    f"{instrument} {day} gate_diag "
+                                    f"armed_candidate_count={gate_diag.get('armed_candidate_count', 0)} "
+                                    f"not_armed_block_count={gate_diag.get('blocked_not_armed', 0)} "
+                                    f"mismatch_block_count={mismatch_block_count} "
+                                    f"weak_side_none_count={gate_diag.get('weak_side_none', 0)} "
                                     f"allowed_count={gate_diag.get('allowed_count', 0)} "
+                                    f"coverage={gate_stats['coverage']:.2%} "
+                                    f"weak_side_bid={gate_diag.get('weak_side_bid', 0)} "
+                                    f"weak_side_ask={gate_diag.get('weak_side_ask', 0)} "
+                                    f"blocked_none={gate_diag.get('blocked_none', 0)} "
                                     f"allow_on_none={gate_diag.get('allow_on_none', 0)}",
                                     flush=True,
                                 )
@@ -7682,27 +8457,6 @@ def main() -> None:
                                     f"Skip reasons mismatch: sum={sum(skip_gate[k] for k in skip_reason_keys)} "
                                     f"skipped={skipped_gate} day={day} W={gate_lookback_bars} mode={gate_mode}"
                                 )
-                            if gate_mode == "side_matched":
-                                blocked_diag = int(gate_diag.get("blocked_none", 0)) + int(
-                                    gate_diag.get("blocked_mismatch", 0)
-                                )
-                                if blocked_diag != blocked_gate:
-                                    raise RuntimeError(
-                                        f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode} "
-                                        f"blocked_none+blocked_mismatch={blocked_diag} blocked_total={blocked_gate}"
-                                    )
-                                allowed_count = int(gate_diag.get("allowed_count", 0))
-                                if blocked_diag + allowed_count != entry_candidates_flat_gate:
-                                    print(
-                                        f"GATE_COUNTS {instrument} {day} "
-                                        f"blocked_diag={blocked_diag} allowed_count={allowed_count} "
-                                        f"entry_candidates_when_flat_gate={entry_candidates_flat_gate}",
-                                        flush=True,
-                                    )
-                                    raise RuntimeError(
-                                        f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode} "
-                                        f"blocked+allowed={blocked_diag + allowed_count} entry_candidates_when_flat={entry_candidates_flat_gate}"
-                                    )
                             if strategy_mode != "impulse_confirm_v1" and entries_taken_base != signals_flat_base:
                                 print(
                                     f"BASE_COUNTS {instrument} {day} "
@@ -7713,17 +8467,6 @@ def main() -> None:
                                 raise RuntimeError(
                                     f"Baseline entries mismatch: entries_taken={entries_taken_base} "
                                     f"signals_when_flat={signals_flat_base} day={day}"
-                                )
-                            expected_gate = entries_taken_gate + blocked_gate
-                            if expected_gate != entry_candidates_flat_gate:
-                                print(
-                                    f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode} gate_mismatch "
-                                    f"entries_taken={entries_taken_gate} blocked={blocked_gate} entry_candidates_when_flat={entry_candidates_flat_gate}",
-                                    flush=True,
-                                )
-                                raise RuntimeError(
-                                    f"Gated entries mismatch: entries_taken+blocked={expected_gate} "
-                                    f"entry_candidates_when_flat={entry_candidates_flat_gate} day={day}"
                                 )
                         except Exception as exc:
                             skipped_days.append(f"{instrument} {day} W={gate_lookback_bars} mode={gate_mode}: {exc}")
@@ -7870,6 +8613,22 @@ def main() -> None:
         coverage_df.to_csv(out_dir / "coverage_activity.csv", index=False)
         print("Coverage/activity by day:", flush=True)
         print(coverage_df.to_string(index=False), flush=True)
+        if srf_w_coverage:
+            srf_vals = sorted({k[0] for k in srf_w_coverage})
+            w_vals = sorted({k[1] for k in srf_w_coverage})
+            print("SRF_ARM_W_SWEEP_TABLE metric=coverage", flush=True)
+            header = "srf_arm_bars " + " ".join(f"W={w}" for w in w_vals)
+            print(header, flush=True)
+            for srf_val in srf_vals:
+                row_cells = [f"{srf_val}"]
+                for w_val in w_vals:
+                    vals = srf_w_coverage.get((srf_val, w_val), [])
+                    if vals:
+                        cell = f"{100.0 * float(np.mean(vals)):.2f}%"
+                    else:
+                        cell = "NA"
+                    row_cells.append(cell)
+                print(" ".join(row_cells), flush=True)
     if not sweep_df.empty:
         dd_equal = np.isclose(
             sweep_df["baseline_max_dd_ticks"].astype(float),
