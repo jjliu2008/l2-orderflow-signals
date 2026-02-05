@@ -94,6 +94,7 @@ class EntryDecision:
     signal: int = 0
     family: str = ""
     reason: str = ""
+    setup_bar: int | None = None
     entry_lvl: float | None = None
     stop_price: float | None = None
     tp1_price: float | None = None
@@ -171,6 +172,7 @@ class EntryAlphaEngine:
                         decision.signal = 1
                         decision.family = "OBRA_v1"
                         decision.reason = "OBRA_LONG_RETEST_ACCEPT"
+                        decision.setup_bar = st.arm_bar
                         decision.entry_lvl = st.lvl
                         decision.stop_price = self._sub_ticks(st.lvl, p.STOP_FROM_LVL)
                         decision.tp1_price = self._add_ticks(entry_px, p.TP1_TICKS)
@@ -185,6 +187,7 @@ class EntryAlphaEngine:
                         decision.signal = -1
                         decision.family = "OBRA_v1"
                         decision.reason = "OBRA_SHORT_RETEST_ACCEPT"
+                        decision.setup_bar = st.arm_bar
                         decision.entry_lvl = st.lvl
                         decision.stop_price = self._add_ticks(st.lvl, p.STOP_FROM_LVL)
                         decision.tp1_price = self._sub_ticks(entry_px, p.TP1_TICKS)
@@ -242,6 +245,7 @@ class EntryAlphaEngine:
                 decision.signal = 1
                 decision.family = "APB_v1"
                 decision.reason = "APB_LONG_BREAK"
+                decision.setup_bar = st.arm_bar
                 decision.entry_lvl = st.lvl
                 decision.stop_price = self._sub_ticks(st.lvl, p.STOP_FROM_LVL)
                 decision.tp1_price = self._add_ticks(entry_px, p.TP1_TICKS)
@@ -254,6 +258,7 @@ class EntryAlphaEngine:
                 decision.signal = -1
                 decision.family = "APB_v1"
                 decision.reason = "APB_SHORT_BREAK"
+                decision.setup_bar = st.arm_bar
                 decision.entry_lvl = st.lvl
                 decision.stop_price = self._add_ticks(st.lvl, p.STOP_FROM_LVL)
                 decision.tp1_price = self._sub_ticks(entry_px, p.TP1_TICKS)
@@ -313,6 +318,7 @@ class EntryAlphaEngine:
                         decision.signal = 1
                         decision.family = "PBRA_v1"
                         decision.reason = "PBRA_LONG_REACCEL"
+                        decision.setup_bar = st.arm_bar
                         decision.entry_lvl = st.lvl
                         decision.stop_price = self._sub_ticks(st.lvl, p.STOP_FROM_LVL)
                         decision.tp1_price = self._add_ticks(entry_px, p.TP1_TICKS)
@@ -336,6 +342,7 @@ class EntryAlphaEngine:
                         decision.signal = -1
                         decision.family = "PBRA_v1"
                         decision.reason = "PBRA_SHORT_REACCEL"
+                        decision.setup_bar = st.arm_bar
                         decision.entry_lvl = st.lvl
                         decision.stop_price = self._add_ticks(st.lvl, p.STOP_FROM_LVL)
                         decision.tp1_price = self._sub_ticks(entry_px, p.TP1_TICKS)
