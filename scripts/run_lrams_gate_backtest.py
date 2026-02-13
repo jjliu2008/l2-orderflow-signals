@@ -59,17 +59,38 @@ Baseline:
   ENTRY_CONFIRM_WORST_TICKS_DEFAULT confirm worst-adverse ticks (default: -2)
   ENTRY_CONFIRM_WORST_TICKS_APB confirm worst-adverse ticks for APB_v1 (default: -1)
   ENTRY_CONFIRM_MIN_ABS_OFID_APB min abs OFID in confirm window for APB_v1 (default: 0 = off)
+  ENTRY_CONFIRM_MIN_ABS_OFID_PBRA min abs OFID in confirm window for PBRA_v1 (default: 0 = off)
+  ENTRY_CONFIRM_MIN_ABS_OFID_PBRA_MISMATCH min abs OFID in confirm window for mismatched PBRA_v1 (default: 0 = off)
+  SRF_ARM_BARS_PBRA_SOFT optional soft arming window for PBRA_v1 (default: 0 = off)
+  ENTRY_CONFIRM_MIN_FLOW_SUM_PBRA min signed OFID sum in confirm window for PBRA_v1 (default: 0 = off)
+  PBRA_ENTER_PROOF_MAX_BARS override PBRA confirm bars for enter-on-proof (default: 0 = off)
+  PBRA_ENTER_ON_PROOF_TICKS override PBRA confirm min ticks for enter-on-proof (default: 0 = off)
   ENTRY_ALPHA_FAMILY_ALLOWLIST comma list of EntryAlpha families to allow (default: unset = all)
   ENTRY_ALPHA_MAX_SL_TICKS cap entry_alpha stop loss in ticks (default: unset)
   ENTRY_ALPHA_TIME_STOP_BARS time stop for entry_alpha (bars, default: off)
   ENTRY_ALPHA_TP_TICKS     fixed take-profit for entry_alpha in ticks (default: off)
+  ENTRY_ALPHA_TP_TICKS_PBRA fixed take-profit for PBRA_v1 in ticks (default: off)
+  ENTRY_ALPHA_ALLOW_MISMATCH_PBRA allow mismatched PBRA_v1 entries (default: 0)
   PBRA_FIRE_MIN_ABS_OFID   PBRA min abs OFID at fire time (default: 0 = off)
+  PBRA_SCRATCH_BARS        PBRA thesis-invalidation bars (default: 0 = off)
+  PBRA_SCRATCH_MIN_MFE_TICKS PBRA min favorable ticks in scratch window (default: 1)
+  PBRA_SCRATCH_MIN_ABS_OFID_MAX PBRA min abs OFID max in scratch window (default: 0 = off)
+  PBRA_RUNNER_ARM_BARS     PBRA runner arm window bars (default: 0 = off)
+  PBRA_RUNNER_ARM_MFE_TICKS PBRA runner min MFE ticks to arm (default: 1)
+  PBRA_RUNNER_MIN_ABS_OFID_MAX PBRA runner min abs OFID max in arm window (default: 0 = off)
+  PBRA_RUNNER_TP_TICKS     PBRA runner TP ticks after arm (default: 0 = off)
+  PBRA_RUNNER_DISABLE_BE_LIMIT disable BE_LIMIT exit when runner armed (default: 1)
+  PBRA_RUNNER_BE_STOP_TICKS PBRA runner stop offset from breakeven (default: 0)
+  PBRA_REGIME_LOOKAHEAD_BARS lookahead bars for PBRA candidate MFE check (default: 0 = off)
+  PBRA_REGIME_ROLLING_CANDIDATES rolling PBRA candidate window size (default: 0 = off)
+  PBRA_REGIME_MIN_PCT_MFE  min pct of PBRA candidates with MFE>=1 to allow entries (default: 0 = off)
   PNL_TICK_VALUE          dollar value per tick (default: 12.50)
   PNL_COMMISSION_PER_SIDE commission per side in $ (default: 0)
   PNL_COMMISSION_ROUND_TURN commission per round turn in $ (default: unset)
   PNL_SLIPPAGE_TICKS      round-turn slippage in ticks (default: 0)
   PNL_DAILY_LOSS_LIMIT    daily loss limit in $ (default: 0 = off)
   PNL_MAX_DRAWDOWN_LIMIT  max intraday drawdown limit in $ (default: 0 = off)
+  PNL_PRINT_TRADES        print per-trade PnL lines (default: 0)
 
 Impulse confirm entry (strategy_mode=impulse_confirm_v1):
   IMPULSE_LOOKBACK_BARS   impulse lookback in bars (default: 1)
@@ -197,7 +218,7 @@ import time
 import datetime
 from collections import deque
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Deque, Dict, List, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -584,6 +605,11 @@ def _simulate_day(
     entry_confirm_worst_ticks_default: int,
     entry_confirm_worst_ticks_apb: int,
     entry_confirm_min_abs_ofid_apb: float,
+    entry_confirm_min_abs_ofid_pbra: float,
+    entry_confirm_min_abs_ofid_pbra_mismatch: float,
+    entry_confirm_min_flow_sum_pbra: float,
+    pbra_enter_proof_bars: int,
+    pbra_enter_proof_ticks: int,
     exit_debug: bool,
     exit_mode: str,
     validate_bars: int,
@@ -619,6 +645,7 @@ def _simulate_day(
     srf_arm_bars_apb: int,
     srf_arm_bars_obra: int,
     srf_arm_bars_pbra: int,
+    srf_arm_bars_pbra_soft: int,
     srf_arm_max_age_bars: int,
     srf_arm_mode: str,
     srf_arm_source: str,
@@ -630,11 +657,25 @@ def _simulate_day(
     entry_alpha_gate_mode: str | None = None,
     entry_alpha_weak_side_mode: str = "follow",
     entry_alpha_allow_mismatch: bool = False,
+    entry_alpha_allow_mismatch_pbra: bool = False,
     entry_alpha_family_allowlist: set[str] | None = None,
     entry_alpha_max_sl_ticks: int | None = None,
     entry_alpha_time_stop_bars: int | None = None,
     entry_alpha_tp_ticks: int | None = None,
+    entry_alpha_tp_ticks_pbra: int | None = None,
     pbra_fire_min_abs_ofid: float = 0.0,
+    pbra_scratch_bars: int = 0,
+    pbra_scratch_min_mfe_ticks: int = 1,
+    pbra_scratch_min_abs_ofid_max: float = 0.0,
+    pbra_runner_arm_bars: int = 0,
+    pbra_runner_arm_mfe_ticks: int = 1,
+    pbra_runner_min_abs_ofid_max: float = 0.0,
+    pbra_runner_tp_ticks: int = 0,
+    pbra_runner_disable_be_limit: bool = True,
+    pbra_runner_be_stop_ticks: int = 0,
+    pbra_regime_lookahead_bars: int = 0,
+    pbra_regime_rolling_candidates: int = 0,
+    pbra_regime_min_pct_mfe: float = 0.0,
     lrams_arm_bars: int | None = None,
 ) -> Tuple[object, ...]:
     bid = pd.to_numeric(df_day["bid_price_1"], errors="coerce").to_numpy()
@@ -778,6 +819,10 @@ def _simulate_day(
     entry_confirm_passed_mismatch = 0
     entry_confirm_failed_clean = 0
     entry_confirm_failed_mismatch = 0
+    entry_confirm_checked_pbra_clean = 0
+    entry_confirm_checked_pbra_mismatch = 0
+    entry_confirm_passed_pbra_clean = 0
+    entry_confirm_passed_pbra_mismatch = 0
     entry_confirm_checked_by_family: Dict[str, int] = {}
     entry_confirm_passed_by_family: Dict[str, int] = {}
     entry_confirm_failed_by_family: Dict[str, int] = {}
@@ -787,6 +832,7 @@ def _simulate_day(
     entry_confirm_fail_mismatch_by_reason: Dict[str, int] = {}
     entry_confirm_fail_mismatch_by_family: Dict[str, int] = {}
     entry_confirm_fail_mismatch_reason_family: Dict[str, str] = {}
+    pbra_confirm_max_abs_ofid_vals: List[float] = []
     pending_entry_active = False
     pending_entry_side = ""
     pending_entry_price = float("nan")
@@ -889,6 +935,7 @@ def _simulate_day(
     entry_alpha_family_skipped = 0
     entry_alpha_pbra_fire_filtered = 0
     entry_alpha_armed_candidates = 0
+    entry_alpha_soft_armed = 0
     entry_alpha_not_armed = 0
     entry_alpha_mismatch = 0
     entry_alpha_weak_side_none = 0
@@ -899,6 +946,7 @@ def _simulate_day(
         "not_armed": 0,
         "weak_none": 0,
         "mismatch": 0,
+        "pbra_regime": 0,
         "blocked_entry_alpha": 0,
     }
     entry_alpha_mismatch_subtypes = {
@@ -913,9 +961,25 @@ def _simulate_day(
     entry_alpha_reason_total: Dict[str, int] = {}
     entry_alpha_reason_mismatch: Dict[str, int] = {}
     entry_alpha_mismatch_bars: Set[int] = set()
+    pbra_regime_pending: Deque[Dict[str, object]] = deque()
+    pbra_regime_outcomes: Deque[int] = (
+        deque(maxlen=pbra_regime_rolling_candidates)
+        if pbra_regime_rolling_candidates > 0
+        else deque()
+    )
+    pbra_regime_checked = 0
+    pbra_regime_blocked = 0
+    pbra_regime_enabled = (
+        strategy_mode == "entry_alpha_v1"
+        and pbra_regime_lookahead_bars > 0
+        and pbra_regime_rolling_candidates > 0
+        and pbra_regime_min_pct_mfe > 0.0
+    )
+    pbra_regime_min_candidates = int(pbra_regime_rolling_candidates)
     candidates_armed_srf = 0
     candidates_armed_lrams = 0
     candidates_armed_both = 0
+    candidates_armed_soft = 0
     candidates_not_armed = 0
     pending_ea_gate_override: bool | None = None
     pending_ea_gate_reason: str | None = None
@@ -943,6 +1007,7 @@ def _simulate_day(
     }
     gate_diag = {
         "armed_candidate_count": 0,
+        "soft_armed": 0,
         "weak_side_ask": 0,
         "weak_side_bid": 0,
         "weak_side_none": 0,
@@ -1923,6 +1988,34 @@ def _simulate_day(
             srf_armed_bars_total += 1
         if armed_until_bar_lrams >= 0 and i <= armed_until_bar_lrams:
             lrams_armed_bars_total += 1
+        if pbra_regime_enabled and pbra_regime_pending:
+            while pbra_regime_pending and pbra_regime_pending[0]["mature_bar"] <= i:
+                cand = pbra_regime_pending.popleft()
+                entry_mid = float(cand.get("entry_mid", float("nan")))
+                if not np.isfinite(entry_mid):
+                    pbra_regime_outcomes.append(0)
+                    pbra_regime_checked += 1
+                    continue
+                cand_bar = int(cand.get("bar", -1))
+                end_bar = int(cand.get("mature_bar", cand_bar))
+                if cand_bar < 0 or end_bar <= cand_bar:
+                    pbra_regime_outcomes.append(0)
+                    pbra_regime_checked += 1
+                    continue
+                window = mid[cand_bar + 1 : end_bar + 1]
+                if window.size:
+                    window = window[np.isfinite(window)]
+                if not window.size:
+                    pbra_regime_outcomes.append(0)
+                    pbra_regime_checked += 1
+                    continue
+                if str(cand.get("side", "")) == "long":
+                    mfe_ticks = (float(np.nanmax(window)) - entry_mid) / tick_size
+                else:
+                    mfe_ticks = (entry_mid - float(np.nanmin(window))) / tick_size
+                ok = bool(np.isfinite(mfe_ticks) and mfe_ticks >= 1.0)
+                pbra_regime_outcomes.append(1 if ok else 0)
+                pbra_regime_checked += 1
         if desired_side_top is not None:
             total_signals += 1
             if in_position:
@@ -1987,6 +2080,25 @@ def _simulate_day(
                             and float(pos.get("mfe_ticks", 0.0)) >= float(lbo_scratch_min_progress_ticks)
                         ):
                             pos["bars_to_progress"] = int(i - entry_bar)
+                    if (
+                        strategy_mode == "entry_alpha_v1"
+                        and str(pos.get("entry_family", "")) == "PBRA_v1"
+                    ):
+                        age_bars = int(i - entry_bar)
+                        pbra_track_bars = max(
+                            int(pos.get("pbra_scratch_bars", 0)),
+                            int(pos.get("pbra_runner_arm_bars", 0)),
+                        )
+                        if pbra_track_bars > 0 and age_bars <= pbra_track_bars:
+                            best_favor = float(pos.get("pbra_best_favor_ticks", 0.0))
+                            if np.isfinite(pnl_mark) and pnl_mark > best_favor:
+                                pos["pbra_best_favor_ticks"] = float(pnl_mark)
+                            ofid_val = float(abs(signed_vol[i])) if i < len(signed_vol) else 0.0
+                            if not np.isfinite(ofid_val):
+                                ofid_val = 0.0
+                            max_abs_ofid = float(pos.get("pbra_max_abs_ofid", 0.0))
+                            if (not np.isfinite(max_abs_ofid)) or ofid_val > max_abs_ofid:
+                                pos["pbra_max_abs_ofid"] = float(ofid_val)
                     breakeven_ticks = pos.get("breakeven_ticks")
                     if breakeven_ticks is not None and not pos.get("breakeven_set", False):
                         mfe_ticks = (mark_px - entry_px) / tick_size if side == "long" else (entry_px - mark_px) / tick_size
@@ -2046,12 +2158,6 @@ def _simulate_day(
                         sl_level_exec = float(entry_px - sl_ticks_local * tick_size) if side == "long" else float(
                             entry_px + sl_ticks_local * tick_size
                         )
-                        if side == "long":
-                            sl_hit = mark_px <= sl_level_exec
-                            tp_hit = mark_px >= tp_level_exec
-                        else:
-                            sl_hit = mark_px >= sl_level_exec
-                            tp_hit = mark_px <= tp_level_exec
                         if float(pos.get("mfe_ticks", 0.0)) >= float(be_arm_ticks):
                             if not pos.get("be_armed", False):
                                 pos["be_armed"] = True
@@ -2077,6 +2183,69 @@ def _simulate_day(
                                 pos["scratch_start_bar"] = int(i)
                             scratch_start = int(pos.get("scratch_start_bar", i))
                             scratch_hit = (i - scratch_start) >= int(scratch_grace_bars)
+                        pbra_scratch_hit = False
+                        if (
+                            strategy_mode == "entry_alpha_v1"
+                            and str(pos.get("entry_family", "")) == "PBRA_v1"
+                        ):
+                            pbra_scratch_bars_local = int(pos.get("pbra_scratch_bars", 0))
+                            if pbra_scratch_bars_local > 0 and age_bars >= pbra_scratch_bars_local:
+                                best_favor = float(pos.get("pbra_best_favor_ticks", 0.0))
+                                if not np.isfinite(best_favor):
+                                    best_favor = 0.0
+                                min_mfe = float(pos.get("pbra_scratch_min_mfe_ticks", 0.0))
+                                max_abs_ofid = float(pos.get("pbra_max_abs_ofid", 0.0))
+                                if not np.isfinite(max_abs_ofid):
+                                    max_abs_ofid = 0.0
+                                min_abs_ofid = float(pos.get("pbra_scratch_min_abs_ofid_max", 0.0))
+                                fails_mfe = best_favor < min_mfe
+                                fails_flow = min_abs_ofid > 0.0 and max_abs_ofid < min_abs_ofid
+                                pbra_scratch_hit = fails_mfe and (min_abs_ofid <= 0.0 or fails_flow)
+                        pbra_runner_armed = False
+                        if (
+                            strategy_mode == "entry_alpha_v1"
+                            and str(pos.get("entry_family", "")) == "PBRA_v1"
+                        ):
+                            runner_arm_bars = int(pos.get("pbra_runner_arm_bars", 0))
+                            if (
+                                not pos.get("pbra_runner_armed", False)
+                                and runner_arm_bars > 0
+                                and age_bars <= runner_arm_bars
+                            ):
+                                best_favor = float(pos.get("pbra_best_favor_ticks", 0.0))
+                                if not np.isfinite(best_favor):
+                                    best_favor = 0.0
+                                max_abs_ofid = float(pos.get("pbra_max_abs_ofid", 0.0))
+                                if not np.isfinite(max_abs_ofid):
+                                    max_abs_ofid = 0.0
+                                arm_mfe = float(pos.get("pbra_runner_arm_mfe_ticks", 1.0))
+                                min_abs_ofid = float(pos.get("pbra_runner_min_abs_ofid_max", 0.0))
+                                if best_favor >= arm_mfe and (
+                                    min_abs_ofid <= 0.0 or max_abs_ofid >= min_abs_ofid
+                                ):
+                                    pos["pbra_runner_armed"] = True
+                            pbra_runner_armed = bool(pos.get("pbra_runner_armed", False))
+                        if pbra_runner_armed:
+                            pbra_scratch_hit = False
+                            if bool(pos.get("pbra_runner_disable_be_limit", True)):
+                                be_limit_hit = False
+                            runner_tp = int(pos.get("pbra_runner_tp_ticks", 0))
+                            if runner_tp > 0:
+                                tp_ticks_local = runner_tp
+                                tp_level_exec = float(entry_px + runner_tp * tick_size) if side == "long" else float(
+                                    entry_px - runner_tp * tick_size
+                                )
+                            be_stop_ticks = int(pos.get("pbra_runner_be_stop_ticks", 0))
+                            if side == "long":
+                                sl_level_exec = max(sl_level_exec, float(entry_px - be_stop_ticks * tick_size))
+                            else:
+                                sl_level_exec = min(sl_level_exec, float(entry_px + be_stop_ticks * tick_size))
+                        if side == "long":
+                            sl_hit = mark_px <= sl_level_exec
+                            tp_hit = mark_px >= tp_level_exec
+                        else:
+                            sl_hit = mark_px >= sl_level_exec
+                            tp_hit = mark_px <= tp_level_exec
                         time_hit = i >= int(pos.get("time_exit_bar", entry_bar))
                         decay_hit = decay_count >= int(decay_bars)
                         if sl_hit:
@@ -2093,6 +2262,9 @@ def _simulate_day(
                         elif decay_hit:
                             pos["exit_bar"] = i
                             pos["exit_reason"] = "DECAY"
+                        elif pbra_scratch_hit:
+                            pos["exit_bar"] = i
+                            pos["exit_reason"] = "PBRA_NO_REACCEL"
                         elif scratch_hit:
                             pos["exit_bar"] = i
                             pos["exit_reason"] = "SCRATCH"
@@ -2128,6 +2300,27 @@ def _simulate_day(
                                 pos["exit_reason"] = "SL"
                                 pos["exit_engine"] = "legacy"
                                 pos["exit_locked"] = True
+                        if (
+                            pos.get("exit_reason") is None
+                            and strategy_mode == "entry_alpha_v1"
+                            and str(pos.get("entry_family", "")) == "PBRA_v1"
+                        ):
+                            pbra_scratch_bars_local = int(pos.get("pbra_scratch_bars", 0))
+                            if pbra_scratch_bars_local > 0:
+                                age_bars = int(i - entry_bar)
+                                if age_bars >= pbra_scratch_bars_local:
+                                    best_favor = float(pos.get("pbra_best_favor_ticks", 0.0))
+                                    min_mfe = float(pos.get("pbra_scratch_min_mfe_ticks", 0.0))
+                                    max_abs_ofid = float(pos.get("pbra_max_abs_ofid", 0.0))
+                                    min_abs_ofid = float(pos.get("pbra_scratch_min_abs_ofid_max", 0.0))
+                                    scratch_due_to_mfe = best_favor < min_mfe
+                                    scratch_due_to_flow = min_abs_ofid > 0.0 and max_abs_ofid < min_abs_ofid
+                                    scratch_hit = scratch_due_to_mfe and (min_abs_ofid <= 0.0 or scratch_due_to_flow)
+                                    if scratch_hit:
+                                        pos["exit_bar"] = i
+                                        pos["exit_reason"] = "PBRA_NO_REACCEL"
+                                        pos["exit_engine"] = "legacy"
+                                        pos["exit_locked"] = True
                 if not use_exit_sm_v2 and not use_exit_exec_v2 and not use_exit_sm_v1 and (
                     strategy_mode == "absorption_failure_v2"
                     and pos.get("exit_reason") == "TIME"
@@ -2489,6 +2682,30 @@ def _simulate_day(
                 entry_reason_label_out = pos.get("entry_reason_label")
                 if strategy_mode == "lrams_breakout_v1" and not entry_reason_out:
                     entry_reason_out = "break"
+                entry_family_val = str(pos.get("entry_family", ""))
+                pbra_would_scratch = 0
+                pbra_runner_armed = 0
+                pbra_runner_tp_hit = 0
+                if entry_family_val == "PBRA_v1":
+                    pbra_bars = int(pos.get("pbra_scratch_bars", 0))
+                    if pbra_bars > 0:
+                        age_bars = int(exit_bar - entry_bar)
+                        if age_bars >= pbra_bars:
+                            best_favor = float(pos.get("pbra_best_favor_ticks", 0.0))
+                            if not np.isfinite(best_favor):
+                                best_favor = 0.0
+                            max_abs_ofid = float(pos.get("pbra_max_abs_ofid", 0.0))
+                            if not np.isfinite(max_abs_ofid):
+                                max_abs_ofid = 0.0
+                            min_mfe = float(pos.get("pbra_scratch_min_mfe_ticks", 0.0))
+                            min_abs_ofid = float(pos.get("pbra_scratch_min_abs_ofid_max", 0.0))
+                            fails_mfe = best_favor < min_mfe
+                            fails_flow = min_abs_ofid > 0.0 and max_abs_ofid < min_abs_ofid
+                            if fails_mfe and (min_abs_ofid <= 0.0 or fails_flow):
+                                pbra_would_scratch = 1
+                    pbra_runner_armed = 1 if bool(pos.get("pbra_runner_armed", False)) else 0
+                    if pbra_runner_armed and exit_reason == "TP":
+                        pbra_runner_tp_hit = 1
                 perfect_exec_pnl_ticks = float("nan")
                 perfect_exec_exit_reason = ""
                 perfect_exec_exit_bar = -1
@@ -2543,7 +2760,7 @@ def _simulate_day(
                         "entry_root_reason": entry_root_reason_out if entry_root_reason_out else "other",
                         "entry_reason_raw": entry_reason_raw_out if entry_reason_raw_out else "",
                         "entry_reason_label": entry_reason_label_out if entry_reason_label_out else "",
-                        "entry_family": str(pos.get("entry_family", "")),
+                        "entry_family": entry_family_val,
                         "absorption_level": float(pos.get("absorption_level", float("nan"))),
                         "break_level": float(pos.get("break_level", float("nan"))),
                         "flow_align_sum_at_entry": float(pos.get("flow_align_sum_at_entry", 0.0)),
@@ -2555,6 +2772,12 @@ def _simulate_day(
                         "confirm_price_ref": float(pos.get("confirm_price_ref", float("nan"))),
                         "mae_ticks": float(pos.get("mae_ticks", 0.0)),
                         "mfe_ticks": float(pos.get("mfe_ticks", 0.0)),
+                        "abs_ofid_at_fire": float(pos.get("abs_ofid_at_fire", float("nan"))),
+                        "pbra_best_favor_ticks_firstN": float(pos.get("pbra_best_favor_ticks", float("nan"))),
+                        "pbra_max_abs_ofid_firstN": float(pos.get("pbra_max_abs_ofid", float("nan"))),
+                        "pbra_would_scratch": int(pbra_would_scratch),
+                        "pbra_runner_armed": int(pbra_runner_armed),
+                        "pbra_runner_tp_hit": int(pbra_runner_tp_hit),
                         "be_armed": bool(pos.get("be_armed", False)),
                         "entry_spread_ticks": float(pos.get("entry_spread_ticks", float("nan"))),
                         "gate_event_age": int(pos.get("gate_event_age", -1)),
@@ -2702,6 +2925,9 @@ def _simulate_day(
                 min_abs_ofid_eff = float(
                     pending_entry.get("confirm_min_abs_ofid", 0.0)
                 )
+                min_flow_sum_eff = float(
+                    pending_entry.get("confirm_min_flow_sum", 0.0)
+                )
                 entry_bar_ref = int(pending_entry.get("created_bar", pending_entry_created))
                 window_end = min(n - 1, entry_bar_ref + confirm_bars_eff)
                 window_end_cur = min(i, window_end)
@@ -2709,6 +2935,7 @@ def _simulate_day(
                 best_favor_ticks = float("nan")
                 worst_adverse_ticks = float("nan")
                 max_abs_ofid = float("nan")
+                confirm_flow_sum = float("nan")
                 if entry_px_ref == entry_px_ref and window_end_cur >= entry_bar_ref:
                     window = mid[entry_bar_ref : window_end_cur + 1]
                     if np.any(np.isfinite(window)):
@@ -2718,19 +2945,27 @@ def _simulate_day(
                         else:
                             best_favor_ticks = (entry_px_ref - np.nanmin(window)) / tick_size
                             worst_adverse_ticks = (entry_px_ref - np.nanmax(window)) / tick_size
-                    if min_abs_ofid_eff > 0:
+                    if min_abs_ofid_eff > 0 or min_flow_sum_eff > 0:
                         ofid_window = signed_vol[entry_bar_ref : window_end_cur + 1]
                         if ofid_window.size > 0:
                             max_abs_ofid = float(np.nanmax(np.abs(ofid_window)))
+                            confirm_flow_sum = float(np.nansum(ofid_window))
                 ofid_ok = True
                 if min_abs_ofid_eff > 0:
                     ofid_ok = np.isfinite(max_abs_ofid) and max_abs_ofid >= min_abs_ofid_eff
+                flow_ok = True
+                if min_flow_sum_eff > 0:
+                    if pending_entry_side == "long":
+                        flow_ok = np.isfinite(confirm_flow_sum) and confirm_flow_sum >= min_flow_sum_eff
+                    else:
+                        flow_ok = np.isfinite(confirm_flow_sum) and confirm_flow_sum <= -min_flow_sum_eff
                 confirm_ok = (
                     np.isfinite(best_favor_ticks)
                     and np.isfinite(worst_adverse_ticks)
                     and best_favor_ticks >= best_min_eff
                     and worst_adverse_ticks >= worst_min_eff
                     and ofid_ok
+                    and flow_ok
                 )
                 if confirm_ok:
                     entry_confirm_passed += 1
@@ -2743,6 +2978,11 @@ def _simulate_day(
                         entry_confirm_passed_by_family[family_key] = (
                             entry_confirm_passed_by_family.get(family_key, 0) + 1
                         )
+                        if family_key == "PBRA_v1":
+                            if bool(pending_entry.get("entry_alpha_mismatch")):
+                                entry_confirm_passed_pbra_mismatch += 1
+                            else:
+                                entry_confirm_passed_pbra_clean += 1
                     pending_confirmed = True
                     pending_payload = dict(pending_entry)
                     pending_entry_active = False
@@ -2764,6 +3004,7 @@ def _simulate_day(
                                 f"worst_adverse={worst_adverse_ticks:.2f} "
                                 f"best_min={best_min_eff:.2f} worst_min={worst_min_eff:.2f} "
                                 f"min_abs_ofid={min_abs_ofid_eff:.2f} max_abs_ofid={max_abs_ofid:.2f} "
+                                f"min_flow_sum={min_flow_sum_eff:.2f} flow_sum={confirm_flow_sum:.2f} "
                                 f"pending_px={pending_entry_price:.2f} confirm_px={confirm_px:.2f} "
                                 f"expiry_in={expiry_in}",
                                 flush=True,
@@ -2821,6 +3062,7 @@ def _simulate_day(
         entry_alpha_gate_override: bool | None = None
         entry_alpha_gate_reason: str | None = None
         entry_alpha_decision_signal = 0
+        abs_ofid_at_fire = float("nan")
         confirm_bars_waited = 0
         confirm_price_ref = float("nan")
         lbo_entry_mode = ""
@@ -2944,6 +3186,7 @@ def _simulate_day(
             did_entry_alpha_eval = True
             decision_signal = int(decision.signal)
             decision_family = decision.family or "entry_alpha_v1"
+            abs_ofid_at_fire = float("nan")
             if (
                 decision_signal != 0
                 and entry_alpha_family_allowlist
@@ -2958,20 +3201,21 @@ def _simulate_day(
                 decision_signal = 0
             if (
                 decision_signal != 0
-                and decision_family == "PBRA_v1"
-                and pbra_fire_min_abs_ofid > 0
             ):
-                abs_ofid_at_fire = float(abs(signed_vol[i]))
-                if abs_ofid_at_fire < pbra_fire_min_abs_ofid:
-                    entry_alpha_pbra_fire_filtered += 1
-                    if validate_debug and entry_alpha_pbra_fire_filtered <= 5:
-                        print(
-                            f"PBRA_FIRE_OFID_BLOCK {symbol_str} {day_str} i={i} "
-                            f"abs_ofid={abs_ofid_at_fire:.2f} "
-                            f"min_abs_ofid={pbra_fire_min_abs_ofid:.2f}",
-                            flush=True,
-                        )
-                    decision_signal = 0
+                if decision_family == "PBRA_v1":
+                    abs_ofid_at_fire = float(abs(signed_vol[i])) if i < len(signed_vol) else 0.0
+                    if not np.isfinite(abs_ofid_at_fire):
+                        abs_ofid_at_fire = 0.0
+                    if pbra_fire_min_abs_ofid > 0 and abs_ofid_at_fire < pbra_fire_min_abs_ofid:
+                        entry_alpha_pbra_fire_filtered += 1
+                        if validate_debug and entry_alpha_pbra_fire_filtered <= 5:
+                            print(
+                                f"PBRA_FIRE_OFID_BLOCK {symbol_str} {day_str} i={i} "
+                                f"abs_ofid={abs_ofid_at_fire:.2f} "
+                                f"min_abs_ofid={pbra_fire_min_abs_ofid:.2f}",
+                                flush=True,
+                            )
+                        decision_signal = 0
             entry_alpha_decision_signal = decision_signal
             if decision_signal != 0:
                 entry_alpha_candidates += 1
@@ -2990,6 +3234,18 @@ def _simulate_day(
                 entry_alpha_setup_bar = decision.setup_bar
                 if entry_alpha_setup_bar is None:
                     entry_alpha_setup_bar = entry_bar
+                if pbra_regime_enabled and entry_family == "PBRA_v1":
+                    mature_bar = int(entry_bar + pbra_regime_lookahead_bars)
+                    if mature_bar <= max_i:
+                        entry_mid = float(mid[entry_bar]) if np.isfinite(mid[entry_bar]) else float("nan")
+                        pbra_regime_pending.append(
+                            {
+                                "bar": int(entry_bar),
+                                "side": desired_side,
+                                "entry_mid": entry_mid,
+                                "mature_bar": mature_bar,
+                            }
+                        )
                 anchor_bar = (
                     int(entry_alpha_setup_bar)
                     if entry_family in {"OBRA_v1", "PBRA_v1"}
@@ -3002,7 +3258,32 @@ def _simulate_day(
                     arm_bars = int(srf_arm_bars_obra)
                 elif entry_family == "PBRA_v1":
                     arm_bars = int(srf_arm_bars_pbra)
+                arm_bars_soft = arm_bars
+                if entry_family == "PBRA_v1" and srf_arm_bars_pbra_soft > arm_bars:
+                    arm_bars_soft = int(srf_arm_bars_pbra_soft)
                 entry_alpha_block_reason: str | None = None
+                if pbra_regime_enabled and entry_family == "PBRA_v1":
+                    outcomes_len = len(pbra_regime_outcomes)
+                    if outcomes_len >= pbra_regime_min_candidates:
+                        pct_mfe = float(sum(pbra_regime_outcomes)) / float(outcomes_len)
+                        if pct_mfe < pbra_regime_min_pct_mfe:
+                            entry_alpha_block_reason = "pbra_regime"
+                            pbra_regime_blocked += 1
+                if (
+                    entry_alpha_block_reason == "pbra_regime"
+                    and (not gated or disable_gate)
+                ):
+                    entry_alpha_blocked += 1
+                    entry_alpha_blocked_excl["pbra_regime"] += 1
+                    entry_alpha_decision_signal = 0
+                    desired_side = None
+                    pending_ea_gate_override = None
+                    pending_ea_gate_reason = None
+                    pending_ea_signal = 0
+                    pending_ea_bar = -1
+                    pending_ea_mismatch = False
+                    i += 1
+                    continue
                 entry_alpha_mismatch_counted = False
                 gate_mode_alpha = entry_alpha_gate_mode_norm or gate_mode
                 if gate_mode_alpha in {"lrams", "both", "side_matched"}:
@@ -3039,6 +3320,17 @@ def _simulate_day(
                         > (srf_arm_max_age_bars - 1)
                     ):
                         armed_srf = False
+                armed_srf_soft = False
+                if arm_bars_soft > arm_bars and last_srf_trigger_bar >= 0:
+                    armed_srf_soft = (anchor_bar - last_srf_trigger_bar) <= (arm_bars_soft - 1)
+                    if (
+                        entry_family in {"OBRA_v1", "PBRA_v1"}
+                        and srf_arm_max_age_bars > 0
+                        and srf_first_trigger_bar >= 0
+                        and (anchor_bar - srf_first_trigger_bar)
+                        > (srf_arm_max_age_bars - 1)
+                    ):
+                        armed_srf_soft = False
                 armed_lrams = False
                 if srf_arm_mode == "lrams_and_srf" and lrams_arm_bars_eff > 0:
                     armed_lrams = i <= armed_until_bar_lrams
@@ -3049,6 +3341,8 @@ def _simulate_day(
                         candidates_armed_srf += 1
                     elif armed_lrams:
                         candidates_armed_lrams += 1
+                    elif armed_srf_soft:
+                        candidates_armed_soft += 1
                     else:
                         candidates_not_armed += 1
                 gate_ok_long = True
@@ -3063,6 +3357,16 @@ def _simulate_day(
                             _arm_from_srf(i)
                     if arming_active:
                         armed_ok = armed_srf or armed_lrams
+                        allow_soft_arm = (
+                            entry_family == "PBRA_v1"
+                            and arm_bars_soft > arm_bars
+                            and not entry_alpha_mismatch_flag
+                            and entry_alpha_block_reason is None
+                        )
+                        if not armed_ok and allow_soft_arm and armed_srf_soft:
+                            armed_ok = True
+                            entry_alpha_soft_armed += 1
+                            gate_diag["soft_armed"] += 1
                         if armed_ok:
                             entry_alpha_armed_candidates += 1
                             gate_diag["armed_candidate_count"] += 1
@@ -3093,6 +3397,7 @@ def _simulate_day(
                                         "decision_family": decision.family or "",
                                         "decision_reason": decision.reason or "",
                                         "arm_bars": int(arm_bars),
+                                        "arm_bars_soft": int(arm_bars_soft),
                                         "last_srf_trigger_bar": int(last_srf_trigger_bar),
                                         "srf_delta": int(anchor_bar - last_srf_trigger_bar)
                                         if last_srf_trigger_bar >= 0
@@ -3203,7 +3508,10 @@ def _simulate_day(
                     entry_alpha_gate_reason = (
                         "allowed" if entry_alpha_gate_override else (entry_alpha_block_reason or "blocked_entry_alpha")
                     )
-                    if entry_alpha_mismatch_flag and entry_alpha_allow_mismatch:
+                    allow_mismatch = entry_alpha_allow_mismatch or (
+                        entry_alpha_allow_mismatch_pbra and entry_family == "PBRA_v1"
+                    )
+                    if entry_alpha_mismatch_flag and allow_mismatch:
                         entry_alpha_gate_override = True
                         entry_alpha_gate_reason = "mismatch_allowed"
                     if entry_alpha_gate_override:
@@ -4801,6 +5109,7 @@ def _simulate_day(
             confirm_best_ticks_eff = int(entry_confirm_min_ticks_default)
             confirm_worst_ticks_eff = int(entry_confirm_worst_ticks_default)
             confirm_min_abs_ofid_eff = 0.0
+            confirm_min_flow_sum_eff = 0.0
             if strategy_mode == "entry_alpha_v1":
                 if entry_family == "APB_v1":
                     confirm_bars_eff = 3
@@ -4810,7 +5119,33 @@ def _simulate_day(
                 elif entry_family == "OBRA_v1":
                     confirm_bars_eff = 3
                 elif entry_family == "PBRA_v1":
-                    confirm_bars_eff = 4
+                    if pbra_enter_proof_bars > 0:
+                        confirm_bars_eff = int(pbra_enter_proof_bars)
+                    else:
+                        confirm_bars_eff = 4
+                    if pbra_enter_proof_ticks > 0:
+                        confirm_best_ticks_eff = int(pbra_enter_proof_ticks)
+                    confirm_min_abs_ofid_eff = float(entry_confirm_min_abs_ofid_pbra)
+                    confirm_min_flow_sum_eff = float(entry_confirm_min_flow_sum_pbra)
+                    if (
+                        entry_alpha_mismatch_flag
+                        and entry_confirm_min_abs_ofid_pbra_mismatch > 0.0
+                    ):
+                        confirm_min_abs_ofid_eff = float(
+                            entry_confirm_min_abs_ofid_pbra_mismatch
+                        )
+            if (
+                strategy_mode == "entry_alpha_v1"
+                and entry_family == "PBRA_v1"
+                and gated
+                and gate_enabled
+            ):
+                window_end = min(n - 1, entry_bar + confirm_bars_eff)
+                ofid_window = signed_vol[entry_bar : window_end + 1]
+                if ofid_window.size > 0:
+                    max_abs_ofid_val = float(np.nanmax(np.abs(ofid_window)))
+                    if np.isfinite(max_abs_ofid_val):
+                        pbra_confirm_max_abs_ofid_vals.append(max_abs_ofid_val)
             pending_entry_active = True
             pending_entry_side = desired_side
             pending_entry_price = float(mid[entry_bar])
@@ -4821,6 +5156,11 @@ def _simulate_day(
                 entry_confirm_checked_mismatch += 1
             else:
                 entry_confirm_checked_clean += 1
+            if entry_family == "PBRA_v1":
+                if bool(entry_alpha_mismatch_flag):
+                    entry_confirm_checked_pbra_mismatch += 1
+                else:
+                    entry_confirm_checked_pbra_clean += 1
             if strategy_mode == "entry_alpha_v1":
                 family_key = str(entry_family or "unknown")
                 entry_confirm_checked_by_family[family_key] = entry_confirm_checked_by_family.get(family_key, 0) + 1
@@ -4833,6 +5173,7 @@ def _simulate_day(
                 "confirm_min_ticks": int(confirm_best_ticks_eff),
                 "confirm_worst_ticks": int(confirm_worst_ticks_eff),
                 "confirm_min_abs_ofid": float(confirm_min_abs_ofid_eff),
+                "confirm_min_flow_sum": float(confirm_min_flow_sum_eff),
                 "entry_reason": entry_reason,
                 "entry_reason_label": entry_reason_label,
                 "entry_family": entry_family,
@@ -5001,8 +5342,28 @@ def _simulate_day(
                 hold_bars_local = min(int(hold_bars_local), int(entry_alpha_time_stop_bars))
             if entry_alpha_tp_ticks is not None:
                 tp_ticks_local = int(entry_alpha_tp_ticks)
+            if entry_alpha_tp_ticks_pbra is not None and entry_family == "PBRA_v1":
+                tp_ticks_local = int(entry_alpha_tp_ticks_pbra)
         tp_level = entry_px + (tp_ticks_local * tick_size if desired_side == "long" else -tp_ticks_local * tick_size)
         sl_level = entry_px - (sl_ticks_local * tick_size if desired_side == "long" else -sl_ticks_local * tick_size)
+        pbra_scratch_bars_local = int(pbra_scratch_bars) if entry_family == "PBRA_v1" else 0
+        pbra_scratch_min_mfe_ticks_local = int(pbra_scratch_min_mfe_ticks)
+        pbra_scratch_min_abs_ofid_max_local = float(pbra_scratch_min_abs_ofid_max)
+        pbra_runner_arm_bars_local = int(pbra_runner_arm_bars) if entry_family == "PBRA_v1" else 0
+        pbra_runner_arm_mfe_ticks_local = int(pbra_runner_arm_mfe_ticks)
+        pbra_runner_min_abs_ofid_max_local = float(pbra_runner_min_abs_ofid_max)
+        pbra_runner_tp_ticks_local = int(pbra_runner_tp_ticks)
+        pbra_runner_disable_be_limit_local = bool(pbra_runner_disable_be_limit)
+        pbra_runner_be_stop_ticks_local = int(pbra_runner_be_stop_ticks)
+        abs_ofid_at_fire_val = float(abs_ofid_at_fire) if np.isfinite(abs_ofid_at_fire) else float("nan")
+        if entry_family == "PBRA_v1" and not np.isfinite(abs_ofid_at_fire_val):
+            abs_ofid_at_fire_val = 0.0
+            if entry_bar < len(signed_vol):
+                ofid_val = float(signed_vol[entry_bar])
+                if np.isfinite(ofid_val):
+                    abs_ofid_at_fire_val = float(abs(ofid_val))
+        pbra_best_favor_ticks_init = 0.0 if entry_family == "PBRA_v1" else float("nan")
+        pbra_max_abs_ofid_init = float(abs_ofid_at_fire_val) if entry_family == "PBRA_v1" else float("nan")
         pos = {
             "entry_time": df_day["Time"].iloc[entry_bar],
             "entry_bar": entry_bar,
@@ -5052,6 +5413,19 @@ def _simulate_day(
             "gate_event_age": int(gate_event_age),
             "gate_asym_val": float(gate_asym_val),
             "gate_thr_val": float(gate_thr_val),
+            "abs_ofid_at_fire": float(abs_ofid_at_fire_val) if np.isfinite(abs_ofid_at_fire_val) else float("nan"),
+            "pbra_scratch_bars": int(pbra_scratch_bars_local),
+            "pbra_scratch_min_mfe_ticks": int(pbra_scratch_min_mfe_ticks_local),
+            "pbra_scratch_min_abs_ofid_max": float(pbra_scratch_min_abs_ofid_max_local),
+            "pbra_best_favor_ticks": float(pbra_best_favor_ticks_init),
+            "pbra_max_abs_ofid": float(pbra_max_abs_ofid_init),
+            "pbra_runner_arm_bars": int(pbra_runner_arm_bars_local),
+            "pbra_runner_arm_mfe_ticks": int(pbra_runner_arm_mfe_ticks_local),
+            "pbra_runner_min_abs_ofid_max": float(pbra_runner_min_abs_ofid_max_local),
+            "pbra_runner_tp_ticks": int(pbra_runner_tp_ticks_local),
+            "pbra_runner_disable_be_limit": bool(pbra_runner_disable_be_limit_local),
+            "pbra_runner_be_stop_ticks": int(pbra_runner_be_stop_ticks_local),
+            "pbra_runner_armed": False,
         }
         if strategy_mode == "srf_entry_v1":
             if not srf_trigger:
@@ -5178,7 +5552,8 @@ def _simulate_day(
             f"events={entry_alpha_events} candidates={entry_alpha_candidates} "
             f"blocked={entry_alpha_blocked} pbra_fire_filtered={entry_alpha_pbra_fire_filtered} "
             f"fires={entry_alpha_fires} trades={len(trades)} "
-            f"armed={entry_alpha_armed_candidates} not_armed={entry_alpha_not_armed} "
+            f"armed={entry_alpha_armed_candidates} soft_armed={entry_alpha_soft_armed} "
+            f"not_armed={entry_alpha_not_armed} "
             f"mismatch={entry_alpha_mismatch} weak_none={entry_alpha_weak_side_none} "
             f"allowed={entry_alpha_allowed} allow_rate={allow_rate:.2%} fire_rate={fire_rate:.2%}",
             flush=True,
@@ -5212,6 +5587,7 @@ def _simulate_day(
                 f"not_armed={entry_alpha_blocked_excl['not_armed']} "
                 f"weak_none={entry_alpha_blocked_excl['weak_none']} "
                 f"mismatch={entry_alpha_blocked_excl['mismatch']} "
+                f"pbra_regime={entry_alpha_blocked_excl['pbra_regime']} "
                 f"blocked_entry_alpha={entry_alpha_blocked_excl['blocked_entry_alpha']} "
                 f"allowed={entry_alpha_allowed} candidates={entry_alpha_candidates} total_blocked={excl_total}",
                 flush=True,
@@ -5258,6 +5634,7 @@ def _simulate_day(
                     f"desired={sample['desired_side']} "
                     f"family={sample['decision_family']} reason={sample['decision_reason']} "
                     f"arm_bars={sample.get('arm_bars')} "
+                    f"arm_bars_soft={sample.get('arm_bars_soft')} "
                     f"last_srf_trigger_bar={sample['last_srf_trigger_bar']} "
                     f"srf_delta={sample['srf_delta']} armed_until_srf={sample['armed_until_srf']} "
                     f"srf_seen={int(sample['srf_seen'])}",
@@ -5337,6 +5714,7 @@ def _simulate_day(
                 f"candidates_armed_srf={candidates_armed_srf} "
                 f"candidates_armed_lrams={candidates_armed_lrams} "
                 f"candidates_armed_both={candidates_armed_both} "
+                f"candidates_armed_soft={candidates_armed_soft} "
                 f"candidates_not_armed={candidates_not_armed} "
                 f"coverage={coverage:.2%}",
                 flush=True,
@@ -5390,6 +5768,43 @@ def _simulate_day(
                 print(
                     f"ENTRY_CONFIRM_BY_FAMILY {symbol_str} {day_str} family={family_key} "
                     f"checked={checked} passed={passed} failed={failed}",
+                    flush=True,
+                )
+        if (
+            strategy_mode == "entry_alpha_v1"
+            and validate_debug
+            and (entry_confirm_checked_pbra_clean or entry_confirm_checked_pbra_mismatch)
+        ):
+            print(
+                f"PBRA_CONFIRM_SPLIT {symbol_str} {day_str} gated={int(gated)} "
+                f"clean_checked={entry_confirm_checked_pbra_clean} "
+                f"clean_passed={entry_confirm_passed_pbra_clean} "
+                f"mismatch_checked={entry_confirm_checked_pbra_mismatch} "
+                f"mismatch_passed={entry_confirm_passed_pbra_mismatch}",
+                flush=True,
+            )
+        if strategy_mode == "entry_alpha_v1" and validate_debug and pbra_confirm_max_abs_ofid_vals:
+            pbra_arr = np.asarray(pbra_confirm_max_abs_ofid_vals, dtype=float)
+            pbra_arr = pbra_arr[np.isfinite(pbra_arr)]
+            if pbra_arr.size > 0:
+                p50 = float(np.percentile(pbra_arr, 50))
+                p75 = float(np.percentile(pbra_arr, 75))
+                p90 = float(np.percentile(pbra_arr, 90))
+                p95 = float(np.percentile(pbra_arr, 95))
+                print(
+                    f"PBRA_CONFIRM_MAX_ABS_OFID_PCTL {symbol_str} {day_str} gated={int(gated)} "
+                    f"n={int(pbra_arr.size)} p50={p50:.2f} p75={p75:.2f} "
+                    f"p90={p90:.2f} p95={p95:.2f}",
+                    flush=True,
+                )
+        if strategy_mode == "entry_alpha_v1" and validate_debug and pbra_regime_enabled:
+            regime_n = len(pbra_regime_outcomes)
+            if regime_n > 0:
+                regime_pct = float(sum(pbra_regime_outcomes)) / float(regime_n)
+                print(
+                    f"PBRA_REGIME_STATS {symbol_str} {day_str} "
+                    f"n={regime_n} checked={pbra_regime_checked} "
+                    f"pct_mfe_ge_1={regime_pct:.2%} blocked={pbra_regime_blocked}",
                     flush=True,
                 )
         if entry_confirm_checked != entry_confirm_passed + entry_confirm_failed + pending_flag:
@@ -5681,21 +6096,63 @@ def _pnl_day_summary(
             "max_loss_usd": 0.0,
             "max_win_ticks": 0.0,
             "max_win_usd": 0.0,
+            "sl_exits": 0,
+            "tp_exits": 0,
+            "scratch_exits": 0,
             "time_exits": 0,
+            "pbra_would_scratch": 0,
+            "pbra_would_scratch_rate": 0.0,
+            "pbra_runner_armed": 0,
+            "pbra_runner_armed_rate": 0.0,
+            "pbra_runner_tp_hit": 0,
+            "pbra_runner_tp_hit_rate": 0.0,
         }
     pnl = pd.to_numeric(trades["pnl_ticks"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
     net = pnl - float(cost_ticks)
     net_ordered = _order_pnl(trades, net)
     eq = _equity_stats(net_ordered)
-    time_exits = 0
+    exit_reason_series = None
     if "exit_reason_std" in trades.columns:
-        time_exits = int(
-            pd.Series(trades["exit_reason_std"]).astype(str).str.upper().eq("TIME").sum()
-        )
+        exit_reason_series = pd.Series(trades["exit_reason_std"]).astype(str).str.upper()
     elif "exit_reason" in trades.columns:
-        time_exits = int(
-            pd.Series(trades["exit_reason"]).astype(str).str.upper().eq("TIME").sum()
+        exit_reason_series = pd.Series(trades["exit_reason"]).astype(str).str.upper()
+    if exit_reason_series is None:
+        sl_exits = 0
+        tp_exits = 0
+        scratch_exits = 0
+        time_exits = 0
+    else:
+        sl_exits = int(exit_reason_series.eq("SL").sum())
+        tp_exits = int(exit_reason_series.eq("TP").sum())
+        scratch_exits = int(exit_reason_series.eq("SCRATCH").sum())
+        time_exits = int(exit_reason_series.eq("TIME").sum())
+    would_scratch = 0
+    would_scratch_rate = 0.0
+    if "pbra_would_scratch" in trades.columns:
+        would_scratch = int(
+            pd.to_numeric(trades["pbra_would_scratch"], errors="coerce")
+            .fillna(0.0)
+            .sum()
         )
+        would_scratch_rate = float(would_scratch / len(trades)) if len(trades) else 0.0
+    runner_armed = 0
+    runner_armed_rate = 0.0
+    runner_tp_hit = 0
+    runner_tp_hit_rate = 0.0
+    if "pbra_runner_armed" in trades.columns:
+        runner_armed = int(
+            pd.to_numeric(trades["pbra_runner_armed"], errors="coerce")
+            .fillna(0.0)
+            .sum()
+        )
+        runner_armed_rate = float(runner_armed / len(trades)) if len(trades) else 0.0
+    if "pbra_runner_tp_hit" in trades.columns:
+        runner_tp_hit = int(
+            pd.to_numeric(trades["pbra_runner_tp_hit"], errors="coerce")
+            .fillna(0.0)
+            .sum()
+        )
+        runner_tp_hit_rate = float(runner_tp_hit / len(trades)) if len(trades) else 0.0
     max_loss_ticks = float(np.min(net)) if net.size else 0.0
     max_win_ticks = float(np.max(net)) if net.size else 0.0
     net_ticks = float(np.sum(net)) if net.size else 0.0
@@ -5711,7 +6168,16 @@ def _pnl_day_summary(
         "max_loss_usd": float(max_loss_ticks * tick_value),
         "max_win_ticks": max_win_ticks,
         "max_win_usd": float(max_win_ticks * tick_value),
+        "sl_exits": sl_exits,
+        "tp_exits": tp_exits,
+        "scratch_exits": scratch_exits,
         "time_exits": time_exits,
+        "pbra_would_scratch": would_scratch,
+        "pbra_would_scratch_rate": would_scratch_rate,
+        "pbra_runner_armed": runner_armed,
+        "pbra_runner_armed_rate": runner_armed_rate,
+        "pbra_runner_tp_hit": runner_tp_hit,
+        "pbra_runner_tp_hit_rate": runner_tp_hit_rate,
     }
 
 
@@ -5819,6 +6285,7 @@ def _run_entry_alpha_ablation(
     srf_arm_bars_apb: int,
     srf_arm_bars_obra: int,
     srf_arm_bars_pbra: int,
+    srf_arm_bars_pbra_soft: int,
     srf_arm_mode: str,
     srf_arm_source: str,
     lrams_arm_bars: int,
@@ -5854,6 +6321,7 @@ def _run_entry_alpha_ablation(
                 entry_alpha_params=entry_alpha_params,
                 entry_alpha_gate_mode=entry_alpha_gate_mode,
                 entry_alpha_allow_mismatch=entry_alpha_allow_mismatch,
+                entry_alpha_allow_mismatch_pbra=entry_alpha_allow_mismatch_pbra,
                 strategy_mode="entry_alpha_v1",
                 gated=gated_mode,
                 disable_gate=not gated_mode,
@@ -5862,6 +6330,7 @@ def _run_entry_alpha_ablation(
                 srf_arm_bars_apb=srf_arm_bars_apb,
                 srf_arm_bars_obra=srf_arm_bars_obra,
                 srf_arm_bars_pbra=srf_arm_bars_pbra,
+                srf_arm_bars_pbra_soft=srf_arm_bars_pbra_soft,
                 srf_arm_mode=srf_arm_mode,
                 srf_arm_source=srf_arm_source,
                 lrams_arm_bars=lrams_arm_bars,
@@ -5973,6 +6442,7 @@ def _standard_exit_reason(reason: str) -> str:
         "SL": "SL",
         "BE_LIMIT": "BE_LIMIT",
         "BE": "BE",
+        "PBRA_NO_REACCEL": "SCRATCH",
         "SCRATCH": "SCRATCH",
         "DECAY": "DECAY",
         "TIME": "TIME",
@@ -6411,6 +6881,27 @@ def main() -> None:
     entry_confirm_worst_ticks_default = int(os.environ.get("ENTRY_CONFIRM_WORST_TICKS_DEFAULT", "-2"))
     entry_confirm_worst_ticks_apb = int(os.environ.get("ENTRY_CONFIRM_WORST_TICKS_APB", "-1"))
     entry_confirm_min_abs_ofid_apb = float(os.environ.get("ENTRY_CONFIRM_MIN_ABS_OFID_APB", "0"))
+    entry_confirm_min_abs_ofid_pbra = float(os.environ.get("ENTRY_CONFIRM_MIN_ABS_OFID_PBRA", "0"))
+    if entry_confirm_min_abs_ofid_pbra < 0:
+        entry_confirm_min_abs_ofid_pbra = 0.0
+    entry_confirm_min_abs_ofid_pbra_mismatch = float(
+        os.environ.get("ENTRY_CONFIRM_MIN_ABS_OFID_PBRA_MISMATCH", "0")
+    )
+    if entry_confirm_min_abs_ofid_pbra_mismatch < 0:
+        entry_confirm_min_abs_ofid_pbra_mismatch = 0.0
+    entry_confirm_min_flow_sum_pbra = float(
+        os.environ.get("ENTRY_CONFIRM_MIN_FLOW_SUM_PBRA", "0")
+    )
+    if entry_confirm_min_flow_sum_pbra < 0:
+        entry_confirm_min_flow_sum_pbra = 0.0
+    pbra_enter_proof_bars_env = os.environ.get("PBRA_ENTER_PROOF_MAX_BARS", "").strip()
+    pbra_enter_proof_bars = int(pbra_enter_proof_bars_env) if pbra_enter_proof_bars_env else 0
+    if pbra_enter_proof_bars < 0:
+        pbra_enter_proof_bars = 0
+    pbra_enter_proof_ticks_env = os.environ.get("PBRA_ENTER_ON_PROOF_TICKS", "").strip()
+    pbra_enter_proof_ticks = int(pbra_enter_proof_ticks_env) if pbra_enter_proof_ticks_env else 0
+    if pbra_enter_proof_ticks < 0:
+        pbra_enter_proof_ticks = 0
     entry_confirm_style = os.environ.get("ENTRY_CONFIRM_STYLE", "off").strip().lower()
     pnl_tick_value = float(os.environ.get("PNL_TICK_VALUE", "12.5"))
     pnl_commission_per_side = float(os.environ.get("PNL_COMMISSION_PER_SIDE", "0"))
@@ -6421,6 +6912,7 @@ def main() -> None:
     pnl_slippage_ticks = float(os.environ.get("PNL_SLIPPAGE_TICKS", "0"))
     pnl_daily_loss_limit = float(os.environ.get("PNL_DAILY_LOSS_LIMIT", "0"))
     pnl_max_drawdown_limit = float(os.environ.get("PNL_MAX_DRAWDOWN_LIMIT", "0"))
+    pnl_print_trades = os.environ.get("PNL_PRINT_TRADES", "0").strip() == "1"
     pnl_cost_ticks = _trade_cost_ticks(
         tick_value=pnl_tick_value,
         commission_per_side=pnl_commission_per_side,
@@ -6449,6 +6941,47 @@ def main() -> None:
     pbra_fire_min_abs_ofid = float(pbra_fire_min_abs_ofid_env) if pbra_fire_min_abs_ofid_env else 0.0
     if pbra_fire_min_abs_ofid < 0:
         pbra_fire_min_abs_ofid = 0.0
+    pbra_scratch_bars_env = os.environ.get("PBRA_SCRATCH_BARS", "0").strip()
+    pbra_scratch_bars = int(pbra_scratch_bars_env) if pbra_scratch_bars_env else 0
+    if pbra_scratch_bars < 0:
+        pbra_scratch_bars = 0
+    pbra_scratch_min_mfe_ticks = int(os.environ.get("PBRA_SCRATCH_MIN_MFE_TICKS", "1"))
+    if pbra_scratch_min_mfe_ticks < 0:
+        pbra_scratch_min_mfe_ticks = 0
+    pbra_scratch_min_abs_ofid_max = float(os.environ.get("PBRA_SCRATCH_MIN_ABS_OFID_MAX", "0"))
+    if pbra_scratch_min_abs_ofid_max < 0:
+        pbra_scratch_min_abs_ofid_max = 0.0
+    pbra_runner_arm_bars_env = os.environ.get("PBRA_RUNNER_ARM_BARS", "").strip()
+    pbra_runner_arm_bars = int(pbra_runner_arm_bars_env) if pbra_runner_arm_bars_env else 0
+    if pbra_runner_arm_bars < 0:
+        pbra_runner_arm_bars = 0
+    pbra_runner_arm_mfe_ticks = int(os.environ.get("PBRA_RUNNER_ARM_MFE_TICKS", "1"))
+    if pbra_runner_arm_mfe_ticks < 0:
+        pbra_runner_arm_mfe_ticks = 0
+    pbra_runner_min_abs_ofid_max = float(os.environ.get("PBRA_RUNNER_MIN_ABS_OFID_MAX", "0"))
+    if pbra_runner_min_abs_ofid_max < 0:
+        pbra_runner_min_abs_ofid_max = 0.0
+    pbra_runner_tp_ticks_env = os.environ.get("PBRA_RUNNER_TP_TICKS", "").strip()
+    pbra_runner_tp_ticks = int(pbra_runner_tp_ticks_env) if pbra_runner_tp_ticks_env else 0
+    if pbra_runner_tp_ticks < 0:
+        pbra_runner_tp_ticks = 0
+    pbra_runner_disable_be_limit = os.environ.get("PBRA_RUNNER_DISABLE_BE_LIMIT", "1").strip() != "0"
+    pbra_runner_be_stop_ticks = int(os.environ.get("PBRA_RUNNER_BE_STOP_TICKS", "0"))
+    pbra_regime_lookahead_env = os.environ.get("PBRA_REGIME_LOOKAHEAD_BARS", "").strip()
+    pbra_regime_lookahead_bars = (
+        int(pbra_regime_lookahead_env) if pbra_regime_lookahead_env else 0
+    )
+    if pbra_regime_lookahead_bars < 0:
+        pbra_regime_lookahead_bars = 0
+    pbra_regime_rolling_env = os.environ.get("PBRA_REGIME_ROLLING_CANDIDATES", "").strip()
+    pbra_regime_rolling_candidates = (
+        int(pbra_regime_rolling_env) if pbra_regime_rolling_env else 0
+    )
+    if pbra_regime_rolling_candidates < 0:
+        pbra_regime_rolling_candidates = 0
+    pbra_regime_min_pct_mfe = float(os.environ.get("PBRA_REGIME_MIN_PCT_MFE", "0"))
+    if pbra_regime_min_pct_mfe < 0:
+        pbra_regime_min_pct_mfe = 0.0
     be_arm_ticks = int(os.environ.get("BE_ARM_TICKS", "1"))
     be_offset_env = os.environ.get("BE_OFFSET_TICKS", "").strip()
     be_offset_ticks = int(be_offset_env) if be_offset_env else None
@@ -6558,6 +7091,13 @@ def main() -> None:
     }
     if entry_alpha_allow_mismatch:
         print("ENTRY_ALPHA_ALLOW_MISMATCH enabled: shadow-allow mismatches", flush=True)
+    entry_alpha_allow_mismatch_pbra = os.environ.get("ENTRY_ALPHA_ALLOW_MISMATCH_PBRA", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
     entry_alpha_family_allowlist_env = os.environ.get("ENTRY_ALPHA_FAMILY_ALLOWLIST", "").strip()
     if entry_alpha_family_allowlist_env:
         entry_alpha_family_allowlist = {
@@ -6579,6 +7119,14 @@ def main() -> None:
     entry_alpha_time_stop_bars = int(entry_alpha_time_stop_env) if entry_alpha_time_stop_env else None
     if entry_alpha_time_stop_bars is not None and entry_alpha_time_stop_bars <= 0:
         entry_alpha_time_stop_bars = None
+    entry_alpha_tp_env = os.environ.get("ENTRY_ALPHA_TP_TICKS", "").strip()
+    entry_alpha_tp_ticks = int(entry_alpha_tp_env) if entry_alpha_tp_env else None
+    if entry_alpha_tp_ticks is not None and entry_alpha_tp_ticks <= 0:
+        entry_alpha_tp_ticks = None
+    entry_alpha_tp_pbra_env = os.environ.get("ENTRY_ALPHA_TP_TICKS_PBRA", "").strip()
+    entry_alpha_tp_ticks_pbra = int(entry_alpha_tp_pbra_env) if entry_alpha_tp_pbra_env else None
+    if entry_alpha_tp_ticks_pbra is not None and entry_alpha_tp_ticks_pbra <= 0:
+        entry_alpha_tp_ticks_pbra = None
     srf_arm_bars_env = os.environ.get("SRF_ARM_BARS", "").strip()
     srf_arm_bars = int(srf_arm_bars_env) if srf_arm_bars_env else None
     srf_arm_bars_sweep_env = os.environ.get("SRF_ARM_BARS_SWEEP", "").strip()
@@ -6604,6 +7152,7 @@ def main() -> None:
     srf_arm_bars_apb_env = os.environ.get("SRF_ARM_BARS_APB", "").strip()
     srf_arm_bars_obra_env = os.environ.get("SRF_ARM_BARS_OBRA", "").strip()
     srf_arm_bars_pbra_env = os.environ.get("SRF_ARM_BARS_PBRA", "").strip()
+    srf_arm_bars_pbra_soft_env = os.environ.get("SRF_ARM_BARS_PBRA_SOFT", "").strip()
     srf_arm_bars_apb = (
         int(srf_arm_bars_apb_env)
         if srf_arm_bars_apb_env
@@ -6611,6 +7160,9 @@ def main() -> None:
     )
     srf_arm_bars_obra = int(srf_arm_bars_obra_env) if srf_arm_bars_obra_env else int(srf_arm_bars_eff)
     srf_arm_bars_pbra = int(srf_arm_bars_pbra_env) if srf_arm_bars_pbra_env else int(srf_arm_bars_eff)
+    srf_arm_bars_pbra_soft = (
+        int(srf_arm_bars_pbra_soft_env) if srf_arm_bars_pbra_soft_env else 0
+    )
     srf_arm_max_age_env = os.environ.get("SRF_ARM_MAX_AGE_BARS", "800").strip()
     srf_arm_max_age_bars = int(srf_arm_max_age_env) if srf_arm_max_age_env else 0
     srf_arm_label = str(srf_arm_bars) if srf_arm_from_env else "W"
@@ -6707,6 +7259,7 @@ def main() -> None:
             "srf_arm_bars_apb": srf_arm_bars_apb,
             "srf_arm_bars_obra": srf_arm_bars_obra,
             "srf_arm_bars_pbra": srf_arm_bars_pbra,
+            "srf_arm_bars_pbra_soft": srf_arm_bars_pbra_soft,
             "srf_arm_mode": srf_arm_mode,
             "trade_session": trade_session,
             "min_spread_ticks": min_spread_ticks,
@@ -6720,7 +7273,37 @@ def main() -> None:
             else None,
             "entry_alpha_max_sl_ticks": entry_alpha_max_sl_ticks,
             "entry_alpha_time_stop_bars": entry_alpha_time_stop_bars,
+            "entry_alpha_tp_ticks": entry_alpha_tp_ticks,
+            "entry_alpha_tp_ticks_pbra": entry_alpha_tp_ticks_pbra,
+            "entry_confirm_min_abs_ofid_pbra": entry_confirm_min_abs_ofid_pbra,
+            "entry_confirm_min_abs_ofid_pbra_mismatch": entry_confirm_min_abs_ofid_pbra_mismatch,
+            "entry_confirm_min_flow_sum_pbra": entry_confirm_min_flow_sum_pbra,
+            "pbra_enter_proof_bars": pbra_enter_proof_bars,
+            "pbra_enter_proof_ticks": pbra_enter_proof_ticks,
+            "entry_alpha_allow_mismatch_pbra": entry_alpha_allow_mismatch_pbra,
+            "pbra_scratch_bars": pbra_scratch_bars,
+            "pbra_scratch_min_mfe_ticks": pbra_scratch_min_mfe_ticks,
+            "pbra_scratch_min_abs_ofid_max": pbra_scratch_min_abs_ofid_max,
+            "pbra_runner_arm_bars": pbra_runner_arm_bars,
+            "pbra_runner_arm_mfe_ticks": pbra_runner_arm_mfe_ticks,
+            "pbra_runner_min_abs_ofid_max": pbra_runner_min_abs_ofid_max,
+            "pbra_runner_tp_ticks": pbra_runner_tp_ticks,
+            "pbra_runner_disable_be_limit": pbra_runner_disable_be_limit,
+            "pbra_runner_be_stop_ticks": pbra_runner_be_stop_ticks,
+            "pbra_regime_lookahead_bars": pbra_regime_lookahead_bars,
+            "pbra_regime_rolling_candidates": pbra_regime_rolling_candidates,
+            "pbra_regime_min_pct_mfe": pbra_regime_min_pct_mfe,
+            "pbra_runner_arm_bars": pbra_runner_arm_bars,
+            "pbra_runner_arm_mfe_ticks": pbra_runner_arm_mfe_ticks,
+            "pbra_runner_min_abs_ofid_max": pbra_runner_min_abs_ofid_max,
+            "pbra_runner_tp_ticks": pbra_runner_tp_ticks,
+            "pbra_runner_disable_be_limit": pbra_runner_disable_be_limit,
+            "pbra_runner_be_stop_ticks": pbra_runner_be_stop_ticks,
+            "entry_alpha_tp_ticks": entry_alpha_tp_ticks,
             "pbra_fire_min_abs_ofid": pbra_fire_min_abs_ofid,
+            "pbra_scratch_bars": pbra_scratch_bars,
+            "pbra_scratch_min_mfe_ticks": pbra_scratch_min_mfe_ticks,
+            "pbra_scratch_min_abs_ofid_max": pbra_scratch_min_abs_ofid_max,
             "afr3_break_min_flow_abs": afr3_break_min_flow_abs,
             "afr3_break_max_spread_ticks": afr3_break_max_spread_ticks,
             "afr3_snapback_check": afr3_snapback_check,
@@ -6760,7 +7343,27 @@ def main() -> None:
             "srf_arm_bars_apb": srf_arm_bars_apb,
             "srf_arm_bars_obra": srf_arm_bars_obra,
             "srf_arm_bars_pbra": srf_arm_bars_pbra,
+            "srf_arm_bars_pbra_soft": srf_arm_bars_pbra_soft,
             "pbra_fire_min_abs_ofid": pbra_fire_min_abs_ofid,
+            "entry_alpha_tp_ticks_pbra": entry_alpha_tp_ticks_pbra,
+            "entry_confirm_min_abs_ofid_pbra": entry_confirm_min_abs_ofid_pbra,
+            "entry_confirm_min_abs_ofid_pbra_mismatch": entry_confirm_min_abs_ofid_pbra_mismatch,
+            "entry_confirm_min_flow_sum_pbra": entry_confirm_min_flow_sum_pbra,
+            "pbra_enter_proof_bars": pbra_enter_proof_bars,
+            "pbra_enter_proof_ticks": pbra_enter_proof_ticks,
+            "entry_alpha_allow_mismatch_pbra": entry_alpha_allow_mismatch_pbra,
+            "pbra_scratch_bars": pbra_scratch_bars,
+            "pbra_scratch_min_mfe_ticks": pbra_scratch_min_mfe_ticks,
+            "pbra_scratch_min_abs_ofid_max": pbra_scratch_min_abs_ofid_max,
+            "pbra_runner_arm_bars": pbra_runner_arm_bars,
+            "pbra_runner_arm_mfe_ticks": pbra_runner_arm_mfe_ticks,
+            "pbra_runner_min_abs_ofid_max": pbra_runner_min_abs_ofid_max,
+            "pbra_runner_tp_ticks": pbra_runner_tp_ticks,
+            "pbra_runner_disable_be_limit": pbra_runner_disable_be_limit,
+            "pbra_runner_be_stop_ticks": pbra_runner_be_stop_ticks,
+            "pbra_regime_lookahead_bars": pbra_regime_lookahead_bars,
+            "pbra_regime_rolling_candidates": pbra_regime_rolling_candidates,
+            "pbra_regime_min_pct_mfe": pbra_regime_min_pct_mfe,
             "afr_k_bars": afr_k_bars,
             "afr_min_flow_abs": afr_min_flow_abs,
             "afr_stall_ticks": afr_stall_ticks,
@@ -6983,7 +7586,21 @@ def main() -> None:
             "entry_alpha_family_allowlist": entry_alpha_family_allowlist,
             "entry_alpha_max_sl_ticks": entry_alpha_max_sl_ticks,
             "entry_alpha_time_stop_bars": entry_alpha_time_stop_bars,
+            "entry_alpha_tp_ticks": entry_alpha_tp_ticks,
+            "entry_alpha_tp_ticks_pbra": entry_alpha_tp_ticks_pbra,
             "pbra_fire_min_abs_ofid": pbra_fire_min_abs_ofid,
+            "pbra_scratch_bars": pbra_scratch_bars,
+            "pbra_scratch_min_mfe_ticks": pbra_scratch_min_mfe_ticks,
+            "pbra_scratch_min_abs_ofid_max": pbra_scratch_min_abs_ofid_max,
+            "pbra_runner_arm_bars": pbra_runner_arm_bars,
+            "pbra_runner_arm_mfe_ticks": pbra_runner_arm_mfe_ticks,
+            "pbra_runner_min_abs_ofid_max": pbra_runner_min_abs_ofid_max,
+            "pbra_runner_tp_ticks": pbra_runner_tp_ticks,
+            "pbra_runner_disable_be_limit": pbra_runner_disable_be_limit,
+            "pbra_runner_be_stop_ticks": pbra_runner_be_stop_ticks,
+            "pbra_regime_lookahead_bars": pbra_regime_lookahead_bars,
+            "pbra_regime_rolling_candidates": pbra_regime_rolling_candidates,
+            "pbra_regime_min_pct_mfe": pbra_regime_min_pct_mfe,
             "afr_k_bars": afr_k_bars,
             "afr_min_flow_abs": afr_min_flow_abs,
             "afr_stall_ticks": afr_stall_ticks,
@@ -7062,6 +7679,9 @@ def main() -> None:
             "entry_confirm_worst_ticks_default": entry_confirm_worst_ticks_default,
             "entry_confirm_worst_ticks_apb": entry_confirm_worst_ticks_apb,
             "entry_confirm_min_abs_ofid_apb": entry_confirm_min_abs_ofid_apb,
+            "entry_confirm_min_abs_ofid_pbra": entry_confirm_min_abs_ofid_pbra,
+            "pbra_enter_proof_bars": pbra_enter_proof_bars,
+            "pbra_enter_proof_ticks": pbra_enter_proof_ticks,
             "exit_debug": exit_debug,
             "exit_mode": exit_mode,
             "srf_arm_max_age_bars": srf_arm_max_age_bars,
@@ -7113,6 +7733,7 @@ def main() -> None:
             srf_arm_bars_apb=srf_arm_bars_apb,
             srf_arm_bars_obra=srf_arm_bars_obra,
             srf_arm_bars_pbra=srf_arm_bars_pbra,
+            srf_arm_bars_pbra_soft=srf_arm_bars_pbra_soft,
             srf_arm_mode=srf_arm_mode,
             srf_arm_source="env" if srf_arm_from_env else "W",
             lrams_arm_bars=lrams_arm_bars_eff,
@@ -7159,6 +7780,11 @@ def main() -> None:
                             int(srf_arm_bars_pbra_env)
                             if srf_arm_bars_pbra_env
                             else int(srf_arm_bars_eff)
+                        )
+                        srf_arm_bars_pbra_soft_eff = (
+                            int(srf_arm_bars_pbra_soft_env)
+                            if srf_arm_bars_pbra_soft_env
+                            else 0
                         )
                         srf_arm_source_eff = "env" if srf_arm_bars_cur is not None else "W"
                         lrams_arm_bars_eff = lrams_arm_bars if lrams_arm_bars is not None else gate_lookback_bars
@@ -7408,6 +8034,7 @@ def main() -> None:
                                     srf_arm_bars_apb=srf_arm_bars_apb_eff,
                                     srf_arm_bars_obra=srf_arm_bars_obra_eff,
                                     srf_arm_bars_pbra=srf_arm_bars_pbra_eff,
+                                    srf_arm_bars_pbra_soft=srf_arm_bars_pbra_soft_eff,
                                     srf_arm_max_age_bars=srf_arm_max_age_bars,
                                     srf_arm_mode=srf_arm_mode,
                                     srf_arm_source=srf_arm_source_eff,
@@ -7419,10 +8046,25 @@ def main() -> None:
                                     weak_side_lookback_bars=weak_side_lookback_bars,
                                     entry_alpha_weak_side_mode=entry_alpha_weak_side_mode,
                                     entry_alpha_allow_mismatch=entry_alpha_allow_mismatch,
+                                    entry_alpha_allow_mismatch_pbra=entry_alpha_allow_mismatch_pbra,
                                     entry_alpha_family_allowlist=entry_alpha_family_allowlist,
                                     entry_alpha_max_sl_ticks=entry_alpha_max_sl_ticks,
                                     entry_alpha_time_stop_bars=entry_alpha_time_stop_bars,
+                                    entry_alpha_tp_ticks=entry_alpha_tp_ticks,
+                                    entry_alpha_tp_ticks_pbra=entry_alpha_tp_ticks_pbra,
                                     pbra_fire_min_abs_ofid=pbra_fire_min_abs_ofid,
+                                    pbra_scratch_bars=pbra_scratch_bars,
+                                    pbra_scratch_min_mfe_ticks=pbra_scratch_min_mfe_ticks,
+                                    pbra_scratch_min_abs_ofid_max=pbra_scratch_min_abs_ofid_max,
+                                    pbra_runner_arm_bars=pbra_runner_arm_bars,
+                                    pbra_runner_arm_mfe_ticks=pbra_runner_arm_mfe_ticks,
+                                    pbra_runner_min_abs_ofid_max=pbra_runner_min_abs_ofid_max,
+                                    pbra_runner_tp_ticks=pbra_runner_tp_ticks,
+                                    pbra_runner_disable_be_limit=pbra_runner_disable_be_limit,
+                                    pbra_runner_be_stop_ticks=pbra_runner_be_stop_ticks,
+                                    pbra_regime_lookahead_bars=pbra_regime_lookahead_bars,
+                                    pbra_regime_rolling_candidates=pbra_regime_rolling_candidates,
+                                    pbra_regime_min_pct_mfe=pbra_regime_min_pct_mfe,
                                     gated=False,
                                     disable_gate=False,
                                     gate_mode=gate_mode,
@@ -7504,6 +8146,11 @@ def main() -> None:
                                     entry_confirm_worst_ticks_default=entry_confirm_worst_ticks_default,
                                     entry_confirm_worst_ticks_apb=entry_confirm_worst_ticks_apb,
                                     entry_confirm_min_abs_ofid_apb=entry_confirm_min_abs_ofid_apb,
+                                    entry_confirm_min_abs_ofid_pbra=entry_confirm_min_abs_ofid_pbra,
+                                    entry_confirm_min_abs_ofid_pbra_mismatch=entry_confirm_min_abs_ofid_pbra_mismatch,
+                                    entry_confirm_min_flow_sum_pbra=entry_confirm_min_flow_sum_pbra,
+                                    pbra_enter_proof_bars=pbra_enter_proof_bars,
+                                    pbra_enter_proof_ticks=pbra_enter_proof_ticks,
                                     exit_debug=exit_debug,
                                     exit_mode=exit_mode,
                                     validate_bars=validate_bars,
@@ -7772,6 +8419,7 @@ def main() -> None:
                                 srf_arm_bars_apb=srf_arm_bars_apb_eff,
                                 srf_arm_bars_obra=srf_arm_bars_obra_eff,
                                 srf_arm_bars_pbra=srf_arm_bars_pbra_eff,
+                                srf_arm_bars_pbra_soft=srf_arm_bars_pbra_soft_eff,
                                 srf_arm_max_age_bars=srf_arm_max_age_bars,
                                 srf_arm_mode=srf_arm_mode,
                                 srf_arm_source=srf_arm_source_eff,
@@ -7781,12 +8429,27 @@ def main() -> None:
                                 entry_cooldown_bars=entry_cooldown_bars,
                                 gate_lookback_bars=gate_lookback_bars,
                                     weak_side_lookback_bars=weak_side_lookback_bars,
-                                    entry_alpha_weak_side_mode=entry_alpha_weak_side_mode,
-                                    entry_alpha_allow_mismatch=entry_alpha_allow_mismatch,
-                                    entry_alpha_family_allowlist=entry_alpha_family_allowlist,
+                                entry_alpha_weak_side_mode=entry_alpha_weak_side_mode,
+                                entry_alpha_allow_mismatch=entry_alpha_allow_mismatch,
+                                entry_alpha_allow_mismatch_pbra=entry_alpha_allow_mismatch_pbra,
+                                entry_alpha_family_allowlist=entry_alpha_family_allowlist,
                                     entry_alpha_max_sl_ticks=entry_alpha_max_sl_ticks,
                                     entry_alpha_time_stop_bars=entry_alpha_time_stop_bars,
+                                    entry_alpha_tp_ticks=entry_alpha_tp_ticks,
+                                    entry_alpha_tp_ticks_pbra=entry_alpha_tp_ticks_pbra,
                                     pbra_fire_min_abs_ofid=pbra_fire_min_abs_ofid,
+                                    pbra_scratch_bars=pbra_scratch_bars,
+                                    pbra_scratch_min_mfe_ticks=pbra_scratch_min_mfe_ticks,
+                                    pbra_scratch_min_abs_ofid_max=pbra_scratch_min_abs_ofid_max,
+                                    pbra_runner_arm_bars=pbra_runner_arm_bars,
+                                    pbra_runner_arm_mfe_ticks=pbra_runner_arm_mfe_ticks,
+                                    pbra_runner_min_abs_ofid_max=pbra_runner_min_abs_ofid_max,
+                                    pbra_runner_tp_ticks=pbra_runner_tp_ticks,
+                                    pbra_runner_disable_be_limit=pbra_runner_disable_be_limit,
+                                    pbra_runner_be_stop_ticks=pbra_runner_be_stop_ticks,
+                                    pbra_regime_lookahead_bars=pbra_regime_lookahead_bars,
+                                    pbra_regime_rolling_candidates=pbra_regime_rolling_candidates,
+                                    pbra_regime_min_pct_mfe=pbra_regime_min_pct_mfe,
                                     gated=True,
                                 disable_gate=disable_gate,
                                 gate_mode=gate_mode,
@@ -7868,6 +8531,11 @@ def main() -> None:
                                 entry_confirm_worst_ticks_default=entry_confirm_worst_ticks_default,
                                 entry_confirm_worst_ticks_apb=entry_confirm_worst_ticks_apb,
                                 entry_confirm_min_abs_ofid_apb=entry_confirm_min_abs_ofid_apb,
+                                entry_confirm_min_abs_ofid_pbra=entry_confirm_min_abs_ofid_pbra,
+                                entry_confirm_min_abs_ofid_pbra_mismatch=entry_confirm_min_abs_ofid_pbra_mismatch,
+                                entry_confirm_min_flow_sum_pbra=entry_confirm_min_flow_sum_pbra,
+                                pbra_enter_proof_bars=pbra_enter_proof_bars,
+                                pbra_enter_proof_ticks=pbra_enter_proof_ticks,
                                 exit_debug=exit_debug,
                                 exit_mode=exit_mode,
                                 validate_bars=validate_bars,
@@ -7968,7 +8636,16 @@ def main() -> None:
                                 f"max_dd_ticks={base_day_pnl['max_dd_ticks']:.2f} max_dd_usd={base_day_pnl['max_dd_usd']:.2f} "
                                 f"max_loss_ticks={base_day_pnl['max_loss_ticks']:.2f} max_loss_usd={base_day_pnl['max_loss_usd']:.2f} "
                                 f"max_win_ticks={base_day_pnl['max_win_ticks']:.2f} max_win_usd={base_day_pnl['max_win_usd']:.2f} "
-                                f"time_exits={int(base_day_pnl.get('time_exits', 0))}",
+                                f"sl_exits={int(base_day_pnl.get('sl_exits', 0))} "
+                                f"tp_exits={int(base_day_pnl.get('tp_exits', 0))} "
+                                f"scratch_exits={int(base_day_pnl.get('scratch_exits', 0))} "
+                                f"time_exits={int(base_day_pnl.get('time_exits', 0))} "
+                                f"would_scratch={int(base_day_pnl.get('pbra_would_scratch', 0))} "
+                                f"would_scratch_rate={base_day_pnl.get('pbra_would_scratch_rate', 0.0):.2%} "
+                                f"runner_armed={int(base_day_pnl.get('pbra_runner_armed', 0))} "
+                                f"runner_armed_rate={base_day_pnl.get('pbra_runner_armed_rate', 0.0):.2%} "
+                                f"runner_tp_hit={int(base_day_pnl.get('pbra_runner_tp_hit', 0))} "
+                                f"runner_tp_hit_rate={base_day_pnl.get('pbra_runner_tp_hit_rate', 0.0):.2%}",
                                 flush=True,
                             )
                             print(
@@ -7978,7 +8655,16 @@ def main() -> None:
                                 f"max_dd_ticks={gate_day_pnl['max_dd_ticks']:.2f} max_dd_usd={gate_day_pnl['max_dd_usd']:.2f} "
                                 f"max_loss_ticks={gate_day_pnl['max_loss_ticks']:.2f} max_loss_usd={gate_day_pnl['max_loss_usd']:.2f} "
                                 f"max_win_ticks={gate_day_pnl['max_win_ticks']:.2f} max_win_usd={gate_day_pnl['max_win_usd']:.2f} "
-                                f"time_exits={int(gate_day_pnl.get('time_exits', 0))}",
+                                f"sl_exits={int(gate_day_pnl.get('sl_exits', 0))} "
+                                f"tp_exits={int(gate_day_pnl.get('tp_exits', 0))} "
+                                f"scratch_exits={int(gate_day_pnl.get('scratch_exits', 0))} "
+                                f"time_exits={int(gate_day_pnl.get('time_exits', 0))} "
+                                f"would_scratch={int(gate_day_pnl.get('pbra_would_scratch', 0))} "
+                                f"would_scratch_rate={gate_day_pnl.get('pbra_would_scratch_rate', 0.0):.2%} "
+                                f"runner_armed={int(gate_day_pnl.get('pbra_runner_armed', 0))} "
+                                f"runner_armed_rate={gate_day_pnl.get('pbra_runner_armed_rate', 0.0):.2%} "
+                                f"runner_tp_hit={int(gate_day_pnl.get('pbra_runner_tp_hit', 0))} "
+                                f"runner_tp_hit_rate={gate_day_pnl.get('pbra_runner_tp_hit_rate', 0.0):.2%}",
                                 flush=True,
                             )
                             pnl_day_rows.append(
@@ -8237,6 +8923,7 @@ def main() -> None:
                                     print(
                                         f"GATE_DIAG {instrument} {day} W={gate_lookback_bars} mode={gate_mode} "
                                         f"armed_candidate_count={gate_diag.get('armed_candidate_count', 0)} "
+                                        f"soft_armed_count={gate_diag.get('soft_armed', 0)} "
                                         f"not_armed_block_count={gate_diag.get('blocked_not_armed', 0)} "
                                         f"mismatch_block_count={mismatch_block_count} "
                                         f"weak_side_none_count={gate_diag.get('weak_side_none', 0)} "
@@ -8377,6 +9064,7 @@ def main() -> None:
                                 print(
                                     f"{instrument} {day} gate_diag "
                                     f"armed_candidate_count={gate_diag.get('armed_candidate_count', 0)} "
+                                    f"soft_armed_count={gate_diag.get('soft_armed', 0)} "
                                     f"not_armed_block_count={gate_diag.get('blocked_not_armed', 0)} "
                                     f"mismatch_block_count={mismatch_block_count} "
                                     f"weak_side_none_count={gate_diag.get('weak_side_none', 0)} "
@@ -9121,12 +9809,52 @@ def main() -> None:
             total_net_ticks = float(np.sum(net)) if net.size else 0.0
             total_net_usd = total_net_ticks * pnl_tick_value
             worst_streak_len, worst_streak_ticks = _worst_losing_streak(net_ordered)
-            time_exits = 0
+            exit_reason_series = None
             if "exit_reason_std" in sub_trades.columns:
-                time_exits = int(
-                    pd.Series(sub_trades["exit_reason_std"]).astype(str).str.upper().eq("TIME").sum()
-                )
+                exit_reason_series = pd.Series(sub_trades["exit_reason_std"]).astype(str).str.upper()
+            elif "exit_reason" in sub_trades.columns:
+                exit_reason_series = pd.Series(sub_trades["exit_reason"]).astype(str).str.upper()
+            if exit_reason_series is None:
+                sl_exits = 0
+                tp_exits = 0
+                scratch_exits = 0
+                time_exits = 0
+            else:
+                sl_exits = int(exit_reason_series.eq("SL").sum())
+                tp_exits = int(exit_reason_series.eq("TP").sum())
+                scratch_exits = int(exit_reason_series.eq("SCRATCH").sum())
+                time_exits = int(exit_reason_series.eq("TIME").sum())
+            sl_exit_rate = float(sl_exits / len(sub_trades)) if len(sub_trades) else 0.0
+            tp_exit_rate = float(tp_exits / len(sub_trades)) if len(sub_trades) else 0.0
+            scratch_exit_rate = float(scratch_exits / len(sub_trades)) if len(sub_trades) else 0.0
             time_exit_rate = float(time_exits / len(sub_trades)) if len(sub_trades) else 0.0
+            would_scratch = 0
+            would_scratch_rate = 0.0
+            if "pbra_would_scratch" in sub_trades.columns:
+                would_scratch = int(
+                    pd.to_numeric(sub_trades["pbra_would_scratch"], errors="coerce")
+                    .fillna(0.0)
+                    .sum()
+                )
+                would_scratch_rate = float(would_scratch / len(sub_trades)) if len(sub_trades) else 0.0
+            runner_armed = 0
+            runner_armed_rate = 0.0
+            runner_tp_hit = 0
+            runner_tp_hit_rate = 0.0
+            if "pbra_runner_armed" in sub_trades.columns:
+                runner_armed = int(
+                    pd.to_numeric(sub_trades["pbra_runner_armed"], errors="coerce")
+                    .fillna(0.0)
+                    .sum()
+                )
+                runner_armed_rate = float(runner_armed / len(sub_trades)) if len(sub_trades) else 0.0
+            if "pbra_runner_tp_hit" in sub_trades.columns:
+                runner_tp_hit = int(
+                    pd.to_numeric(sub_trades["pbra_runner_tp_hit"], errors="coerce")
+                    .fillna(0.0)
+                    .sum()
+                )
+                runner_tp_hit_rate = float(runner_tp_hit / len(sub_trades)) if len(sub_trades) else 0.0
             if not pnl_day_df.empty:
                 day_sub = pnl_day_df[pnl_day_df["strategy"] == strat]
             else:
@@ -9173,11 +9901,33 @@ def main() -> None:
                 f"net_ticks={total_net_ticks:.2f} net_usd={total_net_usd:.2f} "
                 f"max_dd_ticks={eq['max_dd']:.2f} max_dd_usd={eq['max_dd'] * pnl_tick_value:.2f} "
                 f"worst_streak_trades={int(worst_streak_len)} worst_streak_usd={worst_streak_ticks * pnl_tick_value:.2f} "
+                f"sl_exits={sl_exits} sl_exit_rate={sl_exit_rate:.2%} "
+                f"tp_exits={tp_exits} tp_exit_rate={tp_exit_rate:.2%} "
+                f"scratch_exits={scratch_exits} scratch_exit_rate={scratch_exit_rate:.2%} "
                 f"time_exits={time_exits} time_exit_rate={time_exit_rate:.2%} "
+                f"would_scratch={would_scratch} would_scratch_rate={would_scratch_rate:.2%} "
+                f"runner_armed={runner_armed} runner_armed_rate={runner_armed_rate:.2%} "
+                f"runner_tp_hit={runner_tp_hit} runner_tp_hit_rate={runner_tp_hit_rate:.2%} "
                 f"best_day_usd={best_day_usd:.2f} worst_day_usd={worst_day_usd:.2f} "
                 f"pct_days_positive={pct_days_positive:.2%}",
                 flush=True,
             )
+            if pnl_print_trades and strat == "gated":
+                for _, row in sub_trades.iterrows():
+                    gross_ticks = float(row.get("pnl_ticks", 0.0))
+                    net_ticks = gross_ticks - float(pnl_cost_ticks)
+                    print(
+                        f"PNL_TRADE strategy={strat} entry_bar={int(row.get('entry_bar', -1))} "
+                        f"entry_px={float(row.get('entry_px', float('nan'))):.2f} "
+                        f"family={row.get('entry_family', '')} "
+                        f"abs_ofid_at_fire={float(row.get('abs_ofid_at_fire', float('nan'))):.2f} "
+                        f"gross_ticks={gross_ticks:.2f} net_ticks={net_ticks:.2f} "
+                        f"exit_reason={row.get('exit_reason')} "
+                        f"mfe_ticks={float(row.get('mfe_ticks', 0.0)):.2f} "
+                        f"pbra_best_favor_ticks_firstN={float(row.get('pbra_best_favor_ticks_firstN', float('nan'))):.2f} "
+                        f"pbra_max_abs_ofid_firstN={float(row.get('pbra_max_abs_ofid_firstN', float('nan'))):.2f}",
+                        flush=True,
+                    )
             if pass_rate_str != "NA":
                 print(
                     f"PNL_PASS_RATE strategy={strat} pass_days={pass_days_str} pass_rate={pass_rate_str} "
