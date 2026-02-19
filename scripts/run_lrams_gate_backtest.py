@@ -84,6 +84,20 @@ Baseline:
   PBRA_REGIME_LOOKAHEAD_BARS lookahead bars for PBRA candidate MFE check (default: 0 = off)
   PBRA_REGIME_ROLLING_CANDIDATES rolling PBRA candidate window size (default: 0 = off)
   PBRA_REGIME_MIN_PCT_MFE  min pct of PBRA candidates with MFE>=1 to allow entries (default: 0 = off)
+  PFLFT_FLOW_WIN_BARS      PFLFT flow window bars (default: 20)
+  PFLFT_SPREAD_MAX         PFLFT max spread ticks (default: 1)
+  PFLFT_DEPTH_MIN          PFLFT min top depth (default: 0 = off)
+  PFLFT_DMID_ABS_MAX_TICKS PFLFT max abs dmid ticks (default: 1)
+  PFLFT_FLOW_INTENSITY_MIN PFLFT min flow intensity (default: 0)
+  PFLFT_LAG_SCORE_MIN      PFLFT min lag score (default: 0)
+  PFLFT_PROOF_MAX_BARS     PFLFT proof window bars (default: 5)
+  PFLFT_PROOF_TICKS        PFLFT proof ticks (default: 1)
+  PFLFT_PROOF_MIN_FLOW     PFLFT min aligned flow sum in proof window (default: 0)
+  PFLFT_CONFIRM_MIN_ABS_OFID PFLFT min abs OFID in confirm window (default: 5)
+  PFLFT_CONFIRM_MIN_FLOW_SUM PFLFT min signed flow sum in confirm window (default: 5)
+  PFLFT_STOP_TICKS         PFLFT stop ticks (default: 3)
+  PFLFT_TP_TICKS           PFLFT TP ticks (default: 4)
+  PFLFT_TIME_STOP_BARS     PFLFT time stop bars (default: 20)
   PNL_TICK_VALUE          dollar value per tick (default: 12.50)
   PNL_COMMISSION_PER_SIDE commission per side in $ (default: 0)
   PNL_COMMISSION_ROUND_TURN commission per round turn in $ (default: unset)
@@ -608,6 +622,11 @@ def _simulate_day(
     entry_confirm_min_abs_ofid_pbra: float,
     entry_confirm_min_abs_ofid_pbra_mismatch: float,
     entry_confirm_min_flow_sum_pbra: float,
+    entry_confirm_min_abs_ofid_pflft: float,
+    entry_confirm_min_flow_sum_pflft: float,
+    pflft_proof_max_bars: int,
+    pflft_proof_ticks: int,
+    pflft_proof_min_flow: float,
     pbra_enter_proof_bars: int,
     pbra_enter_proof_ticks: int,
     exit_debug: bool,
@@ -942,6 +961,10 @@ def _simulate_day(
     entry_alpha_allowed = 0
     entry_alpha_allowed_clean = 0
     entry_alpha_allowed_mismatch = 0
+    pflft_confirm_checked = 0
+    pflft_confirm_passed = 0
+    pflft_confirm_failed = 0
+    pflft_proof_failed = 0
     entry_alpha_blocked_excl = {
         "not_armed": 0,
         "weak_none": 0,
@@ -1045,6 +1068,7 @@ def _simulate_day(
     if strategy_mode == "entry_alpha_v1":
         entry_alpha_hist = {
             "last": last,
+            "mid": mid,
             "high": high,
             "low": low,
             "spread_ticks": spread_ticks,
@@ -2761,6 +2785,21 @@ def _simulate_day(
                         "entry_reason_raw": entry_reason_raw_out if entry_reason_raw_out else "",
                         "entry_reason_label": entry_reason_label_out if entry_reason_label_out else "",
                         "entry_family": entry_family_val,
+                        "pflft_flow_sum_signed": float(pos.get("pflft_flow_sum_signed", float("nan"))),
+                        "pflft_flow_intensity": float(pos.get("pflft_flow_intensity", float("nan"))),
+                        "pflft_lag_score": float(pos.get("pflft_lag_score", float("nan"))),
+                        "pflft_dmid_ticks": float(pos.get("pflft_dmid_ticks", float("nan"))),
+                        "pflft_spread_ticks": float(pos.get("pflft_spread_ticks", float("nan"))),
+                        "pflft_depth_min": float(pos.get("pflft_depth_min", float("nan"))),
+                        "pflft_confirm_min_abs_ofid": float(
+                            pos.get("pflft_confirm_min_abs_ofid", float("nan"))
+                        ),
+                        "pflft_confirm_min_flow_sum": float(
+                            pos.get("pflft_confirm_min_flow_sum", float("nan"))
+                        ),
+                        "pflft_proof_bars": int(pos.get("pflft_proof_bars", 0)),
+                        "pflft_proof_ticks": int(pos.get("pflft_proof_ticks", 0)),
+                        "pflft_proof_min_flow": float(pos.get("pflft_proof_min_flow", 0.0)),
                         "absorption_level": float(pos.get("absorption_level", float("nan"))),
                         "break_level": float(pos.get("break_level", float("nan"))),
                         "flow_align_sum_at_entry": float(pos.get("flow_align_sum_at_entry", 0.0)),
@@ -2829,6 +2868,8 @@ def _simulate_day(
                     entry_confirm_failed_by_family[family_key] = (
                         entry_confirm_failed_by_family.get(family_key, 0) + 1
                     )
+                    if family_key == "PFLFT_v1":
+                        pflft_confirm_failed += 1
                     if (
                         validate_debug
                         and family_key == "APB_v1"
@@ -2928,6 +2969,9 @@ def _simulate_day(
                 min_flow_sum_eff = float(
                     pending_entry.get("confirm_min_flow_sum", 0.0)
                 )
+                proof_bars_eff = int(pending_entry.get("proof_bars_eff", 0))
+                proof_ticks_eff = int(pending_entry.get("proof_ticks_eff", 0))
+                proof_min_flow_eff = float(pending_entry.get("proof_min_flow_eff", 0.0))
                 entry_bar_ref = int(pending_entry.get("created_bar", pending_entry_created))
                 window_end = min(n - 1, entry_bar_ref + confirm_bars_eff)
                 window_end_cur = min(i, window_end)
@@ -2936,6 +2980,11 @@ def _simulate_day(
                 worst_adverse_ticks = float("nan")
                 max_abs_ofid = float("nan")
                 confirm_flow_sum = float("nan")
+                proof_best_favor = float("nan")
+                proof_flow_sum = float("nan")
+                proof_met = True
+                proof_pending = False
+                proof_failed = False
                 if entry_px_ref == entry_px_ref and window_end_cur >= entry_bar_ref:
                     window = mid[entry_bar_ref : window_end_cur + 1]
                     if np.any(np.isfinite(window)):
@@ -2950,6 +2999,31 @@ def _simulate_day(
                         if ofid_window.size > 0:
                             max_abs_ofid = float(np.nanmax(np.abs(ofid_window)))
                             confirm_flow_sum = float(np.nansum(ofid_window))
+                    if proof_bars_eff > 0:
+                        proof_end = min(n - 1, entry_bar_ref + proof_bars_eff)
+                        proof_end_cur = min(i, proof_end)
+                        proof_window = mid[entry_bar_ref : proof_end_cur + 1]
+                        if np.any(np.isfinite(proof_window)):
+                            if pending_entry_side == "long":
+                                proof_best_favor = (np.nanmax(proof_window) - entry_px_ref) / tick_size
+                            else:
+                                proof_best_favor = (entry_px_ref - np.nanmin(proof_window)) / tick_size
+                        ofid_window = signed_vol[entry_bar_ref : proof_end_cur + 1]
+                        if ofid_window.size > 0:
+                            proof_flow_sum = float(np.nansum(ofid_window))
+                        proof_met = np.isfinite(proof_best_favor) and proof_best_favor >= float(proof_ticks_eff)
+                        if proof_min_flow_eff > 0:
+                            if pending_entry_side == "long":
+                                proof_met = proof_met and np.isfinite(proof_flow_sum) and proof_flow_sum >= proof_min_flow_eff
+                            else:
+                                proof_met = proof_met and np.isfinite(proof_flow_sum) and proof_flow_sum <= -proof_min_flow_eff
+                        else:
+                            if pending_entry_side == "long":
+                                proof_met = proof_met and np.isfinite(proof_flow_sum) and proof_flow_sum >= 0
+                            else:
+                                proof_met = proof_met and np.isfinite(proof_flow_sum) and proof_flow_sum <= 0
+                        proof_pending = not proof_met and i < proof_end
+                        proof_failed = not proof_met and i >= proof_end
                 ofid_ok = True
                 if min_abs_ofid_eff > 0:
                     ofid_ok = np.isfinite(max_abs_ofid) and max_abs_ofid >= min_abs_ofid_eff
@@ -2959,6 +3033,33 @@ def _simulate_day(
                         flow_ok = np.isfinite(confirm_flow_sum) and confirm_flow_sum >= min_flow_sum_eff
                     else:
                         flow_ok = np.isfinite(confirm_flow_sum) and confirm_flow_sum <= -min_flow_sum_eff
+                if proof_failed:
+                    entry_confirm_failed += 1
+                    if bool(pending_entry.get("entry_alpha_mismatch")):
+                        entry_confirm_failed_mismatch += 1
+                    else:
+                        entry_confirm_failed_clean += 1
+                    if strategy_mode == "entry_alpha_v1":
+                        family_key = str(pending_entry.get("entry_family") or "unknown")
+                        entry_confirm_failed_by_family[family_key] = (
+                            entry_confirm_failed_by_family.get(family_key, 0) + 1
+                        )
+                        if family_key == "PFLFT_v1":
+                            pflft_confirm_failed += 1
+                            pflft_proof_failed += 1
+                    pending_entry_active = False
+                    pending_entry = {}
+                    if strategy_mode == "entry_alpha_v1":
+                        pending_ea_gate_override = None
+                        pending_ea_gate_reason = None
+                        pending_ea_signal = 0
+                        pending_ea_bar = -1
+                        pending_ea_mismatch = False
+                    i += 1
+                    continue
+                if proof_pending:
+                    i += 1
+                    continue
                 confirm_ok = (
                     np.isfinite(best_favor_ticks)
                     and np.isfinite(worst_adverse_ticks)
@@ -2983,6 +3084,8 @@ def _simulate_day(
                                 entry_confirm_passed_pbra_mismatch += 1
                             else:
                                 entry_confirm_passed_pbra_clean += 1
+                        if family_key == "PFLFT_v1":
+                            pflft_confirm_passed += 1
                     pending_confirmed = True
                     pending_payload = dict(pending_entry)
                     pending_entry_active = False
@@ -2992,6 +3095,21 @@ def _simulate_day(
                         entry_reason = pending_entry.get("entry_reason")
                         expiry_in = int(pending_entry_expiry - i)
                         is_mismatch = bool(pending_entry.get("entry_alpha_mismatch"))
+                        fail_reason = "other"
+                        if not (
+                            np.isfinite(best_favor_ticks) and np.isfinite(worst_adverse_ticks)
+                        ):
+                            fail_reason = "data_missing"
+                        elif best_favor_ticks < best_min_eff:
+                            fail_reason = "no_progress"
+                        elif worst_adverse_ticks < worst_min_eff:
+                            fail_reason = "too_adverse"
+                        elif min_abs_ofid_eff > 0 and not ofid_ok:
+                            fail_reason = "low_ofid"
+                        elif min_flow_sum_eff > 0 and not flow_ok:
+                            fail_reason = "low_flow"
+                        elif proof_bars_eff > 0 and not proof_met:
+                            fail_reason = "proof"
                         if (
                             (is_mismatch and entry_confirm_fail_printed_mismatch < 10)
                             or (not is_mismatch and entry_confirm_fail_printed_clean < 10)
@@ -3005,6 +3123,10 @@ def _simulate_day(
                                 f"best_min={best_min_eff:.2f} worst_min={worst_min_eff:.2f} "
                                 f"min_abs_ofid={min_abs_ofid_eff:.2f} max_abs_ofid={max_abs_ofid:.2f} "
                                 f"min_flow_sum={min_flow_sum_eff:.2f} flow_sum={confirm_flow_sum:.2f} "
+                                f"proof_bars={proof_bars_eff} proof_ticks={proof_ticks_eff} "
+                                f"proof_min_flow={proof_min_flow_eff:.2f} "
+                                f"proof_best={proof_best_favor:.2f} proof_flow={proof_flow_sum:.2f} "
+                                f"fail_reason={fail_reason} "
                                 f"pending_px={pending_entry_price:.2f} confirm_px={confirm_px:.2f} "
                                 f"expiry_in={expiry_in}",
                                 flush=True,
@@ -3063,6 +3185,17 @@ def _simulate_day(
         entry_alpha_gate_reason: str | None = None
         entry_alpha_decision_signal = 0
         abs_ofid_at_fire = float("nan")
+        pflft_flow_sum_signed = float("nan")
+        pflft_flow_intensity = float("nan")
+        pflft_lag_score = float("nan")
+        pflft_dmid_ticks = float("nan")
+        pflft_spread_ticks = float("nan")
+        pflft_depth_min = float("nan")
+        pflft_confirm_min_abs_ofid = float("nan")
+        pflft_confirm_min_flow_sum = float("nan")
+        pflft_proof_bars = 0
+        pflft_proof_ticks = 0
+        pflft_proof_min_flow = 0.0
         confirm_bars_waited = 0
         confirm_price_ref = float("nan")
         lbo_entry_mode = ""
@@ -3133,6 +3266,21 @@ def _simulate_day(
             ft_progress_ticks = float(pending_payload.get("ft_progress_ticks", float("nan")))
             impulse_ticks = float(pending_payload.get("impulse_ticks", float("nan")))
             dmid_ticks = float(pending_payload.get("dmid_ticks", float("nan")))
+            pflft_flow_sum_signed = float(pending_payload.get("pflft_flow_sum_signed", float("nan")))
+            pflft_flow_intensity = float(pending_payload.get("pflft_flow_intensity", float("nan")))
+            pflft_lag_score = float(pending_payload.get("pflft_lag_score", float("nan")))
+            pflft_dmid_ticks = float(pending_payload.get("pflft_dmid_ticks", float("nan")))
+            pflft_spread_ticks = float(pending_payload.get("pflft_spread_ticks", float("nan")))
+            pflft_depth_min = float(pending_payload.get("pflft_depth_min", float("nan")))
+            pflft_confirm_min_abs_ofid = float(
+                pending_payload.get("confirm_min_abs_ofid", float("nan"))
+            )
+            pflft_confirm_min_flow_sum = float(
+                pending_payload.get("confirm_min_flow_sum", float("nan"))
+            )
+            pflft_proof_bars = int(pending_payload.get("proof_bars_eff", 0))
+            pflft_proof_ticks = int(pending_payload.get("proof_ticks_eff", 0))
+            pflft_proof_min_flow = float(pending_payload.get("proof_min_flow_eff", 0.0))
 
         use_srf_entry = strategy_mode == "srf_entry_v1"
         srf_trigger = False
@@ -3187,6 +3335,12 @@ def _simulate_day(
             decision_signal = int(decision.signal)
             decision_family = decision.family or "entry_alpha_v1"
             abs_ofid_at_fire = float("nan")
+            pflft_flow_sum_signed = float(decision.flow_sum_signed) if decision.flow_sum_signed is not None else float("nan")
+            pflft_flow_intensity = float(decision.flow_intensity) if decision.flow_intensity is not None else float("nan")
+            pflft_lag_score = float(decision.lag_score) if decision.lag_score is not None else float("nan")
+            pflft_dmid_ticks = float(decision.dmid_ticks) if decision.dmid_ticks is not None else float("nan")
+            pflft_spread_ticks = float(decision.spread_ticks) if decision.spread_ticks is not None else float("nan")
+            pflft_depth_min = float(decision.depth_min) if decision.depth_min is not None else float("nan")
             if (
                 decision_signal != 0
                 and entry_alpha_family_allowlist
@@ -5110,6 +5264,9 @@ def _simulate_day(
             confirm_worst_ticks_eff = int(entry_confirm_worst_ticks_default)
             confirm_min_abs_ofid_eff = 0.0
             confirm_min_flow_sum_eff = 0.0
+            proof_bars_eff = 0
+            proof_ticks_eff = 0
+            proof_min_flow_eff = 0.0
             if strategy_mode == "entry_alpha_v1":
                 if entry_family == "APB_v1":
                     confirm_bars_eff = 3
@@ -5134,6 +5291,14 @@ def _simulate_day(
                         confirm_min_abs_ofid_eff = float(
                             entry_confirm_min_abs_ofid_pbra_mismatch
                         )
+                elif entry_family == "PFLFT_v1":
+                    confirm_min_abs_ofid_eff = float(entry_confirm_min_abs_ofid_pflft)
+                    confirm_min_flow_sum_eff = float(entry_confirm_min_flow_sum_pflft)
+                    proof_bars_eff = int(pflft_proof_max_bars)
+                    proof_ticks_eff = int(pflft_proof_ticks)
+                    proof_min_flow_eff = float(pflft_proof_min_flow)
+                    if proof_bars_eff > confirm_bars_eff:
+                        confirm_bars_eff = int(proof_bars_eff)
             if (
                 strategy_mode == "entry_alpha_v1"
                 and entry_family == "PBRA_v1"
@@ -5161,6 +5326,8 @@ def _simulate_day(
                     entry_confirm_checked_pbra_mismatch += 1
                 else:
                     entry_confirm_checked_pbra_clean += 1
+            if entry_family == "PFLFT_v1":
+                pflft_confirm_checked += 1
             if strategy_mode == "entry_alpha_v1":
                 family_key = str(entry_family or "unknown")
                 entry_confirm_checked_by_family[family_key] = entry_confirm_checked_by_family.get(family_key, 0) + 1
@@ -5174,10 +5341,31 @@ def _simulate_day(
                 "confirm_worst_ticks": int(confirm_worst_ticks_eff),
                 "confirm_min_abs_ofid": float(confirm_min_abs_ofid_eff),
                 "confirm_min_flow_sum": float(confirm_min_flow_sum_eff),
+                "proof_bars_eff": int(proof_bars_eff),
+                "proof_ticks_eff": int(proof_ticks_eff),
+                "proof_min_flow_eff": float(proof_min_flow_eff),
                 "entry_reason": entry_reason,
                 "entry_reason_label": entry_reason_label,
                 "entry_family": entry_family,
                 "entry_alpha_mismatch": bool(entry_alpha_mismatch_flag),
+                "pflft_flow_sum_signed": float(pflft_flow_sum_signed)
+                if np.isfinite(pflft_flow_sum_signed)
+                else float("nan"),
+                "pflft_flow_intensity": float(pflft_flow_intensity)
+                if np.isfinite(pflft_flow_intensity)
+                else float("nan"),
+                "pflft_lag_score": float(pflft_lag_score)
+                if np.isfinite(pflft_lag_score)
+                else float("nan"),
+                "pflft_dmid_ticks": float(pflft_dmid_ticks)
+                if np.isfinite(pflft_dmid_ticks)
+                else float("nan"),
+                "pflft_spread_ticks": float(pflft_spread_ticks)
+                if np.isfinite(pflft_spread_ticks)
+                else float("nan"),
+                "pflft_depth_min": float(pflft_depth_min)
+                if np.isfinite(pflft_depth_min)
+                else float("nan"),
                 "absorption_level": float(absorption_level) if np.isfinite(absorption_level) else float("nan"),
                 "break_level": float(break_level) if np.isfinite(break_level) else float("nan"),
                 "flow_align_sum": float(flow_align_sum),
@@ -5388,6 +5576,21 @@ def _simulate_day(
             "entry_reason_label": entry_reason_label if entry_reason_label is not None else "",
             "entry_family": entry_family if entry_family is not None else "",
             "entry_alpha_mismatch": bool(entry_alpha_mismatch_flag) or (entry_bar in entry_alpha_mismatch_bars),
+            "pflft_flow_sum_signed": float(pflft_flow_sum_signed) if np.isfinite(pflft_flow_sum_signed) else float("nan"),
+            "pflft_flow_intensity": float(pflft_flow_intensity) if np.isfinite(pflft_flow_intensity) else float("nan"),
+            "pflft_lag_score": float(pflft_lag_score) if np.isfinite(pflft_lag_score) else float("nan"),
+            "pflft_dmid_ticks": float(pflft_dmid_ticks) if np.isfinite(pflft_dmid_ticks) else float("nan"),
+            "pflft_spread_ticks": float(pflft_spread_ticks) if np.isfinite(pflft_spread_ticks) else float("nan"),
+            "pflft_depth_min": float(pflft_depth_min) if np.isfinite(pflft_depth_min) else float("nan"),
+            "pflft_confirm_min_abs_ofid": float(pflft_confirm_min_abs_ofid)
+            if np.isfinite(pflft_confirm_min_abs_ofid)
+            else float("nan"),
+            "pflft_confirm_min_flow_sum": float(pflft_confirm_min_flow_sum)
+            if np.isfinite(pflft_confirm_min_flow_sum)
+            else float("nan"),
+            "pflft_proof_bars": int(pflft_proof_bars),
+            "pflft_proof_ticks": int(pflft_proof_ticks),
+            "pflft_proof_min_flow": float(pflft_proof_min_flow),
             "lbo_entry_mode": lbo_entry_mode,
             "absorption_level": float(absorption_level) if np.isfinite(absorption_level) else float("nan"),
             "break_level": float(break_level) if np.isfinite(break_level) else float("nan"),
@@ -5603,6 +5806,25 @@ def _simulate_day(
             )
             print(
                 f"EA_MISMATCH_SUBTYPES {symbol_str} {day_str} total={entry_alpha_mismatch} {subtype_parts}",
+                flush=True,
+            )
+        if entry_alpha_engine is not None:
+            pflft_stats = getattr(entry_alpha_engine, "pflft_stats", None)
+            if isinstance(pflft_stats, dict) and any(pflft_stats.values()):
+                print(
+                    f"PFLFT_STATS {symbol_str} {day_str} "
+                    f"candidates={int(pflft_stats.get('candidates', 0))} "
+                    f"blocked_spread={int(pflft_stats.get('blocked_spread', 0))} "
+                    f"blocked_depth={int(pflft_stats.get('blocked_depth', 0))} "
+                    f"blocked_dmid={int(pflft_stats.get('blocked_dmid', 0))} "
+                    f"blocked_lag={int(pflft_stats.get('blocked_lag', 0))}",
+                    flush=True,
+                )
+        if pflft_confirm_checked or pflft_confirm_failed or pflft_confirm_passed:
+            print(
+                f"PFLFT_CONFIRM {symbol_str} {day_str} "
+                f"checked={pflft_confirm_checked} passed={pflft_confirm_passed} "
+                f"failed={pflft_confirm_failed} proof_failed={pflft_proof_failed}",
                 flush=True,
             )
         if entry_alpha_mismatch_samples:
@@ -6208,6 +6430,15 @@ def _apply_entry_alpha_overrides(params: EntryAlphaParams) -> None:
     brk_pad_env = os.environ.get("ENTRY_ALPHA_BRK_PAD", "").strip()
     accept_tol_env = os.environ.get("ENTRY_ALPHA_ACCEPT_TOL", "").strip()
     fail_ticks_env = os.environ.get("ENTRY_ALPHA_FAIL_TICKS", "").strip()
+    pflft_flow_win_env = os.environ.get("PFLFT_FLOW_WIN_BARS", "").strip()
+    pflft_spread_env = os.environ.get("PFLFT_SPREAD_MAX", "").strip()
+    pflft_depth_env = os.environ.get("PFLFT_DEPTH_MIN", "").strip()
+    pflft_dmid_env = os.environ.get("PFLFT_DMID_ABS_MAX_TICKS", "").strip()
+    pflft_flow_int_env = os.environ.get("PFLFT_FLOW_INTENSITY_MIN", "").strip()
+    pflft_lag_env = os.environ.get("PFLFT_LAG_SCORE_MIN", "").strip()
+    pflft_stop_env = os.environ.get("PFLFT_STOP_TICKS", "").strip()
+    pflft_tp_env = os.environ.get("PFLFT_TP_TICKS", "").strip()
+    pflft_time_stop_env = os.environ.get("PFLFT_TIME_STOP_BARS", "").strip()
 
     if ofi_th_env:
         ofi_th = float(ofi_th_env)
@@ -6224,6 +6455,7 @@ def _apply_entry_alpha_overrides(params: EntryAlphaParams) -> None:
         params.obra.SPREAD_MAX = spread_max
         params.apb.SPREAD_MAX = spread_max
         params.pbra.SPREAD_MAX = spread_max
+        params.pflft.SPREAD_MAX = spread_max
     if impulse_min_env:
         params.obra.IMPULSE_MIN_RANGE = int(impulse_min_env)
     if break_min_env:
@@ -6234,6 +6466,24 @@ def _apply_entry_alpha_overrides(params: EntryAlphaParams) -> None:
         params.obra.ACCEPT_TOL = int(accept_tol_env)
     if fail_ticks_env:
         params.obra.FAIL_TICKS = int(fail_ticks_env)
+    if pflft_flow_win_env:
+        params.pflft.FLOW_WIN_BARS = int(pflft_flow_win_env)
+    if pflft_spread_env:
+        params.pflft.SPREAD_MAX = int(pflft_spread_env)
+    if pflft_depth_env:
+        params.pflft.DEPTH_MIN = float(pflft_depth_env)
+    if pflft_dmid_env:
+        params.pflft.DMID_ABS_MAX_TICKS = float(pflft_dmid_env)
+    if pflft_flow_int_env:
+        params.pflft.FLOW_INTENSITY_MIN = float(pflft_flow_int_env)
+    if pflft_lag_env:
+        params.pflft.LAG_SCORE_MIN = float(pflft_lag_env)
+    if pflft_stop_env:
+        params.pflft.STOP_TICKS = int(pflft_stop_env)
+    if pflft_tp_env:
+        params.pflft.TP_TICKS = int(pflft_tp_env)
+    if pflft_time_stop_env:
+        params.pflft.TIME_STOP_BARS = int(pflft_time_stop_env)
 
 def _entry_alpha_forward_stats(
     trades: pd.DataFrame, df_day: pd.DataFrame, tick_size: float, horizons: List[int]
@@ -6894,6 +7144,25 @@ def main() -> None:
     )
     if entry_confirm_min_flow_sum_pbra < 0:
         entry_confirm_min_flow_sum_pbra = 0.0
+    entry_confirm_min_abs_ofid_pflft = float(
+        os.environ.get("PFLFT_CONFIRM_MIN_ABS_OFID", "5")
+    )
+    if entry_confirm_min_abs_ofid_pflft < 0:
+        entry_confirm_min_abs_ofid_pflft = 0.0
+    entry_confirm_min_flow_sum_pflft = float(
+        os.environ.get("PFLFT_CONFIRM_MIN_FLOW_SUM", "5")
+    )
+    if entry_confirm_min_flow_sum_pflft < 0:
+        entry_confirm_min_flow_sum_pflft = 0.0
+    pflft_proof_max_bars = int(os.environ.get("PFLFT_PROOF_MAX_BARS", "5"))
+    if pflft_proof_max_bars < 0:
+        pflft_proof_max_bars = 0
+    pflft_proof_ticks = int(os.environ.get("PFLFT_PROOF_TICKS", "1"))
+    if pflft_proof_ticks < 0:
+        pflft_proof_ticks = 0
+    pflft_proof_min_flow = float(os.environ.get("PFLFT_PROOF_MIN_FLOW", "0"))
+    if pflft_proof_min_flow < 0:
+        pflft_proof_min_flow = 0.0
     pbra_enter_proof_bars_env = os.environ.get("PBRA_ENTER_PROOF_MAX_BARS", "").strip()
     pbra_enter_proof_bars = int(pbra_enter_proof_bars_env) if pbra_enter_proof_bars_env else 0
     if pbra_enter_proof_bars < 0:
@@ -7229,6 +7498,8 @@ def main() -> None:
         print("Warning: USE_ALL_AVAILABLE_DAYS selected fewer than 5 days; low-confidence results.", flush=True)
     if len(selected_days) < 3:
         print("Warning: fewer than 3 days selected; continuing.", flush=True)
+    entry_alpha_params = EntryAlphaParams()
+    _apply_entry_alpha_overrides(entry_alpha_params)
     print(
         "Run config:",
         {
@@ -7278,6 +7549,38 @@ def main() -> None:
             "entry_confirm_min_abs_ofid_pbra": entry_confirm_min_abs_ofid_pbra,
             "entry_confirm_min_abs_ofid_pbra_mismatch": entry_confirm_min_abs_ofid_pbra_mismatch,
             "entry_confirm_min_flow_sum_pbra": entry_confirm_min_flow_sum_pbra,
+            "entry_confirm_min_abs_ofid_pflft": entry_confirm_min_abs_ofid_pflft,
+            "entry_confirm_min_flow_sum_pflft": entry_confirm_min_flow_sum_pflft,
+            "pflft_flow_win_bars": entry_alpha_params.pflft.FLOW_WIN_BARS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_spread_max": entry_alpha_params.pflft.SPREAD_MAX
+            if entry_alpha_params is not None
+            else None,
+            "pflft_depth_min": entry_alpha_params.pflft.DEPTH_MIN
+            if entry_alpha_params is not None
+            else None,
+            "pflft_dmid_abs_max_ticks": entry_alpha_params.pflft.DMID_ABS_MAX_TICKS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_flow_intensity_min": entry_alpha_params.pflft.FLOW_INTENSITY_MIN
+            if entry_alpha_params is not None
+            else None,
+            "pflft_lag_score_min": entry_alpha_params.pflft.LAG_SCORE_MIN
+            if entry_alpha_params is not None
+            else None,
+            "pflft_proof_max_bars": pflft_proof_max_bars,
+            "pflft_proof_ticks": pflft_proof_ticks,
+            "pflft_proof_min_flow": pflft_proof_min_flow,
+            "pflft_stop_ticks": entry_alpha_params.pflft.STOP_TICKS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_tp_ticks": entry_alpha_params.pflft.TP_TICKS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_time_stop_bars": entry_alpha_params.pflft.TIME_STOP_BARS
+            if entry_alpha_params is not None
+            else None,
             "pbra_enter_proof_bars": pbra_enter_proof_bars,
             "pbra_enter_proof_ticks": pbra_enter_proof_ticks,
             "entry_alpha_allow_mismatch_pbra": entry_alpha_allow_mismatch_pbra,
@@ -7349,6 +7652,38 @@ def main() -> None:
             "entry_confirm_min_abs_ofid_pbra": entry_confirm_min_abs_ofid_pbra,
             "entry_confirm_min_abs_ofid_pbra_mismatch": entry_confirm_min_abs_ofid_pbra_mismatch,
             "entry_confirm_min_flow_sum_pbra": entry_confirm_min_flow_sum_pbra,
+            "entry_confirm_min_abs_ofid_pflft": entry_confirm_min_abs_ofid_pflft,
+            "entry_confirm_min_flow_sum_pflft": entry_confirm_min_flow_sum_pflft,
+            "pflft_flow_win_bars": entry_alpha_params.pflft.FLOW_WIN_BARS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_spread_max": entry_alpha_params.pflft.SPREAD_MAX
+            if entry_alpha_params is not None
+            else None,
+            "pflft_depth_min": entry_alpha_params.pflft.DEPTH_MIN
+            if entry_alpha_params is not None
+            else None,
+            "pflft_dmid_abs_max_ticks": entry_alpha_params.pflft.DMID_ABS_MAX_TICKS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_flow_intensity_min": entry_alpha_params.pflft.FLOW_INTENSITY_MIN
+            if entry_alpha_params is not None
+            else None,
+            "pflft_lag_score_min": entry_alpha_params.pflft.LAG_SCORE_MIN
+            if entry_alpha_params is not None
+            else None,
+            "pflft_proof_max_bars": pflft_proof_max_bars,
+            "pflft_proof_ticks": pflft_proof_ticks,
+            "pflft_proof_min_flow": pflft_proof_min_flow,
+            "pflft_stop_ticks": entry_alpha_params.pflft.STOP_TICKS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_tp_ticks": entry_alpha_params.pflft.TP_TICKS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_time_stop_bars": entry_alpha_params.pflft.TIME_STOP_BARS
+            if entry_alpha_params is not None
+            else None,
             "pbra_enter_proof_bars": pbra_enter_proof_bars,
             "pbra_enter_proof_ticks": pbra_enter_proof_ticks,
             "entry_alpha_allow_mismatch_pbra": entry_alpha_allow_mismatch_pbra,
@@ -7550,8 +7885,6 @@ def main() -> None:
     )
     events = _compute_thresholds(events, worst_q=worst_q)
 
-    entry_alpha_params = EntryAlphaParams()
-    _apply_entry_alpha_overrides(entry_alpha_params)
     if strategy_mode == "entry_alpha_v1" and entry_alpha_ablation:
         base_kwargs = {
             "tick_size": tick_size,
@@ -7678,6 +8011,15 @@ def main() -> None:
             "entry_confirm_min_ticks_apb": entry_confirm_min_ticks_apb,
             "entry_confirm_worst_ticks_default": entry_confirm_worst_ticks_default,
             "entry_confirm_worst_ticks_apb": entry_confirm_worst_ticks_apb,
+            "entry_confirm_min_abs_ofid_apb": entry_confirm_min_abs_ofid_apb,
+            "entry_confirm_min_abs_ofid_pbra": entry_confirm_min_abs_ofid_pbra,
+            "entry_confirm_min_abs_ofid_pbra_mismatch": entry_confirm_min_abs_ofid_pbra_mismatch,
+            "entry_confirm_min_flow_sum_pbra": entry_confirm_min_flow_sum_pbra,
+            "entry_confirm_min_abs_ofid_pflft": entry_confirm_min_abs_ofid_pflft,
+            "entry_confirm_min_flow_sum_pflft": entry_confirm_min_flow_sum_pflft,
+            "pflft_proof_max_bars": pflft_proof_max_bars,
+            "pflft_proof_ticks": pflft_proof_ticks,
+            "pflft_proof_min_flow": pflft_proof_min_flow,
             "entry_confirm_min_abs_ofid_apb": entry_confirm_min_abs_ofid_apb,
             "entry_confirm_min_abs_ofid_pbra": entry_confirm_min_abs_ofid_pbra,
             "pbra_enter_proof_bars": pbra_enter_proof_bars,
@@ -8149,6 +8491,11 @@ def main() -> None:
                                     entry_confirm_min_abs_ofid_pbra=entry_confirm_min_abs_ofid_pbra,
                                     entry_confirm_min_abs_ofid_pbra_mismatch=entry_confirm_min_abs_ofid_pbra_mismatch,
                                     entry_confirm_min_flow_sum_pbra=entry_confirm_min_flow_sum_pbra,
+                                    entry_confirm_min_abs_ofid_pflft=entry_confirm_min_abs_ofid_pflft,
+                                    entry_confirm_min_flow_sum_pflft=entry_confirm_min_flow_sum_pflft,
+                                    pflft_proof_max_bars=pflft_proof_max_bars,
+                                    pflft_proof_ticks=pflft_proof_ticks,
+                                    pflft_proof_min_flow=pflft_proof_min_flow,
                                     pbra_enter_proof_bars=pbra_enter_proof_bars,
                                     pbra_enter_proof_ticks=pbra_enter_proof_ticks,
                                     exit_debug=exit_debug,
@@ -8534,6 +8881,11 @@ def main() -> None:
                                 entry_confirm_min_abs_ofid_pbra=entry_confirm_min_abs_ofid_pbra,
                                 entry_confirm_min_abs_ofid_pbra_mismatch=entry_confirm_min_abs_ofid_pbra_mismatch,
                                 entry_confirm_min_flow_sum_pbra=entry_confirm_min_flow_sum_pbra,
+                                entry_confirm_min_abs_ofid_pflft=entry_confirm_min_abs_ofid_pflft,
+                                entry_confirm_min_flow_sum_pflft=entry_confirm_min_flow_sum_pflft,
+                                pflft_proof_max_bars=pflft_proof_max_bars,
+                                pflft_proof_ticks=pflft_proof_ticks,
+                                pflft_proof_min_flow=pflft_proof_min_flow,
                                 pbra_enter_proof_bars=pbra_enter_proof_bars,
                                 pbra_enter_proof_ticks=pbra_enter_proof_ticks,
                                 exit_debug=exit_debug,

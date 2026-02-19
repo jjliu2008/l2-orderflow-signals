@@ -55,10 +55,24 @@ class PBRAParams:
 
 
 @dataclass
+class PFLFTParams:
+    FLOW_WIN_BARS: int = 20
+    SPREAD_MAX: int = 1
+    DEPTH_MIN: float = 0.0
+    DMID_ABS_MAX_TICKS: float = 1.0
+    FLOW_INTENSITY_MIN: float = 0.0
+    LAG_SCORE_MIN: float = 0.0
+    STOP_TICKS: int = 3
+    TP_TICKS: int = 4
+    TIME_STOP_BARS: int = 20
+
+
+@dataclass
 class EntryAlphaParams:
     obra: OBRAParams = field(default_factory=OBRAParams)
     apb: APBParams = field(default_factory=APBParams)
     pbra: PBRAParams = field(default_factory=PBRAParams)
+    pflft: PFLFTParams = field(default_factory=PFLFTParams)
 
 
 @dataclass
@@ -90,6 +104,11 @@ class PBRAState:
 
 
 @dataclass
+class PFLFTState:
+    last_signal_bar: int = -1
+
+
+@dataclass
 class EntryDecision:
     signal: int = 0
     family: str = ""
@@ -100,6 +119,17 @@ class EntryDecision:
     tp1_price: float | None = None
     tp2_price: float | None = None
     time_stop_bars: int | None = None
+    flow_sum_signed: float | None = None
+    flow_intensity: float | None = None
+    lag_score: float | None = None
+    spread_ticks: float | None = None
+    dmid_ticks: float | None = None
+    depth_min: float | None = None
+    proof_bars: int | None = None
+    proof_ticks: int | None = None
+    proof_min_flow: float | None = None
+    confirm_min_abs_ofid: float | None = None
+    confirm_min_flow_sum: float | None = None
 
 
 class EntryAlphaEngine:
@@ -109,6 +139,14 @@ class EntryAlphaEngine:
         self.obra_state = OBRAState()
         self.apb_state = APBState()
         self.pbra_state = PBRAState()
+        self.pflft_state = PFLFTState()
+        self.pflft_stats = {
+            "candidates": 0,
+            "blocked_spread": 0,
+            "blocked_depth": 0,
+            "blocked_dmid": 0,
+            "blocked_lag": 0,
+        }
 
     def _px(self, ticks: float) -> float:
         return float(ticks) * self.tick_size
@@ -124,6 +162,9 @@ class EntryAlphaEngine:
         if decision.signal != 0:
             return decision
         decision = self._apb_v1(i, hist, gates_ok_long, gates_ok_short)
+        if decision.signal != 0:
+            return decision
+        decision = self._pflft_v1(i, hist, gates_ok_long, gates_ok_short)
         if decision.signal != 0:
             return decision
         return self._pbra_v1(i, hist, gates_ok_long, gates_ok_short)
@@ -374,6 +415,91 @@ class EntryAlphaEngine:
                 arm_bar=i,
                 pullback_seen=False,
             )
+        return decision
+
+    def _pflft_v1(self, i: int, hist: Dict[str, np.ndarray], gates_ok_long: bool, gates_ok_short: bool) -> EntryDecision:
+        p = self.params.pflft
+        last = float(hist["last"][i])
+        spread_ticks = float(hist["spread_ticks"][i])
+        depth_bid = hist.get("depth_bid", np.array([], dtype=float))
+        depth_ask = hist.get("depth_ask", np.array([], dtype=float))
+        ofid = hist["ofid"]
+        price_ref = hist.get("mid", hist["last"])
+        decision = EntryDecision()
+
+        if spread_ticks > p.SPREAD_MAX:
+            self.pflft_stats["blocked_spread"] += 1
+            return decision
+
+        depth_min = float("nan")
+        if depth_bid.size and depth_ask.size:
+            bid_depth = float(depth_bid[i])
+            ask_depth = float(depth_ask[i])
+            if np.isfinite(bid_depth) and np.isfinite(ask_depth):
+                depth_min = float(min(bid_depth, ask_depth))
+                if p.DEPTH_MIN > 0.0 and depth_min < p.DEPTH_MIN:
+                    self.pflft_stats["blocked_depth"] += 1
+                    return decision
+
+        w = int(p.FLOW_WIN_BARS)
+        if w <= 0 or i < w:
+            return decision
+
+        start = max(0, i - w + 1)
+        flow_window = ofid[start : i + 1]
+        if flow_window.size == 0:
+            return decision
+        flow_sum_signed = float(np.nansum(flow_window))
+        flow_intensity = float(np.nansum(np.abs(flow_window)))
+
+        dmid_ticks = float("nan")
+        if i - w >= 0:
+            dmid_ticks = (float(price_ref[i]) - float(price_ref[i - w])) / self.tick_size
+        if np.isfinite(dmid_ticks) and abs(dmid_ticks) > p.DMID_ABS_MAX_TICKS:
+            self.pflft_stats["blocked_dmid"] += 1
+            return decision
+
+        lag_score = float("nan")
+        if np.isfinite(dmid_ticks):
+            lag_score = flow_intensity / (abs(dmid_ticks) + 1e-9)
+        if flow_intensity < p.FLOW_INTENSITY_MIN or (
+            np.isfinite(lag_score) and lag_score < p.LAG_SCORE_MIN
+        ):
+            self.pflft_stats["blocked_lag"] += 1
+            return decision
+
+        if flow_sum_signed > 0 and gates_ok_long:
+            entry_px = last
+            decision.signal = 1
+            decision.family = "PFLFT_v1"
+            decision.reason = "PFLFT_LONG_LAG"
+            decision.setup_bar = i
+            decision.entry_lvl = entry_px
+            decision.stop_price = self._sub_ticks(entry_px, p.STOP_TICKS)
+            decision.tp1_price = self._add_ticks(entry_px, p.TP_TICKS)
+            decision.tp2_price = self._add_ticks(entry_px, p.TP_TICKS * 2)
+            decision.time_stop_bars = p.TIME_STOP_BARS
+        elif flow_sum_signed < 0 and gates_ok_short:
+            entry_px = last
+            decision.signal = -1
+            decision.family = "PFLFT_v1"
+            decision.reason = "PFLFT_SHORT_LAG"
+            decision.setup_bar = i
+            decision.entry_lvl = entry_px
+            decision.stop_price = self._add_ticks(entry_px, p.STOP_TICKS)
+            decision.tp1_price = self._sub_ticks(entry_px, p.TP_TICKS)
+            decision.tp2_price = self._sub_ticks(entry_px, p.TP_TICKS * 2)
+            decision.time_stop_bars = p.TIME_STOP_BARS
+        else:
+            return decision
+
+        decision.flow_sum_signed = flow_sum_signed
+        decision.flow_intensity = flow_intensity
+        decision.lag_score = lag_score
+        decision.spread_ticks = spread_ticks
+        decision.dmid_ticks = dmid_ticks
+        decision.depth_min = depth_min
+        self.pflft_stats["candidates"] += 1
         return decision
 
 
