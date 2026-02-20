@@ -1,0 +1,83 @@
+{
+  "run_id": "openclaw_v1",
+  "strategy_mode": "entry_alpha_v1",
+  "family_allowlist": ["PFLFT_v1"],
+  "fixed_env": {
+    "VALIDATE_DEBUG": "1",
+    "ENTRY_CONFIRM_STYLE": "price_only",
+    "ENTRY_CONFIRM_BARS": "2",
+    "DISABLE_GATE": "0",
+    "PNL_TICK_VALUE": "12.5",
+    "PNL_COMMISSION_ROUND_TURN": "1.2",
+    "PNL_SLIPPAGE_TICKS": "1",
+    "PFLFT_STOP_TICKS": "3",
+    "PFLFT_TP_TICKS": "4",
+    "PFLFT_TIME_STOP_BARS": "20"
+  },
+  "data_days": {
+    "train_start": "2025-12-01",
+    "train_end": "2025-12-12",
+    "lock_start": "2025-12-13",
+    "lock_end": "2025-12-18"
+  },
+  "min_trades": { "train": 120, "lock": 50 },
+  "risk_limits": {
+    "daily_loss_limit_ticks": 80,
+    "trailing_dd_limit_ticks": 160
+  },
+  "grid": [
+    {
+      "name": "A_baseline",
+      "env": {
+        "PFLFT_FLOW_WIN_BARS": "20",
+        "PFLFT_SPREAD_MAX": "1",
+        "PFLFT_DMID_ABS_MAX_TICKS": "2",
+        "PFLFT_LAG_SCORE_MIN": "10",
+        "PFLFT_PROOF_MAX_BARS": "0",
+        "PFLFT_PROOF_TICKS": "1",
+        "PFLFT_CONFIRM_MIN_ABS_OFID": "5",
+        "PFLFT_CONFIRM_MIN_FLOW_SUM": "0"
+      }
+    },
+    {
+      "name": "B_proof",
+      "env": {
+        "PFLFT_FLOW_WIN_BARS": "20",
+        "PFLFT_SPREAD_MAX": "1",
+        "PFLFT_DMID_ABS_MAX_TICKS": "2",
+        "PFLFT_LAG_SCORE_MIN": "10",
+        "PFLFT_PROOF_MAX_BARS": "5",
+        "PFLFT_PROOF_TICKS": "1",
+        "PFLFT_PROOF_MIN_FLOW": "0",
+        "PFLFT_CONFIRM_MIN_ABS_OFID": "5",
+        "PFLFT_CONFIRM_MIN_FLOW_SUM": "0"
+      }
+    },
+    {
+      "name": "C_strong",
+      "env": {
+        "PFLFT_FLOW_WIN_BARS": "20",
+        "PFLFT_SPREAD_MAX": "1",
+        "PFLFT_DMID_ABS_MAX_TICKS": "1",
+        "PFLFT_LAG_SCORE_MIN": "10",
+        "PFLFT_PROOF_MAX_BARS": "5",
+        "PFLFT_PROOF_TICKS": "1",
+        "PFLFT_CONFIRM_MIN_ABS_OFID": "8",
+        "PFLFT_CONFIRM_MIN_FLOW_SUM": "5"
+      }
+    },
+    {
+      "name": "D_righttail",
+      "env": {
+        "PFLFT_FLOW_WIN_BARS": "20",
+        "PFLFT_SPREAD_MAX": "1",
+        "PFLFT_DMID_ABS_MAX_TICKS": "1",
+        "PFLFT_LAG_SCORE_MIN": "10",
+        "PFLFT_PROOF_MAX_BARS": "5",
+        "PFLFT_PROOF_TICKS": "2",
+        "PFLFT_CONFIRM_MIN_ABS_OFID": "8",
+        "PFLFT_CONFIRM_MIN_FLOW_SUM": "8"
+      }
+    }
+  ]
+}
