@@ -7,10 +7,10 @@ When invoked:
 
 1) Generate a RUN_ID (timestamp or passed arg).
 2) Execute:
-   python scripts/experiment_agent.py --config configs/experiment_agent.json --outdir artifacts/experiment_agent/${RUN_ID}
+   python scripts/experiment_orchestrator.py --config configs/experiment_orchestrator.json --outdir artifacts/experiment_orchestrator/${RUN_ID}
 3) After completion:
-   - Print path to report.md
-   - Print top 3 rows from comparison.csv
+   - Print path to orchestrator_report.json
+   - Print last comparison.csv from the final iteration
    - Print whether any run breached daily loss or trailing DD
 
 Security:

@@ -1,0 +1,27 @@
+{
+  "experiment_config": "configs/experiment_agent.json",
+  "ideas_agent": "ideas",
+  "coding_agent": "coding",
+  "max_iterations": 5,
+  "max_no_improve": 2,
+  "pivot_min_lock_ev": -0.25,
+  "pivot_min_lock_ev_iterations": 30,
+  "pivot_family_fail_limit": 3,
+  "max_proposal_attempts": 2,
+  "max_patch_attempts": 2,
+  "allowed_files": [
+    "src/entry_alpha.py",
+    "configs/experiment_agent.json"
+  ],
+  "allowed_knobs": {
+    "PFLFT_FLOW_WIN_BARS": ["10", "20", "40"],
+    "PFLFT_SPREAD_MAX": ["1", "2"],
+    "PFLFT_DMID_ABS_MAX_TICKS": ["1", "2"],
+    "PFLFT_LAG_SCORE_MIN": ["low", "mid", "high", "10"],
+    "PFLFT_PROOF_MAX_BARS": ["0", "3", "5"],
+    "PFLFT_PROOF_TICKS": ["1", "2"],
+    "PFLFT_CONFIRM_MIN_ABS_OFID": ["5", "8", "12"],
+    "PFLFT_CONFIRM_MIN_FLOW_SUM": ["0", "5", "8"],
+    "PFLFT_PROOF_MIN_FLOW": ["0", "5", "8"]
+  }
+}
