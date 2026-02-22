@@ -3,7 +3,7 @@
   "strategy_mode": "entry_alpha_v1",
   "family_allowlist": ["PFLFT_v1"],
   "fixed_env": {
-    "VALIDATE_DEBUG": "1",
+    "VALIDATE_DEBUG": "0",
     "ENTRY_CONFIRM_STYLE": "price_only",
     "ENTRY_CONFIRM_BARS": "2",
     "DISABLE_GATE": "0",

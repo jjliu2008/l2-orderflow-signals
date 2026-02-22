@@ -7,8 +7,9 @@
   "pivot_min_lock_ev": -0.25,
   "pivot_min_lock_ev_iterations": 30,
   "pivot_family_fail_limit": 3,
-  "max_proposal_attempts": 2,
-  "max_patch_attempts": 2,
+  "max_proposal_attempts": 1,
+  "max_patch_attempts": 1,
+  "rotation_request_limit": 2,
   "allowed_files": [
     "src/entry_alpha.py",
     "configs/experiment_agent.json"

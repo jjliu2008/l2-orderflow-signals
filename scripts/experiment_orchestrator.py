@@ -45,6 +45,7 @@ class OrchestratorConfig:
     allowed_knobs: Dict[str, List[str]]
     max_proposal_attempts: int
     max_patch_attempts: int
+    rotation_request_limit: int
 
 
 def _load_json(path: Path) -> Dict[str, object]:
@@ -218,6 +219,7 @@ def _load_orchestrator_config(path: Path, outdir: Path) -> OrchestratorConfig:
         allowed_knobs={str(k): [str(v) for v in vals] for k, vals in raw.get("allowed_knobs", {}).items()},
         max_proposal_attempts=int(raw.get("max_proposal_attempts", 2)),
         max_patch_attempts=int(raw.get("max_patch_attempts", 2)),
+        rotation_request_limit=int(raw.get("rotation_request_limit", 2)),
     )
 
 
@@ -236,6 +238,7 @@ def run_orchestrator(config_path: Path, outdir: Path) -> None:
     last_family = _family_id(cfg.experiment_config)
 
     for iteration in range(1, cfg.max_iterations + 1):
+        rotation_calls = 0
         current_family = _family_id(cfg.experiment_config)
         if current_family != last_family:
             prev_best = family_best.get(last_family, float("-inf"))
@@ -307,7 +310,11 @@ def run_orchestrator(config_path: Path, outdir: Path) -> None:
         proposal = None
         proposal_text = ""
         for _ in range(cfg.max_proposal_attempts):
+            if rotation_calls >= cfg.rotation_request_limit:
+                stop_reason = "rotation_request_limit"
+                break
             proposal_text = _run_openclaw_agent(cfg.ideas_agent, idea_prompt)
+            rotation_calls += 1
             try:
                 proposal = _extract_json_block(proposal_text)
                 break
@@ -333,7 +340,11 @@ def run_orchestrator(config_path: Path, outdir: Path) -> None:
 
         patches = None
         for _ in range(cfg.max_patch_attempts):
+            if rotation_calls >= cfg.rotation_request_limit:
+                stop_reason = "rotation_request_limit"
+                break
             patch_text = _run_openclaw_agent(cfg.coding_agent, coding_prompt)
+            rotation_calls += 1
             try:
                 patches = _extract_json_block(patch_text)
                 break

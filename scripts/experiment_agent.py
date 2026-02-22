@@ -352,11 +352,11 @@ def _check_artifacts(run_dir: Path) -> List[str]:
     missing = []
     for req in required:
         if req.endswith(".csv"):
-            path = run_dir / req
-            if not path.exists():
+            found = any(p.name == req for p in run_dir.rglob(req))
+            if not found:
                 missing.append(req)
         else:
-            found = any(p.name.startswith(req) for p in run_dir.iterdir())
+            found = any(p.name.startswith(req) for p in run_dir.rglob("*"))
             if not found:
                 missing.append(req)
     return missing
@@ -545,7 +545,10 @@ def run_experiments(config_path: Path, outdir: Path, dry_run: bool = False, max_
         if df.empty:
             fh.write("No runs completed.\n")
         else:
-            fh.write(df.head(5).to_markdown(index=False))
+            try:
+                fh.write(df.head(5).to_markdown(index=False))
+            except ImportError:
+                fh.write(df.head(5).to_string(index=False))
             fh.write("\n")
 
     manifest = {
