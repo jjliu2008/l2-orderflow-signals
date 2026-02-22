@@ -30,6 +30,45 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EXPERIMENT_AGENT = PROJECT_ROOT / "scripts" / "experiment_agent.py"
 
 
+def _pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        proc = subprocess.run(
+            ["powershell", "-Command", f"Get-Process -Id {pid} -ErrorAction SilentlyContinue"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        return "ProcessName" in proc.stdout
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _acquire_lock(outdir: Path) -> Path:
+    lock_path = outdir / ".experiment_orchestrator.lock"
+    if lock_path.exists():
+        try:
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            pid = int(payload.get("pid", 0))
+        except Exception:
+            pid = 0
+        if _pid_running(pid):
+            raise RuntimeError(
+                f"experiment_orchestrator already running (pid={pid}). Remove {lock_path} if stale."
+            )
+    outdir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(
+        json.dumps({"pid": os.getpid(), "started_at": time.time()}, indent=2),
+        encoding="utf-8",
+    )
+    return lock_path
+
+
 @dataclass(frozen=True)
 class OrchestratorConfig:
     experiment_config: Path
@@ -226,7 +265,7 @@ def _load_orchestrator_config(path: Path, outdir: Path) -> OrchestratorConfig:
 def run_orchestrator(config_path: Path, outdir: Path) -> None:
     cfg = _load_orchestrator_config(config_path, outdir)
     baseline_config = _load_json(cfg.experiment_config)
-    outdir.mkdir(parents=True, exist_ok=True)
+    lock_path = _acquire_lock(outdir)
     history: List[Dict[str, object]] = []
 
     best_expectancy = float("-inf")
@@ -237,145 +276,151 @@ def run_orchestrator(config_path: Path, outdir: Path) -> None:
     consecutive_failed_families = 0
     last_family = _family_id(cfg.experiment_config)
 
-    for iteration in range(1, cfg.max_iterations + 1):
-        rotation_calls = 0
-        current_family = _family_id(cfg.experiment_config)
-        if current_family != last_family:
-            prev_best = family_best.get(last_family, float("-inf"))
-            if prev_best <= 0.0:
-                consecutive_failed_families += 1
+    try:
+        for iteration in range(1, cfg.max_iterations + 1):
+            rotation_calls = 0
+            current_family = _family_id(cfg.experiment_config)
+            if current_family != last_family:
+                prev_best = family_best.get(last_family, float("-inf"))
+                if prev_best <= 0.0:
+                    consecutive_failed_families += 1
+                else:
+                    consecutive_failed_families = 0
+                last_family = current_family
+
+            iter_dir = outdir / f"iter_{iteration:02d}"
+            comparison_path = _run_experiment_agent(cfg.experiment_config, iter_dir)
+            summary = _summarize_results(comparison_path)
+            current_best = _best_lock_expectancy(comparison_path)
+
+            family_best[current_family] = max(current_best, family_best.get(current_family, float("-inf")))
+            if not family_order or family_order[-1] != current_family:
+                family_order.append(current_family)
+
+            history.append(
+                {
+                    "iteration": iteration,
+                    "family": current_family,
+                    "comparison_path": str(comparison_path),
+                    "best_lock_expectancy": current_best,
+                }
+            )
+
+            if current_best > best_expectancy:
+                best_expectancy = current_best
+                no_improve = 0
             else:
-                consecutive_failed_families = 0
-            last_family = current_family
+                no_improve += 1
 
-        iter_dir = outdir / f"iter_{iteration:02d}"
-        comparison_path = _run_experiment_agent(cfg.experiment_config, iter_dir)
-        summary = _summarize_results(comparison_path)
-        current_best = _best_lock_expectancy(comparison_path)
-
-        family_best[current_family] = max(current_best, family_best.get(current_family, float("-inf")))
-        if not family_order or family_order[-1] != current_family:
-            family_order.append(current_family)
-
-        history.append(
-            {
-                "iteration": iteration,
-                "family": current_family,
-                "comparison_path": str(comparison_path),
-                "best_lock_expectancy": current_best,
-            }
-        )
-
-        if current_best > best_expectancy:
-            best_expectancy = current_best
-            no_improve = 0
-        else:
-            no_improve += 1
-
-        if (
-            iteration >= cfg.pivot_min_lock_ev_iterations
-            and best_expectancy < cfg.pivot_min_lock_ev
-        ):
-            stop_reason = "pivot_min_lock_ev"
-            break
-
-        if consecutive_failed_families >= cfg.pivot_family_fail_limit:
-            stop_reason = "pivot_family_fail_limit"
-            break
-
-        if no_improve >= cfg.max_no_improve:
-            stop_reason = "no_improve"
-            break
-
-        idea_prompt = (
-            "You are the ideas agent. Propose a new experiment configuration.\n"
-            "Return ONLY JSON matching this schema:\n"
-            "{\n"
-            '  "rationale": "...",\n'
-            '  "expected_metrics": ["lock_expectancy_ticks", "trade_count"],\n'
-            '  "changes": [\n'
-            '    {"file": "src/entry_alpha.py", "patch": ""},\n'
-            '    {"file": "configs/experiment_agent.json", "patch": ""}\n'
-            "  ],\n"
-            '  "grid": ["A_baseline", "B_proof"]\n'
-            "}\n"
-            "Guardrails:\n"
-            "- Do not modify cost model, exits, or data range.\n"
-            "- Only adjust allowed knobs in grid env.\n"
-            f"- Allowed knobs: {json.dumps(cfg.allowed_knobs)}\n"
-            "Recent results:\n"
-            f"{summary}\n"
-        )
-
-        proposal = None
-        proposal_text = ""
-        for _ in range(cfg.max_proposal_attempts):
-            if rotation_calls >= cfg.rotation_request_limit:
-                stop_reason = "rotation_request_limit"
+            if (
+                iteration >= cfg.pivot_min_lock_ev_iterations
+                and best_expectancy < cfg.pivot_min_lock_ev
+            ):
+                stop_reason = "pivot_min_lock_ev"
                 break
-            proposal_text = _run_openclaw_agent(cfg.ideas_agent, idea_prompt)
-            rotation_calls += 1
+
+            if consecutive_failed_families >= cfg.pivot_family_fail_limit:
+                stop_reason = "pivot_family_fail_limit"
+                break
+
+            if no_improve >= cfg.max_no_improve:
+                stop_reason = "no_improve"
+                break
+
+            idea_prompt = (
+                "You are the ideas agent. Propose a new experiment configuration.\n"
+                "Return ONLY JSON matching this schema:\n"
+                "{\n"
+                '  "rationale": "...",\n'
+                '  "expected_metrics": ["lock_expectancy_ticks", "trade_count"],\n'
+                '  "changes": [\n'
+                '    {"file": "src/entry_alpha.py", "patch": ""},\n'
+                '    {"file": "configs/experiment_agent.json", "patch": ""}\n'
+                "  ],\n"
+                '  "grid": ["A_baseline", "B_proof"]\n'
+                "}\n"
+                "Guardrails:\n"
+                "- Do not modify cost model, exits, or data range.\n"
+                "- Only adjust allowed knobs in grid env.\n"
+                f"- Allowed knobs: {json.dumps(cfg.allowed_knobs)}\n"
+                "Recent results:\n"
+                f"{summary}\n"
+            )
+
+            proposal = None
+            proposal_text = ""
+            for _ in range(cfg.max_proposal_attempts):
+                if rotation_calls >= cfg.rotation_request_limit:
+                    stop_reason = "rotation_request_limit"
+                    break
+                proposal_text = _run_openclaw_agent(cfg.ideas_agent, idea_prompt)
+                rotation_calls += 1
+                try:
+                    proposal = _extract_json_block(proposal_text)
+                    break
+                except Exception:
+                    proposal = None
+            if proposal is None:
+                break
+
+            changes = proposal.get("changes", [])
+            if not isinstance(changes, list) or not changes:
+                break
+
+            target_files = [c.get("file") for c in changes if isinstance(c, dict)]
+            if any(f not in cfg.allowed_files for f in target_files):
+                break
+
+            coding_prompt = (
+                "You are the coding agent. Produce unified diffs for the proposal below.\n"
+                "Return ONLY JSON:\n"
+                "{ \"patches\": [ {\"file\": \"path\", \"patch\": \"...\"} ] }\n\n"
+                f"Proposal JSON:\n{json.dumps(proposal, indent=2)}\n"
+            )
+
+            patches = None
+            for _ in range(cfg.max_patch_attempts):
+                if rotation_calls >= cfg.rotation_request_limit:
+                    stop_reason = "rotation_request_limit"
+                    break
+                patch_text = _run_openclaw_agent(cfg.coding_agent, coding_prompt)
+                rotation_calls += 1
+                try:
+                    patches = _extract_json_block(patch_text)
+                    break
+                except Exception:
+                    patches = None
+            if patches is None or "patches" not in patches:
+                break
+
+            patch_list = patches.get("patches", [])
+            if not isinstance(patch_list, list) or not patch_list:
+                break
+
+            before_config_text = cfg.experiment_config.read_text(encoding="utf-8")
             try:
-                proposal = _extract_json_block(proposal_text)
-                break
+                for patch_item in patch_list:
+                    patch = patch_item.get("patch", "")
+                    if not patch.strip():
+                        continue
+                    diff_files = _diff_files_from_patch(patch)
+                    if any(f not in cfg.allowed_files for f in diff_files):
+                        raise RuntimeError(f"Patch touches disallowed files: {diff_files}")
+                    _apply_patch(patch)
+
+                updated_config = _load_json(cfg.experiment_config)
+                ok, reason = _validate_config_guardrails(baseline_config, updated_config, cfg.allowed_knobs)
+                if not ok:
+                    cfg.experiment_config.write_text(before_config_text, encoding="utf-8")
+                    break
             except Exception:
-                proposal = None
-        if proposal is None:
-            break
-
-        changes = proposal.get("changes", [])
-        if not isinstance(changes, list) or not changes:
-            break
-
-        target_files = [c.get("file") for c in changes if isinstance(c, dict)]
-        if any(f not in cfg.allowed_files for f in target_files):
-            break
-
-        coding_prompt = (
-            "You are the coding agent. Produce unified diffs for the proposal below.\n"
-            "Return ONLY JSON:\n"
-            "{ \"patches\": [ {\"file\": \"path\", \"patch\": \"...\"} ] }\n\n"
-            f"Proposal JSON:\n{json.dumps(proposal, indent=2)}\n"
-        )
-
-        patches = None
-        for _ in range(cfg.max_patch_attempts):
-            if rotation_calls >= cfg.rotation_request_limit:
-                stop_reason = "rotation_request_limit"
-                break
-            patch_text = _run_openclaw_agent(cfg.coding_agent, coding_prompt)
-            rotation_calls += 1
-            try:
-                patches = _extract_json_block(patch_text)
-                break
-            except Exception:
-                patches = None
-        if patches is None or "patches" not in patches:
-            break
-
-        patch_list = patches.get("patches", [])
-        if not isinstance(patch_list, list) or not patch_list:
-            break
-
-        before_config_text = cfg.experiment_config.read_text(encoding="utf-8")
-        try:
-            for patch_item in patch_list:
-                patch = patch_item.get("patch", "")
-                if not patch.strip():
-                    continue
-                diff_files = _diff_files_from_patch(patch)
-                if any(f not in cfg.allowed_files for f in diff_files):
-                    raise RuntimeError(f"Patch touches disallowed files: {diff_files}")
-                _apply_patch(patch)
-
-            updated_config = _load_json(cfg.experiment_config)
-            ok, reason = _validate_config_guardrails(baseline_config, updated_config, cfg.allowed_knobs)
-            if not ok:
                 cfg.experiment_config.write_text(before_config_text, encoding="utf-8")
                 break
+    finally:
+        try:
+            lock_path.unlink(missing_ok=True)
         except Exception:
-            cfg.experiment_config.write_text(before_config_text, encoding="utf-8")
-            break
+            pass
 
     report = {
         "best_lock_expectancy": best_expectancy,

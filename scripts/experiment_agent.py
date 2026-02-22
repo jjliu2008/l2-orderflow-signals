@@ -26,6 +26,45 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BACKTEST_SCRIPT = PROJECT_ROOT / "scripts" / "run_lrams_gate_backtest.py"
 
+
+def _pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        proc = subprocess.run(
+            ["powershell", "-Command", f"Get-Process -Id {pid} -ErrorAction SilentlyContinue"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        return "ProcessName" in proc.stdout
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _acquire_lock(outdir: Path) -> Path:
+    lock_path = outdir / ".experiment_agent.lock"
+    if lock_path.exists():
+        try:
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            pid = int(payload.get("pid", 0))
+        except Exception:
+            pid = 0
+        if _pid_running(pid):
+            raise RuntimeError(
+                f"experiment_agent already running (pid={pid}). Remove {lock_path} if stale."
+            )
+    outdir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(
+        json.dumps({"pid": os.getpid(), "started_at": time.time()}, indent=2),
+        encoding="utf-8",
+    )
+    return lock_path
+
 DATA_RANGE_KEYS = {
     "TEST_DAYS",
     "START_DATE",
@@ -376,6 +415,7 @@ def _split_trades(trades: pd.DataFrame, train_days: List[str], lock_days: List[s
 
 def run_experiments(config_path: Path, outdir: Path, dry_run: bool = False, max_runs: int | None = None) -> pd.DataFrame:
     config = _parse_config(config_path)
+    lock_path = _acquire_lock(outdir)
     guard = _validate_guardrails(config)
 
     fixed_env = _ensure_fixed_env(config)
@@ -409,16 +449,17 @@ def run_experiments(config_path: Path, outdir: Path, dry_run: bool = False, max_
     runs_dir.mkdir(parents=True, exist_ok=True)
 
     rows: List[Dict[str, object]] = []
-    for entry in grid:
-        name = entry.get("name")
-        env_overrides = entry.get("env", {})
-        if not name or not isinstance(env_overrides, dict):
-            raise ValueError("Each grid entry must include name and env dict.")
-        env_overrides = {str(k): str(v) for k, v in env_overrides.items()}
-        _check_grid_env(env_overrides, fixed_env)
+    try:
+        for entry in grid:
+            name = entry.get("name")
+            env_overrides = entry.get("env", {})
+            if not name or not isinstance(env_overrides, dict):
+                raise ValueError("Each grid entry must include name and env dict.")
+            env_overrides = {str(k): str(v) for k, v in env_overrides.items()}
+            _check_grid_env(env_overrides, fixed_env)
 
-        run_env = os.environ.copy()
-        run_env.update(fixed_env)
+            run_env = os.environ.copy()
+            run_env.update(fixed_env)
         run_env.update(env_overrides)
         run_env["TEST_DAYS"] = ",".join(days)
 
@@ -487,7 +528,7 @@ def run_experiments(config_path: Path, outdir: Path, dry_run: bool = False, max_
         if missing:
             status = "INVALID"
 
-        rows.append(
+            rows.append(
             {
                 "name": name,
                 "run_dir": str(run_dir),
@@ -512,7 +553,12 @@ def run_experiments(config_path: Path, outdir: Path, dry_run: bool = False, max_
                 "missing_artifacts": ";".join(missing),
                 "failure_reason": "",
             }
-        )
+            )
+    finally:
+        try:
+            lock_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     df = pd.DataFrame(rows)
     if not df.empty:
