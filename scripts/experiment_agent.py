@@ -47,7 +47,7 @@ def _pid_running(pid: int) -> bool:
 
 
 def _acquire_lock(outdir: Path) -> Path:
-    lock_path = outdir / ".experiment_agent.lock"
+    lock_path = PROJECT_ROOT / ".experiment_agent.lock"
     if lock_path.exists():
         try:
             payload = json.loads(lock_path.read_text(encoding="utf-8"))
@@ -213,7 +213,7 @@ def _check_grid_env(grid_env: Dict[str, str], fixed_env: Dict[str, str]) -> None
             raise ValueError(f"Grid env may not override fixed strategy key: {key}")
 
 
-def _compute_cost_ticks(env: Dict[str, str]) -> float:
+def _compute_cost_ticks(env: Dict[str, str], cost_mode: str = "commission_only") -> float:
     for key in COST_KEYS:
         if key not in env and key not in os.environ:
             raise ValueError(f"Cost key {key} must be set in fixed_env or environment.")
@@ -221,7 +221,17 @@ def _compute_cost_ticks(env: Dict[str, str]) -> float:
     commission_rt = float(env.get("PNL_COMMISSION_ROUND_TURN", os.environ.get("PNL_COMMISSION_ROUND_TURN", "1.2")))
     slippage_ticks = float(env.get("PNL_SLIPPAGE_TICKS", os.environ.get("PNL_SLIPPAGE_TICKS", "1")))
     commission_ticks = commission_rt / tick_value if tick_value > 0 else 0.0
-    return float(slippage_ticks) + float(commission_ticks)
+    mode = str(cost_mode).strip().lower()
+    if mode == "none":
+        return 0.0
+    if mode == "round_trip":
+        return float(slippage_ticks) + float(commission_ticks)
+    if mode != "commission_only":
+        raise ValueError(
+            f"Unsupported cost_mode={cost_mode!r}. Expected one of: commission_only, round_trip, none."
+        )
+    # trades_*.csv PnL is already based on executable prices, so subtract commission by default.
+    return float(commission_ticks)
 
 
 def _order_trades(trades: pd.DataFrame) -> pd.DataFrame:
@@ -374,7 +384,11 @@ def _load_trades(run_dir: Path) -> pd.DataFrame:
     matches = list(run_dir.glob("trades_entry_alpha_v1_W*_gate_*_baseline_vs_gated.csv"))
     if not matches:
         raise FileNotFoundError(f"Missing trades csv in {run_dir}")
-    df = pd.read_csv(matches[0])
+    # Deterministic selection if multiple windows/modes are present in one run dir.
+    side_matched = [p for p in matches if "_gate_side_matched_" in p.name]
+    candidates = side_matched if side_matched else matches
+    candidates = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+    df = pd.read_csv(candidates[0])
     if "strategy" in df.columns:
         df = df[df["strategy"] == "gated"].copy()
     return df
@@ -436,7 +450,8 @@ def run_experiments(config_path: Path, outdir: Path, dry_run: bool = False, max_
     if not train_days or not lock_days:
         raise ValueError("Train or lock days missing; check data availability.")
 
-    cost_ticks = _compute_cost_ticks(fixed_env)
+    cost_mode = str(config.get("cost_mode", "commission_only"))
+    cost_ticks = _compute_cost_ticks(fixed_env, cost_mode=cost_mode)
 
     grid = config.get("grid", [])
     if not isinstance(grid, list) or not grid:
@@ -460,99 +475,99 @@ def run_experiments(config_path: Path, outdir: Path, dry_run: bool = False, max_
 
             run_env = os.environ.copy()
             run_env.update(fixed_env)
-        run_env.update(env_overrides)
-        run_env["TEST_DAYS"] = ",".join(days)
+            run_env.update(env_overrides)
+            run_env["TEST_DAYS"] = ",".join(days)
 
-        run_root = runs_dir / name
-        run_root.mkdir(parents=True, exist_ok=True)
-        artifacts_dir = run_root / "artifacts"
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-        run_env["OUTPUT_DIR"] = str(artifacts_dir)
+            run_root = runs_dir / name
+            run_root.mkdir(parents=True, exist_ok=True)
+            artifacts_dir = run_root / "artifacts"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            run_env["OUTPUT_DIR"] = str(artifacts_dir)
 
-        (run_root / "env.json").write_text(json.dumps(run_env, indent=2), encoding="utf-8")
-        log_path = run_root / "stdout.log"
+            (run_root / "env.json").write_text(json.dumps(run_env, indent=2), encoding="utf-8")
+            log_path = run_root / "stdout.log"
 
-        if dry_run:
-            rows.append(
-                _empty_result_row(
-                    name,
-                    "DRY_RUN",
-                    stdout_log=str(log_path),
-                    failure_reason="dry_run",
+            if dry_run:
+                rows.append(
+                    _empty_result_row(
+                        name,
+                        "DRY_RUN",
+                        stdout_log=str(log_path),
+                        failure_reason="dry_run",
+                    )
                 )
-            )
-            continue
+                continue
 
-        with log_path.open("w", encoding="utf-8") as fh:
-            proc = subprocess.run(
-                [sys.executable, str(BACKTEST_SCRIPT)],
-                cwd=str(PROJECT_ROOT),
-                env=run_env,
-                stdout=fh,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-        if proc.returncode != 0:
-            rows.append(
-                _empty_result_row(
-                    name,
-                    "FAILED",
-                    stdout_log=str(log_path),
-                    exit_code=int(proc.returncode),
-                    failure_reason=f"exit_code:{proc.returncode}",
+            with log_path.open("w", encoding="utf-8") as fh:
+                proc = subprocess.run(
+                    [sys.executable, str(BACKTEST_SCRIPT)],
+                    cwd=str(PROJECT_ROOT),
+                    env=run_env,
+                    stdout=fh,
+                    stderr=subprocess.STDOUT,
+                    check=False,
                 )
+            if proc.returncode != 0:
+                rows.append(
+                    _empty_result_row(
+                        name,
+                        "FAILED",
+                        stdout_log=str(log_path),
+                        exit_code=int(proc.returncode),
+                        failure_reason=f"exit_code:{proc.returncode}",
+                    )
+                )
+                continue
+
+            run_dir = _find_latest_run_dir(artifacts_dir)
+            missing = _check_artifacts(run_dir)
+            trades = _load_trades(run_dir)
+            train_trades, lock_trades = _split_trades(trades, train_days, lock_days)
+
+            train_metrics = _compute_metrics(train_trades, cost_ticks)
+            lock_metrics = _compute_metrics(lock_trades, cost_ticks)
+            lock_risk = _risk_metrics(lock_trades, cost_ticks, guard)
+
+            trade_starve = len(train_trades) < guard.min_trades_train or len(lock_trades) < guard.min_trades_lock
+            disqualified = lock_risk["daily_loss_breaches"] > 0 or lock_risk["trailing_dd_breaches"] > 0
+            good = (
+                lock_metrics["expectancy"] > 0
+                and not trade_starve
+                and not disqualified
             )
-            continue
-
-        run_dir = _find_latest_run_dir(artifacts_dir)
-        missing = _check_artifacts(run_dir)
-        trades = _load_trades(run_dir)
-        train_trades, lock_trades = _split_trades(trades, train_days, lock_days)
-
-        train_metrics = _compute_metrics(train_trades, cost_ticks)
-        lock_metrics = _compute_metrics(lock_trades, cost_ticks)
-        lock_risk = _risk_metrics(lock_trades, cost_ticks, guard)
-
-        trade_starve = len(train_trades) < guard.min_trades_train or len(lock_trades) < guard.min_trades_lock
-        disqualified = lock_risk["daily_loss_breaches"] > 0 or lock_risk["trailing_dd_breaches"] > 0
-        good = (
-            lock_metrics["expectancy"] > 0
-            and not trade_starve
-            and not disqualified
-        )
-        status = "GOOD" if good else "OK"
-        if trade_starve:
-            status = "TRADE_STARVATION"
-        if disqualified:
-            status = "DISQUALIFIED"
-        if missing:
-            status = "INVALID"
+            status = "GOOD" if good else "OK"
+            if trade_starve:
+                status = "TRADE_STARVATION"
+            if disqualified:
+                status = "DISQUALIFIED"
+            if missing:
+                status = "INVALID"
 
             rows.append(
-            {
-                "name": name,
-                "run_dir": str(run_dir),
-                "stdout_log": str(log_path),
-                "exit_code": int(proc.returncode),
-                "trades_train": int(len(train_trades)),
-                "trades_lock": int(len(lock_trades)),
-                "train_expectancy_ticks": train_metrics["expectancy"],
-                "lock_expectancy_ticks": lock_metrics["expectancy"],
-                "lock_net_ticks": lock_metrics["net_ticks"],
-                "lock_win_rate": lock_metrics["win_rate"],
-                "lock_avg_win_ticks": lock_metrics["avg_win"],
-                "lock_avg_loss_ticks": lock_metrics["avg_loss"],
-                "lock_pct_mfe_ge_1": lock_metrics["pct_mfe_ge_1"],
-                "lock_pct_mfe_ge_4": lock_metrics["pct_mfe_ge_4"],
-                "lock_worst_day_ticks": lock_risk["worst_day_ticks"],
-                "lock_max_dd_ticks": lock_risk["max_dd_ticks"],
-                "daily_loss_breaches": lock_risk["daily_loss_breaches"],
-                "trailing_dd_breaches": lock_risk["trailing_dd_breaches"],
-                "min_dd_buffer": lock_risk["min_dd_buffer"],
-                "status": status,
-                "missing_artifacts": ";".join(missing),
-                "failure_reason": "",
-            }
+                {
+                    "name": name,
+                    "run_dir": str(run_dir),
+                    "stdout_log": str(log_path),
+                    "exit_code": int(proc.returncode),
+                    "trades_train": int(len(train_trades)),
+                    "trades_lock": int(len(lock_trades)),
+                    "train_expectancy_ticks": train_metrics["expectancy"],
+                    "lock_expectancy_ticks": lock_metrics["expectancy"],
+                    "lock_net_ticks": lock_metrics["net_ticks"],
+                    "lock_win_rate": lock_metrics["win_rate"],
+                    "lock_avg_win_ticks": lock_metrics["avg_win"],
+                    "lock_avg_loss_ticks": lock_metrics["avg_loss"],
+                    "lock_pct_mfe_ge_1": lock_metrics["pct_mfe_ge_1"],
+                    "lock_pct_mfe_ge_4": lock_metrics["pct_mfe_ge_4"],
+                    "lock_worst_day_ticks": lock_risk["worst_day_ticks"],
+                    "lock_max_dd_ticks": lock_risk["max_dd_ticks"],
+                    "daily_loss_breaches": lock_risk["daily_loss_breaches"],
+                    "trailing_dd_breaches": lock_risk["trailing_dd_breaches"],
+                    "min_dd_buffer": lock_risk["min_dd_buffer"],
+                    "status": status,
+                    "missing_artifacts": ";".join(missing),
+                    "failure_reason": "",
+                }
             )
     finally:
         try:
@@ -603,6 +618,7 @@ def run_experiments(config_path: Path, outdir: Path, dry_run: bool = False, max_
         "days": {"all": days, "train": train_days, "lock": lock_days},
         "fixed_env": fixed_env,
         "grid": config.get("grid", []),
+        "cost_mode": cost_mode,
         "cost_ticks": cost_ticks,
     }
     (outdir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

@@ -90,6 +90,7 @@ Baseline:
   PFLFT_DMID_ABS_MAX_TICKS PFLFT max abs dmid ticks (default: 1)
   PFLFT_FLOW_INTENSITY_MIN PFLFT min flow intensity (default: 0)
   PFLFT_LAG_SCORE_MIN      PFLFT min lag score (default: 0)
+  PFLFT_LAG_DMID_FLOOR_TICKS floor (ticks) for lag-score dmid denominator (default: 1)
   PFLFT_PROOF_MAX_BARS     PFLFT proof window bars (default: 5)
   PFLFT_PROOF_TICKS        PFLFT proof ticks (default: 1)
   PFLFT_PROOF_MIN_FLOW     PFLFT min aligned flow sum in proof window (default: 0)
@@ -102,6 +103,7 @@ Baseline:
   PNL_COMMISSION_PER_SIDE commission per side in $ (default: 0)
   PNL_COMMISSION_ROUND_TURN commission per round turn in $ (default: unset)
   PNL_SLIPPAGE_TICKS      round-turn slippage in ticks (default: 0)
+  PNL_COST_MODE           commission_only|round_trip|none (default: commission_only)
   PNL_DAILY_LOSS_LIMIT    daily loss limit in $ (default: 0 = off)
   PNL_MAX_DRAWDOWN_LIMIT  max intraday drawdown limit in $ (default: 0 = off)
   PNL_PRINT_TRADES        print per-trade PnL lines (default: 0)
@@ -6273,13 +6275,23 @@ def _trade_cost_ticks(
     commission_per_side: float,
     commission_round_turn: float | None,
     slippage_ticks: float,
+    cost_mode: str = "commission_only",
 ) -> float:
+    mode = str(cost_mode).strip().lower()
+    if mode == "none":
+        return 0.0
     if tick_value <= 0:
-        return float(slippage_ticks)
+        return float(slippage_ticks) if mode == "round_trip" else 0.0
     if commission_round_turn is None:
         commission_round_turn = float(commission_per_side) * 2.0
     commission_ticks = float(commission_round_turn) / float(tick_value) if tick_value > 0 else 0.0
-    return float(slippage_ticks) + float(commission_ticks)
+    if mode == "round_trip":
+        return float(slippage_ticks) + float(commission_ticks)
+    if mode == "commission_only":
+        return float(commission_ticks)
+    raise ValueError(
+        f"Unsupported PNL_COST_MODE={cost_mode!r}. Expected one of: commission_only, round_trip, none."
+    )
 
 
 def _order_pnl(
@@ -6436,6 +6448,7 @@ def _apply_entry_alpha_overrides(params: EntryAlphaParams) -> None:
     pflft_dmid_env = os.environ.get("PFLFT_DMID_ABS_MAX_TICKS", "").strip()
     pflft_flow_int_env = os.environ.get("PFLFT_FLOW_INTENSITY_MIN", "").strip()
     pflft_lag_env = os.environ.get("PFLFT_LAG_SCORE_MIN", "").strip()
+    pflft_lag_dmid_floor_env = os.environ.get("PFLFT_LAG_DMID_FLOOR_TICKS", "").strip()
     pflft_stop_env = os.environ.get("PFLFT_STOP_TICKS", "").strip()
     pflft_tp_env = os.environ.get("PFLFT_TP_TICKS", "").strip()
     pflft_time_stop_env = os.environ.get("PFLFT_TIME_STOP_BARS", "").strip()
@@ -6478,6 +6491,8 @@ def _apply_entry_alpha_overrides(params: EntryAlphaParams) -> None:
         params.pflft.FLOW_INTENSITY_MIN = float(pflft_flow_int_env)
     if pflft_lag_env:
         params.pflft.LAG_SCORE_MIN = float(pflft_lag_env)
+    if pflft_lag_dmid_floor_env:
+        params.pflft.LAG_DMID_FLOOR_TICKS = max(float(pflft_lag_dmid_floor_env), 1e-9)
     if pflft_stop_env:
         params.pflft.STOP_TICKS = int(pflft_stop_env)
     if pflft_tp_env:
@@ -7179,6 +7194,7 @@ def main() -> None:
         float(pnl_commission_round_turn_env) if pnl_commission_round_turn_env else None
     )
     pnl_slippage_ticks = float(os.environ.get("PNL_SLIPPAGE_TICKS", "0"))
+    pnl_cost_mode = os.environ.get("PNL_COST_MODE", "commission_only").strip().lower()
     pnl_daily_loss_limit = float(os.environ.get("PNL_DAILY_LOSS_LIMIT", "0"))
     pnl_max_drawdown_limit = float(os.environ.get("PNL_MAX_DRAWDOWN_LIMIT", "0"))
     pnl_print_trades = os.environ.get("PNL_PRINT_TRADES", "0").strip() == "1"
@@ -7187,6 +7203,7 @@ def main() -> None:
         commission_per_side=pnl_commission_per_side,
         commission_round_turn=pnl_commission_round_turn,
         slippage_ticks=pnl_slippage_ticks,
+        cost_mode=pnl_cost_mode,
     )
     print(
         f"ENTRY_CONFIRM: bars={entry_confirm_bars} min_prog={entry_min_progress_ticks} style={entry_confirm_style}",
@@ -7569,6 +7586,9 @@ def main() -> None:
             "pflft_lag_score_min": entry_alpha_params.pflft.LAG_SCORE_MIN
             if entry_alpha_params is not None
             else None,
+            "pflft_lag_dmid_floor_ticks": entry_alpha_params.pflft.LAG_DMID_FLOOR_TICKS
+            if entry_alpha_params is not None
+            else None,
             "pflft_proof_max_bars": pflft_proof_max_bars,
             "pflft_proof_ticks": pflft_proof_ticks,
             "pflft_proof_min_flow": pflft_proof_min_flow,
@@ -7607,6 +7627,7 @@ def main() -> None:
             "pbra_scratch_bars": pbra_scratch_bars,
             "pbra_scratch_min_mfe_ticks": pbra_scratch_min_mfe_ticks,
             "pbra_scratch_min_abs_ofid_max": pbra_scratch_min_abs_ofid_max,
+            "pnl_cost_mode": pnl_cost_mode,
             "afr3_break_min_flow_abs": afr3_break_min_flow_abs,
             "afr3_break_max_spread_ticks": afr3_break_max_spread_ticks,
             "afr3_snapback_check": afr3_snapback_check,
@@ -7670,6 +7691,9 @@ def main() -> None:
             if entry_alpha_params is not None
             else None,
             "pflft_lag_score_min": entry_alpha_params.pflft.LAG_SCORE_MIN
+            if entry_alpha_params is not None
+            else None,
+            "pflft_lag_dmid_floor_ticks": entry_alpha_params.pflft.LAG_DMID_FLOOR_TICKS
             if entry_alpha_params is not None
             else None,
             "pflft_proof_max_bars": pflft_proof_max_bars,
@@ -10541,11 +10565,11 @@ def main() -> None:
                         "p1_pnl_ticks": float(np.quantile(pnl, 0.01)) if pnl.size else 0.0,
                     }
                 )
-            exit_agg = (
-                all_trades.groupby(["strategy", "exit_reason_std"], sort=False)
-                .apply(_agg_reason)
-                .reset_index()
-            )
+            grouped = all_trades.groupby(["strategy", "exit_reason_std"], sort=False)
+            try:
+                exit_agg = grouped.apply(_agg_reason, include_groups=False).reset_index()
+            except TypeError:
+                exit_agg = grouped.apply(_agg_reason).reset_index()
             exit_agg_path = out_dir / f"exit_breakdown_aggregate_{strategy_mode}_W{w_tag}_gate_{gate_tag}.csv"
             exit_agg.to_csv(exit_agg_path, index=False)
             for strat in ["baseline", "gated"]:

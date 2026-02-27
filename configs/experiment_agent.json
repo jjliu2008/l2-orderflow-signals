@@ -1,7 +1,9 @@
 {
-  "run_id": "openclaw_v1",
+  "run_id": "reentry_chop_guard_v1",
   "strategy_mode": "entry_alpha_v1",
-  "family_allowlist": ["PFLFT_v1"],
+  "family_allowlist": [
+    "PFLFT_v1"
+  ],
   "fixed_env": {
     "VALIDATE_DEBUG": "0",
     "ENTRY_CONFIRM_STYLE": "price_only",
@@ -20,63 +22,42 @@
     "lock_start": "2025-12-13",
     "lock_end": "2025-12-18"
   },
-  "min_trades": { "train": 120, "lock": 50 },
+  "min_trades": {
+    "train": 120,
+    "lock": 50
+  },
   "risk_limits": {
     "daily_loss_limit_ticks": 80,
     "trailing_dd_limit_ticks": 160
   },
+  "cost_mode": "commission_only",
   "grid": [
     {
-      "name": "A_baseline",
+      "name": "A_cd0_prog0_none",
       "env": {
-        "PFLFT_FLOW_WIN_BARS": "20",
-        "PFLFT_SPREAD_MAX": "1",
-        "PFLFT_DMID_ABS_MAX_TICKS": "2",
-        "PFLFT_LAG_SCORE_MIN": "10",
-        "PFLFT_PROOF_MAX_BARS": "0",
-        "PFLFT_PROOF_TICKS": "1",
-        "PFLFT_CONFIRM_MIN_ABS_OFID": "5",
-        "PFLFT_CONFIRM_MIN_FLOW_SUM": "0"
+        "ENTRY_COOLDOWN_BARS": "0",
+        "ENTRY_MIN_PROGRESS_TICKS": "0"
       }
     },
     {
-      "name": "B_proof",
+      "name": "B_cd0_prog1_progress_only",
       "env": {
-        "PFLFT_FLOW_WIN_BARS": "20",
-        "PFLFT_SPREAD_MAX": "1",
-        "PFLFT_DMID_ABS_MAX_TICKS": "2",
-        "PFLFT_LAG_SCORE_MIN": "10",
-        "PFLFT_PROOF_MAX_BARS": "5",
-        "PFLFT_PROOF_TICKS": "1",
-        "PFLFT_PROOF_MIN_FLOW": "0",
-        "PFLFT_CONFIRM_MIN_ABS_OFID": "5",
-        "PFLFT_CONFIRM_MIN_FLOW_SUM": "0"
+        "ENTRY_COOLDOWN_BARS": "0",
+        "ENTRY_MIN_PROGRESS_TICKS": "1"
       }
     },
     {
-      "name": "C_strong",
+      "name": "C_cd20_prog0_cooldown_only",
       "env": {
-        "PFLFT_FLOW_WIN_BARS": "20",
-        "PFLFT_SPREAD_MAX": "1",
-        "PFLFT_DMID_ABS_MAX_TICKS": "1",
-        "PFLFT_LAG_SCORE_MIN": "10",
-        "PFLFT_PROOF_MAX_BARS": "5",
-        "PFLFT_PROOF_TICKS": "1",
-        "PFLFT_CONFIRM_MIN_ABS_OFID": "8",
-        "PFLFT_CONFIRM_MIN_FLOW_SUM": "5"
+        "ENTRY_COOLDOWN_BARS": "20",
+        "ENTRY_MIN_PROGRESS_TICKS": "0"
       }
     },
     {
-      "name": "D_righttail",
+      "name": "D_cd20_prog1_both_guards",
       "env": {
-        "PFLFT_FLOW_WIN_BARS": "20",
-        "PFLFT_SPREAD_MAX": "1",
-        "PFLFT_DMID_ABS_MAX_TICKS": "1",
-        "PFLFT_LAG_SCORE_MIN": "10",
-        "PFLFT_PROOF_MAX_BARS": "5",
-        "PFLFT_PROOF_TICKS": "2",
-        "PFLFT_CONFIRM_MIN_ABS_OFID": "8",
-        "PFLFT_CONFIRM_MIN_FLOW_SUM": "8"
+        "ENTRY_COOLDOWN_BARS": "20",
+        "ENTRY_MIN_PROGRESS_TICKS": "1"
       }
     }
   ]

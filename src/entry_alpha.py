@@ -62,6 +62,7 @@ class PFLFTParams:
     DMID_ABS_MAX_TICKS: float = 1.0
     FLOW_INTENSITY_MIN: float = 0.0
     LAG_SCORE_MIN: float = 0.0
+    LAG_DMID_FLOOR_TICKS: float = 1.0
     STOP_TICKS: int = 3
     TP_TICKS: int = 4
     TIME_STOP_BARS: int = 20
@@ -461,7 +462,9 @@ class EntryAlphaEngine:
 
         lag_score = float("nan")
         if np.isfinite(dmid_ticks):
-            lag_score = flow_intensity / (abs(dmid_ticks) + 1e-9)
+            lag_dmid_floor = max(float(p.LAG_DMID_FLOOR_TICKS), 1e-9)
+            lag_denom = max(abs(dmid_ticks), lag_dmid_floor)
+            lag_score = flow_intensity / lag_denom
         if flow_intensity < p.FLOW_INTENSITY_MIN or (
             np.isfinite(lag_score) and lag_score < p.LAG_SCORE_MIN
         ):
