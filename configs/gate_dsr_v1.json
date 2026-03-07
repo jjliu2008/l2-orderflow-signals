@@ -1,0 +1,83 @@
+{
+  "_doc": "depth_shape_ratio gate v1 — confirmed 2026-03-06",
+  "gate_id": "dsr_v1",
+  "version": 1,
+  "status": "confirmed",
+
+  "feature": {
+    "name": "depth_shape_ratio",
+    "definition": "L1_size / sum(L1_size..L5_size) on the entry side (ask for longs, bid for shorts)",
+    "source_columns": {
+      "long": "depth_shape_ratio_ask",
+      "short": "depth_shape_ratio_bid"
+    },
+    "parquet_schema_version": "mbp10_v1",
+    "note": "Measures how concentrated top-of-book depth is at L1. Low = thin probe quote in front of real depth. High = L1 dominates the top-5 stack."
+  },
+
+  "threshold": {
+    "operator": "<",
+    "value": 0.135,
+    "interpretation": "Pass (allow entry) when entry-side DSR < 0.135. Reject when DSR >= 0.135.",
+    "derivation": "Fit on 6 days (2025-12-01 through 2025-12-09, n=92), swept 0.03-0.20 in 0.005 steps, selected by max lift with >=5 fail-side trades."
+  },
+
+  "exclusions": {
+    "policy": "Do not apply this gate on sessions containing a scheduled macro release. Mark those sessions as gate_ineligible. This is a fixed list — do not expand it with ad-hoc additions without a separate research note.",
+    "event_types": ["FOMC_DECISION", "NFP", "CPI"],
+    "known_exclusion_dates": [
+      {"date": "2025-12-10", "event": "FOMC_DECISION", "note": "26 of 35 entries clustered 19:02-20:11 UTC (2-3pm ET post-FOMC chop). DSR signal inverts: market maker quote withdrawal on both sides mimics thin-book signal."}
+    ]
+  },
+
+  "evidence": {
+    "sample_instrument": "ES (front month ESZ5, Dec 2025)",
+    "sample_dates": [
+      "2025-12-01","2025-12-02","2025-12-03","2025-12-04","2025-12-05",
+      "2025-12-09","2025-12-11","2025-12-12"
+    ],
+    "excluded_dates": ["2025-12-10 (FOMC)", "2025-12-14 (n=1)"],
+    "fit_set": {
+      "dates": ["2025-12-01","2025-12-02","2025-12-03","2025-12-04","2025-12-05","2025-12-09"],
+      "n": 92,
+      "base_follow_rate": 0.304,
+      "pass_n": 51,
+      "pass_follow_rate": 0.412,
+      "fail_n": 41,
+      "fail_follow_rate": 0.171,
+      "lift_pp": 24.1
+    },
+    "holdout_set": {
+      "dates": ["2025-12-11","2025-12-12"],
+      "n": 93,
+      "base_follow_rate": 0.215,
+      "pass_n": 59,
+      "pass_follow_rate": 0.271,
+      "fail_n": 34,
+      "fail_follow_rate": 0.118,
+      "lift_pp": 15.4
+    },
+    "full_sample_excl_fomc": {
+      "n": 185,
+      "pass_n": 110,
+      "pass_follow_rate": 0.336,
+      "fail_n": 75,
+      "fail_follow_rate": 0.147,
+      "lift_pp": 18.9
+    },
+    "follow_through_definition": "mfe_ticks >= 1.0 (price moves at least 1 tick in trade direction after entry)",
+    "fit_holdout_shrinkage_pp": 8.7,
+    "day_consistency": "Signal present in 7/8 usable days. 12-10 (FOMC) inverts — excluded. 12-01 (n=10) too small to read."
+  },
+
+  "interpretation": {
+    "what_it_does": "Cuts the bottom ~40% of entries — those with 85% immediate-failure rate — from execution. Passing trades still only follow through ~34% of the time on a 1-tick definition, so this is a stop-bleeding filter, not a high-conviction signal.",
+    "mechanism": "Thin L1 (low DSR) = probe quote sitting in front of real depth. Once L1 is absorbed at entry, less immediate book resistance above/below. High DSR = L1 dominates the stack, meaning L1 absorption still leaves a thick book that can push price back.",
+    "what_it_does_not_do": "Does not improve payoff magnitude among winners. TP optimization requires a separate layer of research on the 110 passing trades."
+  },
+
+  "next_research": {
+    "question": "Among the 110 passing trades (DSR < 0.135, excl FOMC), do any L2-10 features predict magnitude of favorable excursion (fav_excursion ticks) among winners?",
+    "purpose": "TP optimization — find where to set exit on winning trades to move from filter-only to positive EV."
+  }
+}
