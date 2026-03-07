@@ -16,11 +16,14 @@ Parameters tunable via CLI:
     --dsr-gate          DSR threshold (default 0.135)
     --window-secs       detection window in seconds (default 30)
     --min-dip-ticks     minimum adverse ticks before arm (default 1)
-    --bid-sz-retention  fraction of initial bid_sz required (default 0.60)
+    --bid-sz-min-lots   absolute minimum bid_sz (lots) for bid absorption (default 5)
     --absorption-prints minimum sell prints in burst (default 5)
     --burst-ms          burst window in ms (default 500)
-    --flip-window-secs  rolling window for aggressor flip (default 1.0)
-    --genuine-adverse   ticks of dip that counts as "kept going" (default 4)
+    --flip-window-secs  each half-window duration for two-window flip (default 1.0)
+    --flip-prev-max     max buy_frac in prev window for long flip (default 0.45)
+    --flip-curr-min     min buy_frac in curr window for long flip (default 0.60)
+    --genuine-adverse         ticks of dip that counts as "kept going" (default 4)
+    --ask-absorbed-min-lots   cumulative lots at offer level to trigger ask_absorbed (default 50)
 """
 
 import argparse
@@ -152,11 +155,14 @@ def detect_absorption(
     *,
     window_secs: float = 30.0,
     min_dip_ticks: float = 1.0,
-    bid_sz_retention: float = 0.60,
+    bid_sz_min_lots: int = 5,
     absorption_prints: int = 5,
     burst_ms: float = 500.0,
     flip_window_secs: float = 1.0,
+    flip_buy_frac_prev_max: float = 0.45,
+    flip_buy_frac_curr_min: float = 0.60,
     genuine_adverse_ticks: float = 4.0,
+    ask_absorbed_min_lots: int = 50,
 ) -> dict:
     """
     Runs the 4 absorption signatures on the tick stream for one signal window.
@@ -195,19 +201,31 @@ def detect_absorption(
         "ask_absorbed_ts":       None,
         "ask_exhausted_fired":   False,
         "ask_exhausted_ts":      None,
-        "aggressor_flip_fired":  False,
-        "aggressor_flip_ts":     None,
-        "aggressor_flip_px":     None,
+        "aggressor_flip_fired":      False,
+        "aggressor_flip_ts":         None,
+        "aggressor_flip_px":         None,
+        "aggressor_flip_prev_frac":  None,
+        "aggressor_flip_curr_frac":  None,
         "detection_fired":       False,
         "detection_signature":   None,
         "detection_ts":          None,
         "detection_entry_px":    None,
         "entry_dip_ticks":       None,
         "window_outcome":        None,
+        # forward outcome from detection entry (to window end)
+        "forward_mfe_ticks":     None,
+        "forward_mae_ticks":     None,
+        # bar-close baseline outcome (over same full window)
+        "bar_mfe_ticks":         None,
+        "bar_mae_ticks":         None,
         # diagnostics
-        "max_sell_burst":        0,
-        "min_bid_sz_retention":  None,
-        "max_ask_sz_drop":       None,
+        "max_sell_burst":            0,
+        "min_bid_sz_retention":      None,
+        "max_ask_sz_drop":           None,
+        "ask_absorbed_lots_at_det":  None,
+        # flip diagnostics — always populated
+        "_flip_prev_buy_frac":       None,
+        "_flip_max_curr_buy_frac":   None,
     }
 
     if not window:
@@ -235,9 +253,19 @@ def detect_absorption(
     ask_sz_baseline    = None
     max_ask_sz_drop    = 0.0
 
-    # aggressor flip state: rolling window of (ts, signed_size)
-    flip_deque: deque = deque()    # (ts, signed_size) positive=buy, negative=sell
+    # aggressor flip state: two rolling windows of (ts, size, is_buy)
+    # prev_deque covers [arm_ts, arm_ts + flip_window_secs]
+    # curr_deque covers rolling last flip_window_secs
+    flip_all_deque: deque = deque()   # (ts, size, is_buy) — all prints since arm
+    flip_prev_closed = False          # True once prev window has fully elapsed
+    flip_prev_buy_frac: float | None = None   # buy fraction in prev window
 
+    # ask_absorbed: cumulative buy-aggressor lots at the arm-time ask/bid level
+    ask_absorbed_lots: float = 0.0
+    ask_absorbed_px_ref: float | None = None   # set at arm time
+
+    flip_max_curr_buy_frac: float = 0.0   # diagnostic: highest curr_buy_frac seen
+    flip_window_td = timedelta(seconds=flip_window_secs)
     detection: dict | None = None  # first signature to fire
 
     for rec in window:
@@ -259,6 +287,7 @@ def detect_absorption(
                 arm_bid_sz   = bid_sz if is_long else ask_sz
                 arm_ask_sz   = ask_sz if is_long else bid_sz
                 ask_sz_baseline = arm_ask_sz
+                ask_absorbed_px_ref   = ask_px if is_long else bid_px
                 meta["dip_armed"]     = True
                 meta["dip_arm_ts"]    = str(ts)
                 meta["dip_arm_price"] = price
@@ -266,25 +295,55 @@ def detect_absorption(
             else:
                 continue   # not armed yet
 
-        # ── Bid size retention tracking (diagnostic) ─────────────────────────
+        # ── Minimum observation period ─────────────────────────────────────────
+        obs_period_ok = ts >= arm_ts + flip_window_td
+
+        # ── Bid size retention tracking (diagnostic) ──────────────────────────
         cur_bid_sz = bid_sz if is_long else ask_sz
         if arm_bid_sz and arm_bid_sz > 0:
             frac = cur_bid_sz / arm_bid_sz
             min_bid_sz_frac = min(min_bid_sz_frac, frac)
 
-        # ── Ask size drop tracking ────────────────────────────────────────────
+        # ── Ask size drop tracking (diagnostic only) ──────────────────────────
         cur_ask_sz = ask_sz if is_long else bid_sz
         if ask_sz_baseline is not None and ask_sz_baseline > 0:
             drop = (ask_sz_baseline - cur_ask_sz) / ask_sz_baseline
             max_ask_sz_drop = max(max_ask_sz_drop, drop)
 
-        # ── Aggressor flip: rolling window ───────────────────────────────────
-        signed = size if side == "A" else -size
-        flip_deque.append((ts, signed))
-        cutoff = ts - timedelta(seconds=flip_window_secs)
-        while flip_deque and flip_deque[0][0] < cutoff:
-            flip_deque.popleft()
-        flip_sum = sum(v for _, v in flip_deque)
+        # ── Ask absorbed: accumulate lots traded at the arm-time offer level ───
+        # Long:  count side='A' (buy-aggressor) prints at ask_absorbed_px_ref
+        # Short: count side='B' (sell-aggressor) prints at ask_absorbed_px_ref
+        if ask_absorbed_px_ref is not None:
+            if is_long and side == "A" and price == ask_absorbed_px_ref:
+                ask_absorbed_lots += size
+            elif not is_long and side == "B" and price == ask_absorbed_px_ref:
+                ask_absorbed_lots += size
+
+        # ── Aggressor flip: two-window buy-fraction comparison ───────────────
+        # prev window = [arm_ts, arm_ts + flip_window_secs]
+        # curr window = rolling last flip_window_secs
+        is_buy = (side == "A")
+        flip_all_deque.append((ts, size, is_buy))
+
+        # Compute prev window fraction once it has fully elapsed
+        if arm_ts is not None and not flip_prev_closed:
+            prev_end = arm_ts + flip_window_td
+            if ts >= prev_end:
+                prev = [(s, b) for t2, s, b in flip_all_deque if arm_ts <= t2 < prev_end]
+                if prev:
+                    prev_total = sum(s for s, _ in prev)
+                    prev_buys  = sum(s for s, b in prev if b)
+                    flip_prev_buy_frac = prev_buys / prev_total if prev_total else 0.5
+                flip_prev_closed = True
+
+        # Curr window = rolling last flip_window_secs
+        curr_cutoff = ts - flip_window_td
+        curr = [(s, b) for t2, s, b in flip_all_deque if t2 >= curr_cutoff]
+        curr_total = sum(s for s, _ in curr)
+        curr_buys  = sum(s for s, b in curr if b)
+        curr_buy_frac = curr_buys / curr_total if curr_total else 0.5
+        if flip_prev_closed:
+            flip_max_curr_buy_frac = max(flip_max_curr_buy_frac, curr_buy_frac)
 
         # ── Bid absorption: sell burst at same price ──────────────────────────
         # For longs: watch sell-aggressor trades (side='B') hitting the bid
@@ -298,13 +357,15 @@ def detect_absorption(
             n_burst = len(same_level)
             max_sell_burst = max(max_sell_burst, n_burst)
 
-            # Bid absorption: N prints at same level, bid hasn't dropped, bid_sz retained
-            if (not meta["bid_absorption_fired"]
+            # Bid absorption: N prints at same level, bid hasn't dropped,
+            # and current bid_sz meets an absolute minimum (not a fraction of
+            # a volatile baseline — absolute floor is more stable)
+            cur_defense_sz = bid_sz if is_long else ask_sz
+            if (obs_period_ok
+                    and not meta["bid_absorption_fired"]
                     and n_burst >= absorption_prints
                     and bid_px == price   # bid hasn't dropped
-                    and arm_bid_sz is not None
-                    and arm_bid_sz > 0
-                    and (bid_sz / arm_bid_sz) >= bid_sz_retention):
+                    and cur_defense_sz >= bid_sz_min_lots):
                 meta["bid_absorption_fired"]  = True
                 meta["bid_absorption_ts"]     = str(ts)
                 meta["bid_absorption_px"]     = price
@@ -313,43 +374,60 @@ def detect_absorption(
                     detection = {"sig": "bid_absorption", "ts": ts,
                                  "entry_px": ask_px if is_long else bid_px}
 
-        # ── Offer size absorbed / exhausted ──────────────────────────────────
-        # Long:  watch ask_sz declining at same ask_px while price doesn't advance
-        # Short: watch bid_sz declining at same bid_px while price doesn't retreat
-        if ask_sz_baseline is not None:
-            sz_declined = (cur_ask_sz < ask_sz_baseline * 0.7)   # 30% shrink
+        # ── Ask absorbed / exhausted ──────────────────────────────────────────
+        # ask_absorbed: cumulative buy-aggressor lots at the arm-time ask level
+        #   reach ask_absorbed_min_lots while that level is still the best ask.
+        # ask_exhausted: the offer level clears (ask_px advances past ref) before
+        #   the lot threshold is reached — passive depletion of supply.
+        if obs_period_ok and ask_absorbed_px_ref is not None:
             if is_long:
-                price_flat  = (ask_px <= (bar_mid + 1 * TICK))   # ask hasn't risen
-                aggr_count  = sum(1 for _, v in flip_deque if v > 0)  # buys in window
-                entry_ref   = ask_px
+                offer_intact = (ask_px <= ask_absorbed_px_ref)
+                offer_moved  = (ask_px > ask_absorbed_px_ref)
+                entry_ref    = ask_px
             else:
-                price_flat  = (bid_px >= (bar_mid - 1 * TICK))   # bid hasn't fallen
-                aggr_count  = sum(1 for _, v in flip_deque if v < 0)  # sells in window
-                entry_ref   = bid_px
-            if sz_declined and price_flat:
-                if not meta["ask_absorbed_fired"] and aggr_count >= 2:
-                    meta["ask_absorbed_fired"] = True
-                    meta["ask_absorbed_ts"]    = str(ts)
-                    if detection is None:
-                        detection = {"sig": "ask_absorbed", "ts": ts,
-                                     "entry_px": entry_ref}
-                elif not meta["ask_exhausted_fired"] and aggr_count < 2:
-                    meta["ask_exhausted_fired"] = True
-                    meta["ask_exhausted_ts"]    = str(ts)
-                    if detection is None:
-                        detection = {"sig": "ask_exhausted", "ts": ts,
-                                     "entry_px": entry_ref}
+                offer_intact = (bid_px >= ask_absorbed_px_ref)
+                offer_moved  = (bid_px < ask_absorbed_px_ref)
+                entry_ref    = bid_px
+            if (not meta["ask_absorbed_fired"]
+                    and ask_absorbed_lots >= ask_absorbed_min_lots
+                    and offer_intact):
+                meta["ask_absorbed_fired"] = True
+                meta["ask_absorbed_ts"]    = str(ts)
+                if detection is None:
+                    detection = {"sig": "ask_absorbed", "ts": ts,
+                                 "entry_px": entry_ref}
+            if (not meta["ask_exhausted_fired"]
+                    and offer_moved
+                    and ask_absorbed_lots < ask_absorbed_min_lots):
+                meta["ask_exhausted_fired"] = True
+                meta["ask_exhausted_ts"]    = str(ts)
+                if detection is None:
+                    detection = {"sig": "ask_exhausted", "ts": ts,
+                                 "entry_px": entry_ref}
 
-        # ── Aggressor flip ────────────────────────────────────────────────────
-        # Long:  price dipped below bar_mid, rolling buy volume overtakes sells → flip_sum > 0
-        # Short: price rose above bar_mid, rolling sell volume overtakes buys  → flip_sum < 0
+        # ── Aggressor flip: two-window fraction comparison ───────────────────
+        # Requires prev window to have elapsed and been majority adverse-side,
+        # then curr window to be majority reversal-side. Price must still be
+        # at least 1 tick adverse from bar_close_mid when flip fires.
+        # Long:  prev buy_frac low (sellers dominated), curr buy_frac high (buyers returning)
+        # Short: prev buy_frac high (buyers dominated), curr sell_frac high (sellers returning)
         flip_price_ok = (price <= bar_mid - TICK) if is_long else (price >= bar_mid + TICK)
-        flip_cond     = (flip_sum > 0)             if is_long else (flip_sum < 0)
+        if is_long:
+            flip_cond = (flip_prev_buy_frac is not None
+                         and flip_prev_buy_frac <= flip_buy_frac_prev_max
+                         and curr_buy_frac >= flip_buy_frac_curr_min)
+        else:
+            flip_cond = (flip_prev_buy_frac is not None
+                         and flip_prev_buy_frac >= (1 - flip_buy_frac_prev_max)
+                         and curr_buy_frac <= (1 - flip_buy_frac_curr_min))
+
         if (not meta["aggressor_flip_fired"]
                 and flip_cond and flip_price_ok):
             meta["aggressor_flip_fired"] = True
             meta["aggressor_flip_ts"]    = str(ts)
             meta["aggressor_flip_px"]    = price
+            meta["aggressor_flip_prev_frac"] = round(flip_prev_buy_frac, 3)
+            meta["aggressor_flip_curr_frac"] = round(curr_buy_frac, 3)
             # Aggressor flip is highest priority — override earlier detection
             flip_det = {"sig": "aggressor_flip", "ts": ts,
                         "entry_px": ask_px if is_long else bid_px}
@@ -357,27 +435,59 @@ def detect_absorption(
                 detection = flip_det
 
     # ── Diagnostics ──────────────────────────────────────────────────────────
-    meta["max_sell_burst"]       = max_sell_burst
-    meta["min_bid_sz_retention"] = round(min_bid_sz_frac, 3)
-    meta["max_ask_sz_drop"]      = round(max_ask_sz_drop, 3)
+    meta["_flip_prev_buy_frac"]      = round(flip_prev_buy_frac, 3) if flip_prev_buy_frac is not None else None
+    meta["_flip_max_curr_buy_frac"] = round(flip_max_curr_buy_frac, 3)
+    meta["max_sell_burst"]           = max_sell_burst
+    meta["min_bid_sz_retention"]     = round(min_bid_sz_frac, 3)
+    meta["max_ask_sz_drop"]          = round(max_ask_sz_drop, 3)
+    meta["ask_absorbed_lots_at_det"] = round(ask_absorbed_lots, 0)
+
+    # ── Bar-close baseline outcomes (full window from bar_mid) ───────────────
+    if window:
+        px_all = [r["price"] for r in window]
+        if is_long:
+            meta["bar_mfe_ticks"] = round((max(px_all) - bar_mid) / TICK, 2)
+            meta["bar_mae_ticks"] = round((bar_mid - min(px_all)) / TICK, 2)
+        else:
+            meta["bar_mfe_ticks"] = round((bar_mid - min(px_all)) / TICK, 2)
+            meta["bar_mae_ticks"] = round((max(px_all) - bar_mid) / TICK, 2)
 
     # ── Window outcome ────────────────────────────────────────────────────────
     if not dip_armed:
         meta["window_outcome"] = "no_dip"
     elif detection is not None:
-        meta["detection_fired"]     = True
-        meta["detection_signature"] = detection["sig"]
-        meta["detection_ts"]        = str(detection["ts"])
-        meta["detection_entry_px"]  = detection["entry_px"]
-        meta["entry_dip_ticks"]     = round(
-            (bar_mid - detection["entry_px"]) / TICK if is_long
-            else (detection["entry_px"] - bar_mid) / TICK, 2
+        entry_px  = detection["entry_px"]
+        entry_dip = (
+            (bar_mid - entry_px) / TICK if is_long
+            else (entry_px - bar_mid) / TICK
         )
-        meta["window_outcome"] = "fired"
-    elif max_adverse >= genuine_adverse_ticks:
-        meta["window_outcome"] = "genuine_adverse"
-    else:
-        meta["window_outcome"] = "no_signature"
+        # Discard detections that give an entry worse than bar close
+        if entry_dip < 0:
+            detection = None
+        else:
+            meta["detection_fired"]     = True
+            meta["detection_signature"] = detection["sig"]
+            meta["detection_ts"]        = str(detection["ts"])
+            meta["detection_entry_px"]  = entry_px
+            meta["entry_dip_ticks"]     = round(entry_dip, 2)
+            meta["window_outcome"]      = "fired"
+            # Forward outcomes from detection entry to window end
+            post = [r for r in window if r["ts"] >= detection["ts"]]
+            if post:
+                px_post = [r["price"] for r in post]
+                if is_long:
+                    meta["forward_mfe_ticks"] = round((max(px_post) - entry_px) / TICK, 2)
+                    meta["forward_mae_ticks"] = round((entry_px - min(px_post)) / TICK, 2)
+                else:
+                    meta["forward_mfe_ticks"] = round((entry_px - min(px_post)) / TICK, 2)
+                    meta["forward_mae_ticks"] = round((max(px_post) - entry_px) / TICK, 2)
+
+    if meta["window_outcome"] is None:
+        if detection is None and dip_armed:
+            if max_adverse >= genuine_adverse_ticks:
+                meta["window_outcome"] = "genuine_adverse"
+            else:
+                meta["window_outcome"] = "no_signature"
 
     return meta
 
@@ -389,11 +499,14 @@ def main():
     parser.add_argument("--dsr-gate",           type=float, default=0.135)
     parser.add_argument("--window-secs",        type=float, default=30.0)
     parser.add_argument("--min-dip-ticks",      type=float, default=1.0)
-    parser.add_argument("--bid-sz-retention",   type=float, default=0.60)
+    parser.add_argument("--bid-sz-min-lots",    type=int,   default=5)
     parser.add_argument("--absorption-prints",  type=int,   default=5)
     parser.add_argument("--burst-ms",           type=float, default=500.0)
     parser.add_argument("--flip-window-secs",   type=float, default=1.0)
-    parser.add_argument("--genuine-adverse",    type=float, default=4.0)
+    parser.add_argument("--flip-prev-max",      type=float, default=0.45)
+    parser.add_argument("--flip-curr-min",      type=float, default=0.60)
+    parser.add_argument("--genuine-adverse",       type=float, default=4.0)
+    parser.add_argument("--ask-absorbed-min-lots", type=int,   default=50)
     args = parser.parse_args()
 
     date_str = args.date
@@ -428,11 +541,14 @@ def main():
             dbn_trades,
             window_secs=args.window_secs,
             min_dip_ticks=args.min_dip_ticks,
-            bid_sz_retention=args.bid_sz_retention,
+            bid_sz_min_lots=args.bid_sz_min_lots,
             absorption_prints=args.absorption_prints,
             burst_ms=args.burst_ms,
             flip_window_secs=args.flip_window_secs,
+            flip_buy_frac_prev_max=args.flip_prev_max,
+            flip_buy_frac_curr_min=args.flip_curr_min,
             genuine_adverse_ticks=args.genuine_adverse,
+            ask_absorbed_min_lots=args.ask_absorbed_min_lots,
         )
         results.append(meta)
         fired = "FIRED" if meta["detection_fired"] else meta["window_outcome"].upper()
