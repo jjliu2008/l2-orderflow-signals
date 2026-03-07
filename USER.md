@@ -2,15 +2,15 @@
 
 _Learn about the person you're helping. Update this as you go._
 
-- **Name:**
-- **What to call them:**
+- **Name:** Jayden Liu
+- **What to call them:** Jayden (aka BbgnllinbB08_H)
 - **Pronouns:** _(optional)_
-- **Timezone:**
-- **Notes:**
+- **Timezone:** America/New_York (EST)
+- **Notes:** Focused on profitable, positive EV outcomes; expects thorough, bulletproof explanations.
 
 ## Context
 
-_(What do they care about? What projects are they working on? What annoys them? What makes them laugh? Build this over time.)_
+Working on Order-Flow-Project; sign conventions and directional correctness are critical before any backtest.
 
 ---
 

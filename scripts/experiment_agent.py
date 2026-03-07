@@ -168,13 +168,32 @@ def _validate_guardrails(config: Dict[str, object]) -> Guardrails:
     train_end = data_days.get("train_end")
     lock_start = data_days.get("lock_start")
     lock_end = data_days.get("lock_end")
-    if (train_start, train_end, lock_start, lock_end) != (
+    canonical_split = (
         "2025-12-01",
         "2025-12-12",
         "2025-12-13",
         "2025-12-18",
-    ):
-        raise ValueError("Train/lock split must remain 2025-12-01..12-12 and 2025-12-13..12-18.")
+    )
+    guardrails_cfg = config.get("guardrails", {})
+    allow_screening_override = bool(
+        guardrails_cfg.get("allow_screening_split_override", False)
+        if isinstance(guardrails_cfg, dict)
+        else False
+    )
+    current_split = (str(train_start), str(train_end), str(lock_start), str(lock_end))
+    if current_split != canonical_split:
+        if not allow_screening_override:
+            raise ValueError("Train/lock split must remain 2025-12-01..12-12 and 2025-12-13..12-18.")
+        c_ts, c_te, c_ls, c_le = canonical_split
+        ts, te, ls, le = current_split
+        # Screening override is allowed for any narrower split inside the full canonical window.
+        overall_start = c_ts
+        overall_end = c_le
+        if not (overall_start <= ts <= te < ls <= le <= overall_end):
+            raise ValueError(
+                "Screening split override must stay within 2025-12-01..12-18 with "
+                "train ending before lock starts."
+            )
 
     min_trades = config.get("min_trades", {})
     risk_limits = config.get("risk_limits", {})

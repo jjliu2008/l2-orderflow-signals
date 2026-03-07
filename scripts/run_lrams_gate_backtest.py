@@ -99,6 +99,28 @@ Baseline:
   PFLFT_STOP_TICKS         PFLFT stop ticks (default: 3)
   PFLFT_TP_TICKS           PFLFT TP ticks (default: 4)
   PFLFT_TIME_STOP_BARS     PFLFT time stop bars (default: 20)
+  PFLFT_V7_ENABLE          enable PFLFT v7 preburst (default: 0)
+  PFLFT_V7_SPREAD_MAX      v7 max spread ticks (default: 1)
+  PFLFT_V7_FLOWINT_PRE3_MIN v7 min pre3 flow intensity (default: 15)
+  PFLFT_V7_SV_PRE3_MIN     v7 min abs pre3 signed volume (default: 12)
+  PFLFT_V7_DMID1_MAX       v7 max abs 1-bar dmid ticks (default: 1)
+  PFLFT_V7_PROOF_BARS      v7 proof window bars (default: 2)
+  PFLFT_V7_PROOF_TICKS     v7 proof ticks (default: 1)
+  PFLFT_V7_PROOF_MIN_FLOW  v7 min aligned flow sum in proof window (default: 0)
+  PFLFT_V7_TIME_STOP_BARS  v7 time stop bars (default: 5)
+  PFLFT_V7_TP_TICKS        v7 base TP ticks (default: 2)
+  PFLFT_V7_SL_TICKS        v7 SL ticks (default: 1)
+  PFLFT_V7_FLOWINT_PRE3_P90 v7 runner eligibility flowint threshold (default: 25)
+  PFLFT_V7_RUNNER_TP_TICKS v7 runner TP ticks (default: 4)
+  PFLFT_V7_PREV_RANGE_MAX_TICKS v7 no-trade max prev-range ticks (default: 15)
+  PFLFT_V7_PREV_ABS_FLOW_MAX v7 no-trade max prev abs flow sum (default: 20000)
+  PFLFT_V8_ENABLE          enable PFLFT v8 preburst + regime gate (default: 0)
+  PFLFT_V8_LFP_ALIGNED_10_MIN v8 min aligned lfp_event_10 (default: 0.58)
+  PFLFT_V8_STRESS_RATIO_MIN v8 min stress_ratio (default: 0.18)
+  PFLFT_V8_DEPTH_TOTAL_TOP5_MAX v8 max depth_total_top5 (default: 640)
+  PFLFT_V8_ALIGNED_IMB_DELTA_MIN v8 min aligned imbalance_delta (default: 0.05)
+  PFLFT_V8_TOXICITY_MAX    v8 max ec_entry_toxicity_3 (default: 0.156)
+  PFLFT_V8_TOX_PROXY_MAX   v8 max causal toxicity_proxy_pre3; <=0 disables gate (default: 0.55)
   PNL_TICK_VALUE          dollar value per tick (default: 12.50)
   PNL_COMMISSION_PER_SIDE commission per side in $ (default: 0)
   PNL_COMMISSION_ROUND_TURN commission per round turn in $ (default: unset)
@@ -376,6 +398,91 @@ def _load_data() -> pd.DataFrame:
     df["Time"] = pd.to_datetime(df["Time"], utc=True, errors="coerce")
     df = df.sort_values(["Symbol", "Time"]).reset_index(drop=True)
     return df
+
+
+def _verify_signed_volume_sign_convention(df: pd.DataFrame) -> None:
+    """
+    Fail fast when signed_volume sign convention looks wrong.
+
+    We expect signed_volume sign to agree with same-bar mid move direction
+    on bars where there are trades and non-zero mid move (aggressor side flow).
+    """
+    if os.environ.get("VERIFY_SIGNED_VOLUME_SIGN", "1").strip() != "1":
+        raise ValueError("VERIFY_SIGNED_VOLUME_SIGN=0 is not allowed; signed-volume sign check is mandatory.")
+
+    required = {"signed_volume", "trade_count", "mid", "date", "Time"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"Signed-volume sign check requires columns {missing}")
+
+    min_bars = max(100, int(os.environ.get("SIGNED_VOLUME_SIGN_MIN_BARS", "2000")))
+    min_agree = float(os.environ.get("SIGNED_VOLUME_SIGN_MIN_AGREE", "0.80"))
+    max_ret_signed_share = float(os.environ.get("SIGNED_VOLUME_SIGN_MAX_RET_SIGN_SHARE", "0.90"))
+
+    total_bars = 0
+    total_agree = 0
+    total_ret_signed_matches = 0
+    total_ret_signed_candidates = 0
+
+    for _, g in df.groupby("date", sort=False):
+        g = g.sort_values("Time")
+        sv = pd.to_numeric(g["signed_volume"], errors="coerce").fillna(0.0)
+        tc = pd.to_numeric(g["trade_count"], errors="coerce").fillna(0.0)
+        mid = pd.to_numeric(g["mid"], errors="coerce")
+        tv = pd.to_numeric(g.get("trade_volume", 0.0), errors="coerce").fillna(0.0)
+
+        dmid_prev = (mid - mid.shift(1)).fillna(0.0)
+        mask = (tc > 0) & (sv != 0.0) & (dmid_prev != 0.0)
+        n = int(mask.sum())
+        if n == 0:
+            continue
+
+        agree = np.sign(sv[mask].to_numpy()) == np.sign(dmid_prev[mask].to_numpy())
+        total_bars += n
+        total_agree += int(np.count_nonzero(agree))
+
+        # Detect return-signed construction (volume * sign(ret_1)).
+        ret_mask = mask & (tv > 0)
+        m = int(ret_mask.sum())
+        if m > 0:
+            implied = tv[ret_mask].to_numpy() * np.sign(dmid_prev[ret_mask].to_numpy())
+            observed = sv[ret_mask].to_numpy()
+            total_ret_signed_candidates += m
+            total_ret_signed_matches += int(np.count_nonzero(np.isclose(observed, implied, atol=1e-12)))
+
+    if total_bars < min_bars:
+        raise ValueError(
+            f"Signed-volume sign check inconclusive: only {total_bars} qualifying bars "
+            f"(need >= {min_bars})."
+        )
+
+    agree_rate = total_agree / total_bars
+    ret_signed_share = (
+        total_ret_signed_matches / total_ret_signed_candidates if total_ret_signed_candidates > 0 else 0.0
+    )
+
+    print(
+        "Signed-volume sign check:",
+        {
+            "qualifying_bars": total_bars,
+            "agree_rate_same_bar_mid_move": round(float(agree_rate), 6),
+            "ret_signed_formula_match_share": round(float(ret_signed_share), 6),
+            "min_agree_required": min_agree,
+            "max_ret_signed_share_allowed": max_ret_signed_share,
+        },
+        flush=True,
+    )
+
+    if agree_rate < min_agree:
+        raise ValueError(
+            f"Signed-volume sign convention failed: agree_rate={agree_rate:.4f} < {min_agree:.4f}. "
+            "Flow direction may be inverted."
+        )
+    if ret_signed_share > max_ret_signed_share:
+        raise ValueError(
+            f"Signed-volume appears return-signed (share={ret_signed_share:.4f} > {max_ret_signed_share:.4f}). "
+            "Use aggressor-side signed volume before backtesting."
+        )
 
 
 def _build_events(
@@ -678,6 +785,7 @@ def _simulate_day(
     entry_alpha_gate_mode: str | None = None,
     entry_alpha_weak_side_mode: str = "follow",
     entry_alpha_allow_mismatch: bool = False,
+    entry_alpha_allow_mismatch_v7: bool = False,
     entry_alpha_allow_mismatch_pbra: bool = False,
     entry_alpha_family_allowlist: set[str] | None = None,
     entry_alpha_max_sl_ticks: int | None = None,
@@ -1067,6 +1175,15 @@ def _simulate_day(
         else:
             afr_flow_series = signed_vol
     spread_ticks = np.rint((ask - bid) / tick_size).astype(np.int64)
+    def _col_or_nan(col: str) -> np.ndarray:
+        if col in df_day.columns:
+            return pd.to_numeric(df_day[col], errors="coerce").to_numpy()
+        return np.full(n, np.nan, dtype=float)
+    lfp_event_buy_10 = _col_or_nan("lfp_event_buy_10")
+    lfp_event_sell_10 = _col_or_nan("lfp_event_sell_10")
+    stress_ratio = _col_or_nan("stress_ratio")
+    depth_total_top5 = _col_or_nan("depth_total_top5")
+    imbalance_delta = _col_or_nan("imbalance_delta")
     if strategy_mode == "entry_alpha_v1":
         entry_alpha_hist = {
             "last": last,
@@ -1079,6 +1196,11 @@ def _simulate_day(
             "trades": trades_arr,
             "depth_bid": top_bid_depth,
             "depth_ask": top_ask_depth,
+            "lfp_event_buy_10": lfp_event_buy_10,
+            "lfp_event_sell_10": lfp_event_sell_10,
+            "stress_ratio": stress_ratio,
+            "depth_total_top5": depth_total_top5,
+            "imbalance_delta": imbalance_delta,
         }
     cs = np.concatenate([[0.0], np.cumsum(signed_vol)])
     if tick_size <= 0:
@@ -1095,6 +1217,94 @@ def _simulate_day(
         if start > idx:
             return 0.0
         return float(np.sum(afr_flow_series[start : idx + 1]))
+
+    def _entry_edge_snapshot(entry_idx: int, side_label: str) -> Dict[str, object]:
+        """Compute causal edge-candidate features at entry time."""
+        flow_z_win = 50
+        flow_persist_win = 20
+        dmid_k = 10
+        spread_regime_win = 100
+        depth_replenish_win = 20
+        toxicity_h = 3
+        out: Dict[str, object] = {
+            "ec_flow_zscore_50": float("nan"),
+            "ec_flow_persistence_20": float("nan"),
+            "ec_dmid_ticks_10": float("nan"),
+            "ec_dmid_accel_10": float("nan"),
+            "ec_spread_regime_pct_100": float("nan"),
+            "ec_depth_imbalance_l1": float("nan"),
+            "ec_depth_replenish_rate_20": float("nan"),
+            "ec_entry_toxicity_3": float("nan"),
+            "ec_session_phase": "",
+            "ec_session_phase_id": -1,
+        }
+        if entry_idx < 0 or entry_idx >= n:
+            return out
+
+        fs = max(0, entry_idx - flow_z_win + 1)
+        flow_window = signed_vol[fs : entry_idx + 1]
+        if flow_window.size >= 5:
+            m = float(np.nanmean(flow_window))
+            s = float(np.nanstd(flow_window))
+            if np.isfinite(s) and s > 1e-9:
+                out["ec_flow_zscore_50"] = float((signed_vol[entry_idx] - m) / s)
+
+        ps = max(0, entry_idx - flow_persist_win + 1)
+        sign_window = np.sign(signed_vol[ps : entry_idx + 1])
+        if sign_window.size > 0:
+            curr_sign = np.sign(signed_vol[entry_idx])
+            nz = sign_window != 0
+            if np.any(nz):
+                out["ec_flow_persistence_20"] = float(np.mean(sign_window[nz] == curr_sign))
+
+        if entry_idx >= dmid_k and np.isfinite(mid[entry_idx]) and np.isfinite(mid[entry_idx - dmid_k]):
+            dmid_now = float((mid[entry_idx] - mid[entry_idx - dmid_k]) / tick_size)
+            out["ec_dmid_ticks_10"] = dmid_now
+            if entry_idx >= dmid_k + 1 and np.isfinite(mid[entry_idx - 1]) and np.isfinite(mid[entry_idx - 1 - dmid_k]):
+                dmid_prev = float((mid[entry_idx - 1] - mid[entry_idx - 1 - dmid_k]) / tick_size)
+                out["ec_dmid_accel_10"] = float(dmid_now - dmid_prev)
+
+        rs = max(0, entry_idx - spread_regime_win + 1)
+        spread_window = spread_ticks[rs : entry_idx + 1].astype(float)
+        if spread_window.size >= 5 and np.isfinite(spread_window[-1]):
+            out["ec_spread_regime_pct_100"] = float(np.mean(spread_window <= spread_window[-1]))
+
+        bid_d = float(top_bid_depth[entry_idx]) if entry_idx < len(top_bid_depth) else float("nan")
+        ask_d = float(top_ask_depth[entry_idx]) if entry_idx < len(top_ask_depth) else float("nan")
+        if np.isfinite(bid_d) and np.isfinite(ask_d):
+            denom = bid_d + ask_d
+            if abs(denom) > 1e-9:
+                out["ec_depth_imbalance_l1"] = float((bid_d - ask_d) / denom)
+        ds = max(1, entry_idx - depth_replenish_win + 1)
+        tot_depth = top_bid_depth[ds - 1 : entry_idx + 1] + top_ask_depth[ds - 1 : entry_idx + 1]
+        if tot_depth.size >= 3:
+            dd = np.diff(tot_depth.astype(float))
+            if dd.size > 0:
+                up = float(np.nansum(np.clip(dd, 0, None)))
+                down = float(np.nansum(np.clip(-dd, 0, None)))
+                out["ec_depth_replenish_rate_20"] = float(up / max(down, 1e-9))
+
+        # Offline diagnostic only (not causal for decisions)
+        end = min(n - 1, entry_idx + toxicity_h)
+        if end > entry_idx and np.isfinite(mid[entry_idx]):
+            fut = mid[entry_idx + 1 : end + 1]
+            if fut.size > 0 and np.any(np.isfinite(fut)):
+                if side_label == "long":
+                    out["ec_entry_toxicity_3"] = float((mid[entry_idx] - np.nanmin(fut)) / tick_size)
+                elif side_label == "short":
+                    out["ec_entry_toxicity_3"] = float((np.nanmax(fut) - mid[entry_idx]) / tick_size)
+
+        frac = float(entry_idx / max(1, n - 1))
+        if frac < 1.0 / 3.0:
+            out["ec_session_phase"] = "open"
+            out["ec_session_phase_id"] = 0
+        elif frac < 2.0 / 3.0:
+            out["ec_session_phase"] = "mid"
+            out["ec_session_phase_id"] = 1
+        else:
+            out["ec_session_phase"] = "close"
+            out["ec_session_phase_id"] = 2
+        return out
 
     srf_arm_bars_eff = int(srf_arm_bars) if srf_arm_bars is not None else 0
     lrams_arm_bars_eff = int(lrams_arm_bars) if lrams_arm_bars is not None else gate_lookback_bars
@@ -1786,13 +1996,41 @@ def _simulate_day(
                 flush=True,
             )
             gate_debug_printed += 1
-    if trade_session == "rth":
+    v7_regime_required = (
+        strategy_mode == "entry_alpha_v1"
+        and entry_alpha_params is not None
+        and bool(entry_alpha_params.pflft.V7_ENABLE)
+    )
+    times = None
+    if trade_session == "rth" or v7_regime_required:
         times = pd.to_datetime(df_day["Time"], utc=True, errors="coerce")
+    if trade_session == "rth":
         times_cst = times.dt.tz_convert("America/Chicago")
         session_ok = (times_cst.dt.time >= datetime.time(9, 30)) & (times_cst.dt.time < datetime.time(16, 0))
         session_ok = session_ok.to_numpy()
     else:
         session_ok = np.ones(n, dtype=bool)
+    if v7_regime_required and entry_alpha_hist:
+        bar_seconds = 0.0
+        if times is not None:
+            deltas = times.diff().dt.total_seconds().to_numpy()
+            deltas = deltas[np.isfinite(deltas) & (deltas > 0)]
+            if deltas.size > 0:
+                bar_seconds = float(np.median(deltas))
+        bars_30m = int(round(1800.0 / bar_seconds)) if bar_seconds > 0 else 0
+        regime_ok = np.zeros(n, dtype=bool)
+        if bars_30m >= 1 and tick_size > 0:
+            mid_series = pd.Series(mid)
+            roll_max = mid_series.rolling(bars_30m, min_periods=bars_30m).max()
+            roll_min = mid_series.rolling(bars_30m, min_periods=bars_30m).min()
+            prev_range_ticks = (roll_max - roll_min).shift(1) / float(tick_size)
+            abs_flow = pd.Series(np.abs(signed_vol))
+            prev_abs_flow = abs_flow.rolling(bars_30m, min_periods=bars_30m).sum().shift(1)
+            range_ok = prev_range_ticks > float(entry_alpha_params.pflft.V7_PREV_RANGE_MAX_TICKS)
+            flow_ok = prev_abs_flow > float(entry_alpha_params.pflft.V7_PREV_ABS_FLOW_MAX)
+            valid = prev_range_ticks.notna() & prev_abs_flow.notna()
+            regime_ok = (valid & (range_ok | flow_ok)).to_numpy()
+        entry_alpha_hist["regime_ok"] = regime_ok
 
     if baseline_mode == "not_awful":
         k = max(1, int(baseline_k_bars))
@@ -2802,6 +3040,15 @@ def _simulate_day(
                         "pflft_proof_bars": int(pos.get("pflft_proof_bars", 0)),
                         "pflft_proof_ticks": int(pos.get("pflft_proof_ticks", 0)),
                         "pflft_proof_min_flow": float(pos.get("pflft_proof_min_flow", 0.0)),
+                        "pflft_v8_opp_flow_frac_3": float(pos.get("pflft_v8_opp_flow_frac_3", float("nan"))),
+                        "pflft_v8_imb_mismatch_3": float(pos.get("pflft_v8_imb_mismatch_3", float("nan"))),
+                        "pflft_v8_thin_stress_3": float(pos.get("pflft_v8_thin_stress_3", float("nan"))),
+                        "pflft_v8_toxicity_proxy_pre3": float(
+                            pos.get("pflft_v8_toxicity_proxy_pre3", float("nan"))
+                        ),
+                        "pflft_v8_imb_aligned_3": float(pos.get("pflft_v8_imb_aligned_3", float("nan"))),
+                        "pflft_v8_stress_mean_3": float(pos.get("pflft_v8_stress_mean_3", float("nan"))),
+                        "pflft_v8_depth_mean_3": float(pos.get("pflft_v8_depth_mean_3", float("nan"))),
                         "absorption_level": float(pos.get("absorption_level", float("nan"))),
                         "break_level": float(pos.get("break_level", float("nan"))),
                         "flow_align_sum_at_entry": float(pos.get("flow_align_sum_at_entry", 0.0)),
@@ -2834,6 +3081,16 @@ def _simulate_day(
                         "srf_speed": float(pos.get("srf_speed", float("nan"))),
                         "srf_refill_ratio": float(pos.get("srf_refill_ratio", float("nan"))),
                         "srf_flow_sum": float(pos.get("srf_flow_sum", float("nan"))),
+                        "ec_flow_zscore_50": float(pos.get("ec_flow_zscore_50", float("nan"))),
+                        "ec_flow_persistence_20": float(pos.get("ec_flow_persistence_20", float("nan"))),
+                        "ec_dmid_ticks_10": float(pos.get("ec_dmid_ticks_10", float("nan"))),
+                        "ec_dmid_accel_10": float(pos.get("ec_dmid_accel_10", float("nan"))),
+                        "ec_spread_regime_pct_100": float(pos.get("ec_spread_regime_pct_100", float("nan"))),
+                        "ec_depth_imbalance_l1": float(pos.get("ec_depth_imbalance_l1", float("nan"))),
+                        "ec_depth_replenish_rate_20": float(pos.get("ec_depth_replenish_rate_20", float("nan"))),
+                        "ec_entry_toxicity_3": float(pos.get("ec_entry_toxicity_3", float("nan"))),
+                        "ec_session_phase": str(pos.get("ec_session_phase", "")),
+                        "ec_session_phase_id": int(pos.get("ec_session_phase_id", -1)),
                         "perfect_exec_same_exits_pnl_ticks": float(perfect_exec_pnl_ticks),
                         "perfect_exec_same_exits_reason": str(perfect_exec_exit_reason),
                         "perfect_exec_same_exits_exit_bar": int(perfect_exec_exit_bar),
@@ -2984,9 +3241,14 @@ def _simulate_day(
                 confirm_flow_sum = float("nan")
                 proof_best_favor = float("nan")
                 proof_flow_sum = float("nan")
+                proof_best_favor_first = float("nan")
+                proof_flow_sum_first = float("nan")
+                worst_adverse_first = float("nan")
                 proof_met = True
                 proof_pending = False
                 proof_failed = False
+                proof_fast = False
+                no_adverse_before_proof = False
                 if entry_px_ref == entry_px_ref and window_end_cur >= entry_bar_ref:
                     window = mid[entry_bar_ref : window_end_cur + 1]
                     if np.any(np.isfinite(window)):
@@ -3024,6 +3286,35 @@ def _simulate_day(
                                 proof_met = proof_met and np.isfinite(proof_flow_sum) and proof_flow_sum >= 0
                             else:
                                 proof_met = proof_met and np.isfinite(proof_flow_sum) and proof_flow_sum <= 0
+                        first_end = min(proof_end_cur, entry_bar_ref + 1)
+                        if first_end >= entry_bar_ref:
+                            first_window = mid[entry_bar_ref : first_end + 1]
+                            if np.any(np.isfinite(first_window)):
+                                if pending_entry_side == "long":
+                                    proof_best_favor_first = (np.nanmax(first_window) - entry_px_ref) / tick_size
+                                    worst_adverse_first = (np.nanmin(first_window) - entry_px_ref) / tick_size
+                                else:
+                                    proof_best_favor_first = (entry_px_ref - np.nanmin(first_window)) / tick_size
+                                    worst_adverse_first = (entry_px_ref - np.nanmax(first_window)) / tick_size
+                            ofid_window_first = signed_vol[entry_bar_ref : first_end + 1]
+                            if ofid_window_first.size > 0:
+                                proof_flow_sum_first = float(np.nansum(ofid_window_first))
+                            proof_fast = np.isfinite(proof_best_favor_first) and proof_best_favor_first >= float(
+                                proof_ticks_eff
+                            )
+                            if proof_min_flow_eff > 0:
+                                if pending_entry_side == "long":
+                                    proof_fast = proof_fast and np.isfinite(proof_flow_sum_first) and proof_flow_sum_first >= proof_min_flow_eff
+                                else:
+                                    proof_fast = proof_fast and np.isfinite(proof_flow_sum_first) and proof_flow_sum_first <= -proof_min_flow_eff
+                            else:
+                                if pending_entry_side == "long":
+                                    proof_fast = proof_fast and np.isfinite(proof_flow_sum_first) and proof_flow_sum_first >= 0
+                                else:
+                                    proof_fast = proof_fast and np.isfinite(proof_flow_sum_first) and proof_flow_sum_first <= 0
+                            no_adverse_before_proof = bool(
+                                proof_fast and np.isfinite(worst_adverse_first) and worst_adverse_first >= 0
+                            )
                         proof_pending = not proof_met and i < proof_end
                         proof_failed = not proof_met and i >= proof_end
                 ofid_ok = True
@@ -3088,6 +3379,13 @@ def _simulate_day(
                                 entry_confirm_passed_pbra_clean += 1
                         if family_key == "PFLFT_v1":
                             pflft_confirm_passed += 1
+                    if str(pending_entry.get("entry_family")) == "PFLFT_v7":
+                        v7_runner_eligible = bool(pending_entry.get("v7_runner_eligible", False))
+                        pending_entry["v7_proof_fast"] = bool(proof_fast)
+                        pending_entry["v7_no_adverse"] = bool(no_adverse_before_proof)
+                        pending_entry["v7_runner"] = bool(
+                            v7_runner_eligible and bool(proof_fast) and bool(no_adverse_before_proof)
+                        )
                     pending_confirmed = True
                     pending_payload = dict(pending_entry)
                     pending_entry_active = False
@@ -3183,6 +3481,9 @@ def _simulate_day(
         entry_alpha_tp1_px: float | None = None
         entry_alpha_tp2_px: float | None = None
         entry_alpha_time_stop: int | None = None
+        entry_alpha_proof_bars: int | None = None
+        entry_alpha_proof_ticks: int | None = None
+        entry_alpha_proof_min_flow: float | None = None
         entry_alpha_gate_override: bool | None = None
         entry_alpha_gate_reason: str | None = None
         entry_alpha_decision_signal = 0
@@ -3198,6 +3499,13 @@ def _simulate_day(
         pflft_proof_bars = 0
         pflft_proof_ticks = 0
         pflft_proof_min_flow = 0.0
+        pflft_v8_opp_flow_frac_3 = float("nan")
+        pflft_v8_imb_mismatch_3 = float("nan")
+        pflft_v8_thin_stress_3 = float("nan")
+        pflft_v8_toxicity_proxy_pre3 = float("nan")
+        pflft_v8_imb_aligned_3 = float("nan")
+        pflft_v8_stress_mean_3 = float("nan")
+        pflft_v8_depth_mean_3 = float("nan")
         confirm_bars_waited = 0
         confirm_price_ref = float("nan")
         lbo_entry_mode = ""
@@ -3283,6 +3591,15 @@ def _simulate_day(
             pflft_proof_bars = int(pending_payload.get("proof_bars_eff", 0))
             pflft_proof_ticks = int(pending_payload.get("proof_ticks_eff", 0))
             pflft_proof_min_flow = float(pending_payload.get("proof_min_flow_eff", 0.0))
+            pflft_v8_opp_flow_frac_3 = float(pending_payload.get("v8_opp_flow_frac_3", float("nan")))
+            pflft_v8_imb_mismatch_3 = float(pending_payload.get("v8_imb_mismatch_3", float("nan")))
+            pflft_v8_thin_stress_3 = float(pending_payload.get("v8_thin_stress_3", float("nan")))
+            pflft_v8_toxicity_proxy_pre3 = float(
+                pending_payload.get("v8_toxicity_proxy_pre3", float("nan"))
+            )
+            pflft_v8_imb_aligned_3 = float(pending_payload.get("v8_imb_aligned_3", float("nan")))
+            pflft_v8_stress_mean_3 = float(pending_payload.get("v8_stress_mean_3", float("nan")))
+            pflft_v8_depth_mean_3 = float(pending_payload.get("v8_depth_mean_3", float("nan")))
 
         use_srf_entry = strategy_mode == "srf_entry_v1"
         srf_trigger = False
@@ -3343,6 +3660,41 @@ def _simulate_day(
             pflft_dmid_ticks = float(decision.dmid_ticks) if decision.dmid_ticks is not None else float("nan")
             pflft_spread_ticks = float(decision.spread_ticks) if decision.spread_ticks is not None else float("nan")
             pflft_depth_min = float(decision.depth_min) if decision.depth_min is not None else float("nan")
+            pflft_v8_opp_flow_frac_3 = (
+                float(decision.v8_opp_flow_frac_3)
+                if decision.v8_opp_flow_frac_3 is not None
+                else float("nan")
+            )
+            pflft_v8_imb_mismatch_3 = (
+                float(decision.v8_imb_mismatch_3)
+                if decision.v8_imb_mismatch_3 is not None
+                else float("nan")
+            )
+            pflft_v8_thin_stress_3 = (
+                float(decision.v8_thin_stress_3)
+                if decision.v8_thin_stress_3 is not None
+                else float("nan")
+            )
+            pflft_v8_toxicity_proxy_pre3 = (
+                float(decision.v8_toxicity_proxy_pre3)
+                if decision.v8_toxicity_proxy_pre3 is not None
+                else float("nan")
+            )
+            pflft_v8_imb_aligned_3 = (
+                float(decision.v8_imb_aligned_3)
+                if decision.v8_imb_aligned_3 is not None
+                else float("nan")
+            )
+            pflft_v8_stress_mean_3 = (
+                float(decision.v8_stress_mean_3)
+                if decision.v8_stress_mean_3 is not None
+                else float("nan")
+            )
+            pflft_v8_depth_mean_3 = (
+                float(decision.v8_depth_mean_3)
+                if decision.v8_depth_mean_3 is not None
+                else float("nan")
+            )
             if (
                 decision_signal != 0
                 and entry_alpha_family_allowlist
@@ -3387,6 +3739,9 @@ def _simulate_day(
                 entry_alpha_tp1_px = decision.tp1_price
                 entry_alpha_tp2_px = decision.tp2_price
                 entry_alpha_time_stop = decision.time_stop_bars
+                entry_alpha_proof_bars = decision.proof_bars
+                entry_alpha_proof_ticks = decision.proof_ticks
+                entry_alpha_proof_min_flow = decision.proof_min_flow
                 entry_alpha_setup_bar = decision.setup_bar
                 if entry_alpha_setup_bar is None:
                     entry_alpha_setup_bar = entry_bar
@@ -3664,12 +4019,16 @@ def _simulate_day(
                     entry_alpha_gate_reason = (
                         "allowed" if entry_alpha_gate_override else (entry_alpha_block_reason or "blocked_entry_alpha")
                     )
-                    allow_mismatch = entry_alpha_allow_mismatch or (
-                        entry_alpha_allow_mismatch_pbra and entry_family == "PBRA_v1"
+                    allow_mismatch = (
+                        entry_alpha_allow_mismatch
+                        or (entry_alpha_allow_mismatch_pbra and entry_family == "PBRA_v1")
+                        or (entry_alpha_allow_mismatch_v7 and entry_family == "PFLFT_v7")
                     )
                     if entry_alpha_mismatch_flag and allow_mismatch:
                         entry_alpha_gate_override = True
-                        entry_alpha_gate_reason = "mismatch_allowed"
+                        entry_alpha_gate_reason = (
+                            "mismatch_allowed_v7" if entry_family == "PFLFT_v7" else "mismatch_allowed"
+                        )
                     if entry_alpha_gate_override:
                         entry_alpha_allowed += 1
                         if entry_alpha_mismatch_flag:
@@ -5301,6 +5660,15 @@ def _simulate_day(
                     proof_min_flow_eff = float(pflft_proof_min_flow)
                     if proof_bars_eff > confirm_bars_eff:
                         confirm_bars_eff = int(proof_bars_eff)
+                elif entry_family is not None and entry_family.startswith("PFLFT_v"):
+                    if entry_alpha_proof_bars is not None:
+                        proof_bars_eff = int(entry_alpha_proof_bars)
+                    if entry_alpha_proof_ticks is not None:
+                        proof_ticks_eff = int(entry_alpha_proof_ticks)
+                    if entry_alpha_proof_min_flow is not None:
+                        proof_min_flow_eff = float(entry_alpha_proof_min_flow)
+                    if proof_bars_eff > confirm_bars_eff:
+                        confirm_bars_eff = int(proof_bars_eff)
             if (
                 strategy_mode == "entry_alpha_v1"
                 and entry_family == "PBRA_v1"
@@ -5368,6 +5736,27 @@ def _simulate_day(
                 "pflft_depth_min": float(pflft_depth_min)
                 if np.isfinite(pflft_depth_min)
                 else float("nan"),
+                "v8_opp_flow_frac_3": float(pflft_v8_opp_flow_frac_3)
+                if np.isfinite(pflft_v8_opp_flow_frac_3)
+                else float("nan"),
+                "v8_imb_mismatch_3": float(pflft_v8_imb_mismatch_3)
+                if np.isfinite(pflft_v8_imb_mismatch_3)
+                else float("nan"),
+                "v8_thin_stress_3": float(pflft_v8_thin_stress_3)
+                if np.isfinite(pflft_v8_thin_stress_3)
+                else float("nan"),
+                "v8_toxicity_proxy_pre3": float(pflft_v8_toxicity_proxy_pre3)
+                if np.isfinite(pflft_v8_toxicity_proxy_pre3)
+                else float("nan"),
+                "v8_imb_aligned_3": float(pflft_v8_imb_aligned_3)
+                if np.isfinite(pflft_v8_imb_aligned_3)
+                else float("nan"),
+                "v8_stress_mean_3": float(pflft_v8_stress_mean_3)
+                if np.isfinite(pflft_v8_stress_mean_3)
+                else float("nan"),
+                "v8_depth_mean_3": float(pflft_v8_depth_mean_3)
+                if np.isfinite(pflft_v8_depth_mean_3)
+                else float("nan"),
                 "absorption_level": float(absorption_level) if np.isfinite(absorption_level) else float("nan"),
                 "break_level": float(break_level) if np.isfinite(break_level) else float("nan"),
                 "flow_align_sum": float(flow_align_sum),
@@ -5386,6 +5775,18 @@ def _simulate_day(
                 "impulse_ticks": float(impulse_ticks),
                 "dmid_ticks": float(dmid_ticks),
             }
+            if entry_family == "PFLFT_v7" and entry_alpha_params is not None:
+                v7_base_tp_ticks = int(entry_alpha_params.pflft.V7_TP_TICKS)
+                v7_runner_tp_ticks = int(entry_alpha_params.pflft.V7_RUNNER_TP_TICKS)
+                v7_flowint_p90 = float(entry_alpha_params.pflft.V7_FLOWINT_PRE3_P90)
+                v7_runner_eligible = (
+                    np.isfinite(pflft_flow_intensity)
+                    and np.isfinite(v7_flowint_p90)
+                    and float(pflft_flow_intensity) >= float(v7_flowint_p90)
+                )
+                pending_entry["v7_base_tp_ticks"] = v7_base_tp_ticks
+                pending_entry["v7_runner_tp_ticks"] = v7_runner_tp_ticks
+                pending_entry["v7_runner_eligible"] = bool(v7_runner_eligible)
             i = entry_bar + 1
             continue
         entry_px = _compute_fill_price(desired_side, bid[entry_bar], ask[entry_bar], mid[entry_bar], "exec")
@@ -5504,6 +5905,7 @@ def _simulate_day(
         sl_ticks_local = sl_ticks
         hold_bars_local = hold_bars
         breakeven_ticks_local = None
+        edge_snapshot = _entry_edge_snapshot(entry_bar, desired_side)
         if strategy_mode.startswith("absorption_failure"):
             if afr_tp_ticks is not None:
                 tp_ticks_local = afr_tp_ticks
@@ -5534,6 +5936,54 @@ def _simulate_day(
                 tp_ticks_local = int(entry_alpha_tp_ticks)
             if entry_alpha_tp_ticks_pbra is not None and entry_family == "PBRA_v1":
                 tp_ticks_local = int(entry_alpha_tp_ticks_pbra)
+            if (
+                entry_family == "PFLFT_v7"
+                and pending_payload is not None
+                and entry_alpha_tp_ticks is None
+            ):
+                v7_base_tp_ticks = pending_payload.get("v7_base_tp_ticks")
+                v7_runner_tp_ticks = pending_payload.get("v7_runner_tp_ticks")
+                v7_runner = bool(pending_payload.get("v7_runner", False))
+                if v7_runner and v7_runner_tp_ticks is not None and int(v7_runner_tp_ticks) > 0:
+                    tp_ticks_local = int(v7_runner_tp_ticks)
+                elif v7_base_tp_ticks is not None and int(v7_base_tp_ticks) > 0:
+                    tp_ticks_local = int(v7_base_tp_ticks)
+            # For PFLFT v7/v8, keep reward:risk anchored to the actual fill price.
+            # Proof/confirm can move the fill away from the signal price, which would
+            # otherwise compress TP while expanding SL. This restores intended ratios.
+            if entry_family in {"PFLFT_v7", "PFLFT_v8"} and entry_alpha_params is not None:
+                if entry_alpha_tp_ticks is None:
+                    if entry_family == "PFLFT_v8":
+                        tp_ticks_local = int(entry_alpha_params.pflft.V7_TP_TICKS)
+                    # v7 tp_ticks_local may already be runner/base from above
+                sl_ticks_local = int(entry_alpha_params.pflft.V7_SL_TICKS)
+            # Structural v2: regime-aware exits to improve payoff asymmetry.
+            if entry_family == "PFLFT_v2":
+                flow_z = float(edge_snapshot.get("ec_flow_zscore_50", float("nan")))
+                spread_pct = float(edge_snapshot.get("ec_spread_regime_pct_100", float("nan")))
+                depth_repl = float(edge_snapshot.get("ec_depth_replenish_rate_20", float("nan")))
+                strong = (
+                    (np.isfinite(flow_z) and flow_z >= 1.0)
+                    and (not np.isfinite(spread_pct) or spread_pct <= 0.9)
+                    and (not np.isfinite(depth_repl) or depth_repl >= 1.0)
+                )
+                weak = (
+                    (np.isfinite(flow_z) and flow_z <= -0.5)
+                    or (np.isfinite(spread_pct) and spread_pct >= 0.97)
+                    or (np.isfinite(depth_repl) and depth_repl < 0.9)
+                )
+                if strong:
+                    tp_ticks_local = max(int(tp_ticks_local), 5)
+                    sl_ticks_local = min(int(sl_ticks_local), 3)
+                    hold_bars_local = max(int(hold_bars_local), 24)
+                elif weak:
+                    tp_ticks_local = min(int(tp_ticks_local), 3)
+                    sl_ticks_local = min(int(sl_ticks_local), 2)
+                    hold_bars_local = min(int(hold_bars_local), 10)
+                else:
+                    tp_ticks_local = max(int(tp_ticks_local), 4)
+                    sl_ticks_local = min(int(sl_ticks_local), 3)
+                    hold_bars_local = min(max(int(hold_bars_local), 14), 20)
         tp_level = entry_px + (tp_ticks_local * tick_size if desired_side == "long" else -tp_ticks_local * tick_size)
         sl_level = entry_px - (sl_ticks_local * tick_size if desired_side == "long" else -sl_ticks_local * tick_size)
         pbra_scratch_bars_local = int(pbra_scratch_bars) if entry_family == "PBRA_v1" else 0
@@ -5593,6 +6043,27 @@ def _simulate_day(
             "pflft_proof_bars": int(pflft_proof_bars),
             "pflft_proof_ticks": int(pflft_proof_ticks),
             "pflft_proof_min_flow": float(pflft_proof_min_flow),
+            "pflft_v8_opp_flow_frac_3": float(pflft_v8_opp_flow_frac_3)
+            if np.isfinite(pflft_v8_opp_flow_frac_3)
+            else float("nan"),
+            "pflft_v8_imb_mismatch_3": float(pflft_v8_imb_mismatch_3)
+            if np.isfinite(pflft_v8_imb_mismatch_3)
+            else float("nan"),
+            "pflft_v8_thin_stress_3": float(pflft_v8_thin_stress_3)
+            if np.isfinite(pflft_v8_thin_stress_3)
+            else float("nan"),
+            "pflft_v8_toxicity_proxy_pre3": float(pflft_v8_toxicity_proxy_pre3)
+            if np.isfinite(pflft_v8_toxicity_proxy_pre3)
+            else float("nan"),
+            "pflft_v8_imb_aligned_3": float(pflft_v8_imb_aligned_3)
+            if np.isfinite(pflft_v8_imb_aligned_3)
+            else float("nan"),
+            "pflft_v8_stress_mean_3": float(pflft_v8_stress_mean_3)
+            if np.isfinite(pflft_v8_stress_mean_3)
+            else float("nan"),
+            "pflft_v8_depth_mean_3": float(pflft_v8_depth_mean_3)
+            if np.isfinite(pflft_v8_depth_mean_3)
+            else float("nan"),
             "lbo_entry_mode": lbo_entry_mode,
             "absorption_level": float(absorption_level) if np.isfinite(absorption_level) else float("nan"),
             "break_level": float(break_level) if np.isfinite(break_level) else float("nan"),
@@ -5631,6 +6102,16 @@ def _simulate_day(
             "pbra_runner_disable_be_limit": bool(pbra_runner_disable_be_limit_local),
             "pbra_runner_be_stop_ticks": int(pbra_runner_be_stop_ticks_local),
             "pbra_runner_armed": False,
+            "ec_flow_zscore_50": float(edge_snapshot.get("ec_flow_zscore_50", float("nan"))),
+            "ec_flow_persistence_20": float(edge_snapshot.get("ec_flow_persistence_20", float("nan"))),
+            "ec_dmid_ticks_10": float(edge_snapshot.get("ec_dmid_ticks_10", float("nan"))),
+            "ec_dmid_accel_10": float(edge_snapshot.get("ec_dmid_accel_10", float("nan"))),
+            "ec_spread_regime_pct_100": float(edge_snapshot.get("ec_spread_regime_pct_100", float("nan"))),
+            "ec_depth_imbalance_l1": float(edge_snapshot.get("ec_depth_imbalance_l1", float("nan"))),
+            "ec_depth_replenish_rate_20": float(edge_snapshot.get("ec_depth_replenish_rate_20", float("nan"))),
+            "ec_entry_toxicity_3": float(edge_snapshot.get("ec_entry_toxicity_3", float("nan"))),
+            "ec_session_phase": str(edge_snapshot.get("ec_session_phase", "")),
+            "ec_session_phase_id": int(edge_snapshot.get("ec_session_phase_id", -1)),
         }
         if strategy_mode == "srf_entry_v1":
             if not srf_trigger:
@@ -6449,6 +6930,105 @@ def _apply_entry_alpha_overrides(params: EntryAlphaParams) -> None:
     pflft_flow_int_env = os.environ.get("PFLFT_FLOW_INTENSITY_MIN", "").strip()
     pflft_lag_env = os.environ.get("PFLFT_LAG_SCORE_MIN", "").strip()
     pflft_lag_dmid_floor_env = os.environ.get("PFLFT_LAG_DMID_FLOOR_TICKS", "").strip()
+    pflft_v2_enable_env = os.environ.get("PFLFT_V2_ENABLE", "").strip().lower()
+    pflft_v2_flow_z_min_env = os.environ.get("PFLFT_V2_FLOW_Z_MIN", "").strip()
+    pflft_v2_flow_persist_min_env = os.environ.get("PFLFT_V2_FLOW_PERSIST_MIN", "").strip()
+    pflft_v2_spread_regime_max_env = os.environ.get("PFLFT_V2_SPREAD_REGIME_MAX", "").strip()
+    pflft_v2_depth_imb_min_env = os.environ.get("PFLFT_V2_DEPTH_IMB_MIN", "").strip()
+    pflft_v2_depth_repl_min_env = os.environ.get("PFLFT_V2_DEPTH_REPLENISH_MIN", "").strip()
+    pflft_v2_dmid_accel_max_env = os.environ.get("PFLFT_V2_DMID_ACCEL_MAX", "").strip()
+    pflft_v3_enable_env = os.environ.get("PFLFT_V3_ENABLE", "").strip().lower()
+    pflft_v3_long_only_env = os.environ.get("PFLFT_V3_LONG_ONLY", "").strip().lower()
+    pflft_v3_spread_max_env = os.environ.get("PFLFT_V3_SPREAD_MAX", "").strip()
+    pflft_v3_flow_int_min_env = os.environ.get("PFLFT_V3_FLOW_INTENSITY_MIN", "").strip()
+    pflft_v3_lag_max_env = os.environ.get("PFLFT_V3_LAG_SCORE_MAX", "").strip()
+    pflft_v3_dmid_min_env = os.environ.get("PFLFT_V3_DMID_MIN_TICKS", "").strip()
+    pflft_v3_dmid_max_env = os.environ.get("PFLFT_V3_DMID_MAX_TICKS", "").strip()
+    pflft_v3_depth_imb_min_env = os.environ.get("PFLFT_V3_DEPTH_IMB_MIN", "").strip()
+    pflft_v3_depth_repl_min_env = os.environ.get("PFLFT_V3_DEPTH_REPLENISH_MIN", "").strip()
+    pflft_v3_stop_env = os.environ.get("PFLFT_V3_STOP_TICKS", "").strip()
+    pflft_v3_tp_env = os.environ.get("PFLFT_V3_TP_TICKS", "").strip()
+    pflft_v3_time_stop_env = os.environ.get("PFLFT_V3_TIME_STOP_BARS", "").strip()
+    pflft_v4_enable_env = os.environ.get("PFLFT_V4_ENABLE", "").strip().lower()
+    pflft_v4_spread_max_env = os.environ.get("PFLFT_V4_SPREAD_MAX", "").strip()
+    pflft_v4_flow_z_min_env = os.environ.get("PFLFT_V4_FLOW_Z_MIN", "").strip()
+    pflft_v4_flow_persist_min_env = os.environ.get("PFLFT_V4_FLOW_PERSIST_MIN", "").strip()
+    pflft_v4_dmid_min_env = os.environ.get("PFLFT_V4_DMID_MIN_TICKS", "").strip()
+    pflft_v4_dmid_max_env = os.environ.get("PFLFT_V4_DMID_MAX_TICKS", "").strip()
+    pflft_v4_dmid_accel_max_env = os.environ.get("PFLFT_V4_DMID_ACCEL_MAX", "").strip()
+    pflft_v4_depth_imb_min_env = os.environ.get("PFLFT_V4_DEPTH_IMB_MIN", "").strip()
+    pflft_v4_stop_env = os.environ.get("PFLFT_V4_STOP_TICKS", "").strip()
+    pflft_v4_tp_env = os.environ.get("PFLFT_V4_TP_TICKS", "").strip()
+    pflft_v4_time_stop_env = os.environ.get("PFLFT_V4_TIME_STOP_BARS", "").strip()
+    pflft_v5_enable_env = os.environ.get("PFLFT_V5_ENABLE", "").strip().lower()
+    pflft_v5_long_only_env = os.environ.get("PFLFT_V5_LONG_ONLY", "").strip().lower()
+    pflft_v5_spread_max_env = os.environ.get("PFLFT_V5_SPREAD_MAX", "").strip()
+    pflft_v5_spread_regime_max_env = os.environ.get("PFLFT_V5_SPREAD_REGIME_MAX", "").strip()
+    pflft_v5_flow_z_min_env = os.environ.get("PFLFT_V5_FLOW_Z_MIN", "").strip()
+    pflft_v5_impulse_bars_env = os.environ.get("PFLFT_V5_IMPULSE_BARS", "").strip()
+    pflft_v5_impulse_min_env = os.environ.get("PFLFT_V5_IMPULSE_MIN_TICKS", "").strip()
+    pflft_v5_pullback_max_bars_env = os.environ.get("PFLFT_V5_PULLBACK_MAX_BARS", "").strip()
+    pflft_v5_pullback_min_env = os.environ.get("PFLFT_V5_PULLBACK_MIN_TICKS", "").strip()
+    pflft_v5_pullback_max_env = os.environ.get("PFLFT_V5_PULLBACK_MAX_TICKS", "").strip()
+    pflft_v5_resume_ticks_env = os.environ.get("PFLFT_V5_RESUME_TICKS", "").strip()
+    pflft_v5_resume_confirm_bars_env = os.environ.get("PFLFT_V5_RESUME_CONFIRM_BARS", "").strip()
+    pflft_v5_flow_persist_min_env = os.environ.get("PFLFT_V5_FLOW_PERSIST_MIN", "").strip()
+    pflft_v5_depth_imb_min_env = os.environ.get("PFLFT_V5_DEPTH_IMB_MIN", "").strip()
+    pflft_v5_toxicity_max_env = os.environ.get("PFLFT_V5_TOXICITY_MAX", "").strip()
+    pflft_v5_proof_bars_env = os.environ.get("PFLFT_V5_PROOF_BARS", "").strip()
+    pflft_v5_proof_ticks_env = os.environ.get("PFLFT_V5_PROOF_TICKS", "").strip()
+    pflft_v5_proof_min_flow_env = os.environ.get("PFLFT_V5_PROOF_MIN_FLOW", "").strip()
+    pflft_v5_stop_env = os.environ.get("PFLFT_V5_STOP_TICKS", "").strip()
+    pflft_v5_tp_env = os.environ.get("PFLFT_V5_TP_TICKS", "").strip()
+    pflft_v5_time_stop_env = os.environ.get("PFLFT_V5_TIME_STOP_BARS", "").strip()
+    pflft_v6_enable_env = os.environ.get("PFLFT_V6_ENABLE", "").strip().lower()
+    pflft_v6_long_only_env = os.environ.get("PFLFT_V6_LONG_ONLY", "").strip().lower()
+    pflft_v6_spread_max_env = os.environ.get("PFLFT_V6_SPREAD_MAX", "").strip()
+    pflft_v6_spread_regime_max_env = os.environ.get("PFLFT_V6_SPREAD_REGIME_MAX", "").strip()
+    pflft_v6_flow_z_min_env = os.environ.get("PFLFT_V6_FLOW_Z_MIN", "").strip()
+    pflft_v6_flow_persist_min_env = os.environ.get("PFLFT_V6_FLOW_PERSIST_MIN", "").strip()
+    pflft_v6_depth_imb_min_env = os.environ.get("PFLFT_V6_DEPTH_IMB_MIN", "").strip()
+    pflft_v6_toxicity_max_env = os.environ.get("PFLFT_V6_TOXICITY_MAX", "").strip()
+    pflft_v6_impulse_bars_env = os.environ.get("PFLFT_V6_IMPULSE_BARS", "").strip()
+    pflft_v6_impulse_min_env = os.environ.get("PFLFT_V6_IMPULSE_MIN_TICKS", "").strip()
+    pflft_v6_pullback_max_bars_env = os.environ.get("PFLFT_V6_PULLBACK_MAX_BARS", "").strip()
+    pflft_v6_pullback_min_env = os.environ.get("PFLFT_V6_PULLBACK_MIN_TICKS", "").strip()
+    pflft_v6_pullback_max_env = os.environ.get("PFLFT_V6_PULLBACK_MAX_TICKS", "").strip()
+    pflft_v6_resume_ticks_env = os.environ.get("PFLFT_V6_RESUME_TICKS", "").strip()
+    pflft_v6_confirm_bars_env = os.environ.get("PFLFT_V6_CONFIRM_BARS", "").strip()
+    pflft_v6_no_trade_dmid_low_env = os.environ.get("PFLFT_V6_NO_TRADE_DMID_LOW", "").strip()
+    pflft_v6_no_trade_dmid_high_env = os.environ.get("PFLFT_V6_NO_TRADE_DMID_HIGH", "").strip()
+    pflft_v6_proof_bars_env = os.environ.get("PFLFT_V6_PROOF_BARS", "").strip()
+    pflft_v6_proof_ticks_env = os.environ.get("PFLFT_V6_PROOF_TICKS", "").strip()
+    pflft_v6_proof_min_flow_env = os.environ.get("PFLFT_V6_PROOF_MIN_FLOW", "").strip()
+    pflft_v6_high_tp_env = os.environ.get("PFLFT_V6_HIGH_TP_TICKS", "").strip()
+    pflft_v6_high_time_stop_env = os.environ.get("PFLFT_V6_HIGH_TIME_STOP_BARS", "").strip()
+    pflft_v6_base_tp_env = os.environ.get("PFLFT_V6_BASE_TP_TICKS", "").strip()
+    pflft_v6_base_time_stop_env = os.environ.get("PFLFT_V6_BASE_TIME_STOP_BARS", "").strip()
+    pflft_v6_stop_env = os.environ.get("PFLFT_V6_STOP_TICKS", "").strip()
+    pflft_v7_enable_env = os.environ.get("PFLFT_V7_ENABLE", "").strip().lower()
+    pflft_v7_spread_max_env = os.environ.get("PFLFT_V7_SPREAD_MAX", "").strip()
+    pflft_v7_flowint_pre3_min_env = os.environ.get("PFLFT_V7_FLOWINT_PRE3_MIN", "").strip()
+    pflft_v7_sv_pre3_min_env = os.environ.get("PFLFT_V7_SV_PRE3_MIN", "").strip()
+    pflft_v7_dmid1_max_env = os.environ.get("PFLFT_V7_DMID1_MAX", "").strip()
+    pflft_v7_proof_bars_env = os.environ.get("PFLFT_V7_PROOF_BARS", "").strip()
+    pflft_v7_proof_ticks_env = os.environ.get("PFLFT_V7_PROOF_TICKS", "").strip()
+    pflft_v7_proof_min_flow_env = os.environ.get("PFLFT_V7_PROOF_MIN_FLOW", "").strip()
+    pflft_v7_time_stop_env = os.environ.get("PFLFT_V7_TIME_STOP_BARS", "").strip()
+    pflft_v7_tp_env = os.environ.get("PFLFT_V7_TP_TICKS", "").strip()
+    pflft_v7_sl_env = os.environ.get("PFLFT_V7_SL_TICKS", "").strip()
+    pflft_v7_flowint_pre3_p90_env = os.environ.get("PFLFT_V7_FLOWINT_PRE3_P90", "").strip()
+    pflft_v7_runner_tp_env = os.environ.get("PFLFT_V7_RUNNER_TP_TICKS", "").strip()
+    pflft_v7_prev_range_max_env = os.environ.get("PFLFT_V7_PREV_RANGE_MAX_TICKS", "").strip()
+    pflft_v7_prev_abs_flow_max_env = os.environ.get("PFLFT_V7_PREV_ABS_FLOW_MAX", "").strip()
+    pflft_v7_allow_mismatch_env = os.environ.get("ENTRY_ALPHA_ALLOW_MISMATCH_V7", "").strip().lower()
+    pflft_v8_enable_env = os.environ.get("PFLFT_V8_ENABLE", "").strip().lower()
+    pflft_v8_lfp_min_env = os.environ.get("PFLFT_V8_LFP_ALIGNED_10_MIN", "").strip()
+    pflft_v8_stress_min_env = os.environ.get("PFLFT_V8_STRESS_RATIO_MIN", "").strip()
+    pflft_v8_depth_max_env = os.environ.get("PFLFT_V8_DEPTH_TOTAL_TOP5_MAX", "").strip()
+    pflft_v8_imb_delta_min_env = os.environ.get("PFLFT_V8_ALIGNED_IMB_DELTA_MIN", "").strip()
+    pflft_v8_toxicity_max_env = os.environ.get("PFLFT_V8_TOXICITY_MAX", "").strip()
+    pflft_v8_tox_proxy_max_env = os.environ.get("PFLFT_V8_TOX_PROXY_MAX", "").strip()
     pflft_stop_env = os.environ.get("PFLFT_STOP_TICKS", "").strip()
     pflft_tp_env = os.environ.get("PFLFT_TP_TICKS", "").strip()
     pflft_time_stop_env = os.environ.get("PFLFT_TIME_STOP_BARS", "").strip()
@@ -6493,12 +7073,225 @@ def _apply_entry_alpha_overrides(params: EntryAlphaParams) -> None:
         params.pflft.LAG_SCORE_MIN = float(pflft_lag_env)
     if pflft_lag_dmid_floor_env:
         params.pflft.LAG_DMID_FLOOR_TICKS = max(float(pflft_lag_dmid_floor_env), 1e-9)
+    if pflft_v2_enable_env:
+        params.pflft.V2_ENABLE = pflft_v2_enable_env in {"1", "true", "yes", "on"}
+    if pflft_v2_flow_z_min_env:
+        params.pflft.V2_FLOW_Z_MIN = float(pflft_v2_flow_z_min_env)
+    if pflft_v2_flow_persist_min_env:
+        params.pflft.V2_FLOW_PERSIST_MIN = float(pflft_v2_flow_persist_min_env)
+    if pflft_v2_spread_regime_max_env:
+        params.pflft.V2_SPREAD_REGIME_MAX = float(pflft_v2_spread_regime_max_env)
+    if pflft_v2_depth_imb_min_env:
+        params.pflft.V2_DEPTH_IMB_MIN = float(pflft_v2_depth_imb_min_env)
+    if pflft_v2_depth_repl_min_env:
+        params.pflft.V2_DEPTH_REPLENISH_MIN = float(pflft_v2_depth_repl_min_env)
+    if pflft_v2_dmid_accel_max_env:
+        params.pflft.V2_DMID_ACCEL_MAX = float(pflft_v2_dmid_accel_max_env)
+    if pflft_v3_enable_env:
+        params.pflft.V3_ENABLE = pflft_v3_enable_env in {"1", "true", "yes", "on"}
+    if pflft_v3_long_only_env:
+        params.pflft.V3_LONG_ONLY = pflft_v3_long_only_env in {"1", "true", "yes", "on"}
+    if pflft_v3_spread_max_env:
+        params.pflft.V3_SPREAD_MAX = int(pflft_v3_spread_max_env)
+    if pflft_v3_flow_int_min_env:
+        params.pflft.V3_FLOW_INTENSITY_MIN = float(pflft_v3_flow_int_min_env)
+    if pflft_v3_lag_max_env:
+        params.pflft.V3_LAG_SCORE_MAX = float(pflft_v3_lag_max_env)
+    if pflft_v3_dmid_min_env:
+        params.pflft.V3_DMID_MIN_TICKS = float(pflft_v3_dmid_min_env)
+    if pflft_v3_dmid_max_env:
+        params.pflft.V3_DMID_MAX_TICKS = float(pflft_v3_dmid_max_env)
+    if pflft_v3_depth_imb_min_env:
+        params.pflft.V3_DEPTH_IMB_MIN = float(pflft_v3_depth_imb_min_env)
+    if pflft_v3_depth_repl_min_env:
+        params.pflft.V3_DEPTH_REPLENISH_MIN = float(pflft_v3_depth_repl_min_env)
+    if pflft_v3_stop_env:
+        params.pflft.V3_STOP_TICKS = int(pflft_v3_stop_env)
+    if pflft_v3_tp_env:
+        params.pflft.V3_TP_TICKS = int(pflft_v3_tp_env)
+    if pflft_v3_time_stop_env:
+        params.pflft.V3_TIME_STOP_BARS = int(pflft_v3_time_stop_env)
+    if pflft_v4_enable_env:
+        params.pflft.V4_ENABLE = pflft_v4_enable_env in {"1", "true", "yes", "on"}
+    if pflft_v4_spread_max_env:
+        params.pflft.V4_SPREAD_MAX = int(pflft_v4_spread_max_env)
+    if pflft_v4_flow_z_min_env:
+        params.pflft.V4_FLOW_Z_MIN = float(pflft_v4_flow_z_min_env)
+    if pflft_v4_flow_persist_min_env:
+        params.pflft.V4_FLOW_PERSIST_MIN = float(pflft_v4_flow_persist_min_env)
+    if pflft_v4_dmid_min_env:
+        params.pflft.V4_DMID_MIN_TICKS = float(pflft_v4_dmid_min_env)
+    if pflft_v4_dmid_max_env:
+        params.pflft.V4_DMID_MAX_TICKS = float(pflft_v4_dmid_max_env)
+    if pflft_v4_dmid_accel_max_env:
+        params.pflft.V4_DMID_ACCEL_MAX = float(pflft_v4_dmid_accel_max_env)
+    if pflft_v4_depth_imb_min_env:
+        params.pflft.V4_DEPTH_IMB_MIN = float(pflft_v4_depth_imb_min_env)
+    if pflft_v4_stop_env:
+        params.pflft.V4_STOP_TICKS = int(pflft_v4_stop_env)
+    if pflft_v4_tp_env:
+        params.pflft.V4_TP_TICKS = int(pflft_v4_tp_env)
+    if pflft_v4_time_stop_env:
+        params.pflft.V4_TIME_STOP_BARS = int(pflft_v4_time_stop_env)
+    if pflft_v5_enable_env:
+        params.pflft.V5_ENABLE = pflft_v5_enable_env in {"1", "true", "yes", "on"}
+    if pflft_v5_long_only_env:
+        params.pflft.V5_LONG_ONLY = pflft_v5_long_only_env in {"1", "true", "yes", "on"}
+    if pflft_v5_spread_max_env:
+        params.pflft.V5_SPREAD_MAX = int(pflft_v5_spread_max_env)
+    if pflft_v5_spread_regime_max_env:
+        params.pflft.V5_SPREAD_REGIME_MAX = float(pflft_v5_spread_regime_max_env)
+    if pflft_v5_flow_z_min_env:
+        params.pflft.V5_FLOW_Z_MIN = float(pflft_v5_flow_z_min_env)
+    if pflft_v5_impulse_bars_env:
+        params.pflft.V5_IMPULSE_BARS = int(pflft_v5_impulse_bars_env)
+    if pflft_v5_impulse_min_env:
+        params.pflft.V5_IMPULSE_MIN_TICKS = float(pflft_v5_impulse_min_env)
+    if pflft_v5_pullback_max_bars_env:
+        params.pflft.V5_PULLBACK_MAX_BARS = int(pflft_v5_pullback_max_bars_env)
+    if pflft_v5_pullback_min_env:
+        params.pflft.V5_PULLBACK_MIN_TICKS = float(pflft_v5_pullback_min_env)
+    if pflft_v5_pullback_max_env:
+        params.pflft.V5_PULLBACK_MAX_TICKS = float(pflft_v5_pullback_max_env)
+    if pflft_v5_resume_ticks_env:
+        params.pflft.V5_RESUME_TICKS = float(pflft_v5_resume_ticks_env)
+    if pflft_v5_resume_confirm_bars_env:
+        params.pflft.V5_RESUME_CONFIRM_BARS = int(pflft_v5_resume_confirm_bars_env)
+    if pflft_v5_flow_persist_min_env:
+        params.pflft.V5_FLOW_PERSIST_MIN = float(pflft_v5_flow_persist_min_env)
+    if pflft_v5_depth_imb_min_env:
+        params.pflft.V5_DEPTH_IMB_MIN = float(pflft_v5_depth_imb_min_env)
+    if pflft_v5_toxicity_max_env:
+        params.pflft.V5_TOXICITY_MAX = float(pflft_v5_toxicity_max_env)
+    if pflft_v5_proof_bars_env:
+        params.pflft.V5_PROOF_BARS = int(pflft_v5_proof_bars_env)
+    if pflft_v5_proof_ticks_env:
+        params.pflft.V5_PROOF_TICKS = int(pflft_v5_proof_ticks_env)
+    if pflft_v5_proof_min_flow_env:
+        params.pflft.V5_PROOF_MIN_FLOW = float(pflft_v5_proof_min_flow_env)
+    if pflft_v5_stop_env:
+        params.pflft.V5_STOP_TICKS = int(pflft_v5_stop_env)
+    if pflft_v5_tp_env:
+        params.pflft.V5_TP_TICKS = int(pflft_v5_tp_env)
+    if pflft_v5_time_stop_env:
+        params.pflft.V5_TIME_STOP_BARS = int(pflft_v5_time_stop_env)
+    if pflft_v6_enable_env:
+        params.pflft.V6_ENABLE = pflft_v6_enable_env in {"1", "true", "yes", "on"}
+    if pflft_v6_long_only_env:
+        params.pflft.V6_LONG_ONLY = pflft_v6_long_only_env in {"1", "true", "yes", "on"}
+    if pflft_v6_spread_max_env:
+        params.pflft.V6_SPREAD_MAX = int(pflft_v6_spread_max_env)
+    if pflft_v6_spread_regime_max_env:
+        params.pflft.V6_SPREAD_REGIME_MAX = float(pflft_v6_spread_regime_max_env)
+    if pflft_v6_flow_z_min_env:
+        params.pflft.V6_FLOW_Z_MIN = float(pflft_v6_flow_z_min_env)
+    if pflft_v6_flow_persist_min_env:
+        params.pflft.V6_FLOW_PERSIST_MIN = float(pflft_v6_flow_persist_min_env)
+    if pflft_v6_depth_imb_min_env:
+        params.pflft.V6_DEPTH_IMB_MIN = float(pflft_v6_depth_imb_min_env)
+    if pflft_v6_toxicity_max_env:
+        params.pflft.V6_TOXICITY_MAX = float(pflft_v6_toxicity_max_env)
+    if pflft_v6_impulse_bars_env:
+        params.pflft.V6_IMPULSE_BARS = int(pflft_v6_impulse_bars_env)
+    if pflft_v6_impulse_min_env:
+        params.pflft.V6_IMPULSE_MIN_TICKS = float(pflft_v6_impulse_min_env)
+    if pflft_v6_pullback_max_bars_env:
+        params.pflft.V6_PULLBACK_MAX_BARS = int(pflft_v6_pullback_max_bars_env)
+    if pflft_v6_pullback_min_env:
+        params.pflft.V6_PULLBACK_MIN_TICKS = float(pflft_v6_pullback_min_env)
+    if pflft_v6_pullback_max_env:
+        params.pflft.V6_PULLBACK_MAX_TICKS = float(pflft_v6_pullback_max_env)
+    if pflft_v6_resume_ticks_env:
+        params.pflft.V6_RESUME_TICKS = float(pflft_v6_resume_ticks_env)
+    if pflft_v6_confirm_bars_env:
+        params.pflft.V6_CONFIRM_BARS = int(pflft_v6_confirm_bars_env)
+    if pflft_v6_no_trade_dmid_low_env:
+        params.pflft.V6_NO_TRADE_DMID_LOW = float(pflft_v6_no_trade_dmid_low_env)
+    if pflft_v6_no_trade_dmid_high_env:
+        params.pflft.V6_NO_TRADE_DMID_HIGH = float(pflft_v6_no_trade_dmid_high_env)
+    if pflft_v6_proof_bars_env:
+        params.pflft.V6_PROOF_BARS = int(pflft_v6_proof_bars_env)
+    if pflft_v6_proof_ticks_env:
+        params.pflft.V6_PROOF_TICKS = int(pflft_v6_proof_ticks_env)
+    if pflft_v6_proof_min_flow_env:
+        params.pflft.V6_PROOF_MIN_FLOW = float(pflft_v6_proof_min_flow_env)
+    if pflft_v6_high_tp_env:
+        params.pflft.V6_HIGH_TP_TICKS = int(pflft_v6_high_tp_env)
+    if pflft_v6_high_time_stop_env:
+        params.pflft.V6_HIGH_TIME_STOP_BARS = int(pflft_v6_high_time_stop_env)
+    if pflft_v6_base_tp_env:
+        params.pflft.V6_BASE_TP_TICKS = int(pflft_v6_base_tp_env)
+    if pflft_v6_base_time_stop_env:
+        params.pflft.V6_BASE_TIME_STOP_BARS = int(pflft_v6_base_time_stop_env)
+    if pflft_v6_stop_env:
+        params.pflft.V6_STOP_TICKS = int(pflft_v6_stop_env)
+    if pflft_v7_enable_env:
+        params.pflft.V7_ENABLE = pflft_v7_enable_env in {"1", "true", "yes", "on"}
+    if pflft_v7_spread_max_env:
+        params.pflft.V7_SPREAD_MAX = int(pflft_v7_spread_max_env)
+    if pflft_v7_flowint_pre3_min_env:
+        params.pflft.V7_FLOWINT_PRE3_MIN = float(pflft_v7_flowint_pre3_min_env)
+    if pflft_v7_sv_pre3_min_env:
+        params.pflft.V7_SV_PRE3_MIN = float(pflft_v7_sv_pre3_min_env)
+    if pflft_v7_dmid1_max_env:
+        params.pflft.V7_DMID1_MAX = float(pflft_v7_dmid1_max_env)
+    if pflft_v7_proof_bars_env:
+        params.pflft.V7_PROOF_BARS = int(pflft_v7_proof_bars_env)
+    if pflft_v7_proof_ticks_env:
+        params.pflft.V7_PROOF_TICKS = int(pflft_v7_proof_ticks_env)
+    if pflft_v7_proof_min_flow_env:
+        params.pflft.V7_PROOF_MIN_FLOW = float(pflft_v7_proof_min_flow_env)
+    if pflft_v7_time_stop_env:
+        params.pflft.V7_TIME_STOP_BARS = int(pflft_v7_time_stop_env)
+    if pflft_v7_tp_env:
+        params.pflft.V7_TP_TICKS = int(pflft_v7_tp_env)
+    if pflft_v7_sl_env:
+        params.pflft.V7_SL_TICKS = int(pflft_v7_sl_env)
+    if pflft_v7_flowint_pre3_p90_env:
+        params.pflft.V7_FLOWINT_PRE3_P90 = float(pflft_v7_flowint_pre3_p90_env)
+    if pflft_v7_runner_tp_env:
+        params.pflft.V7_RUNNER_TP_TICKS = int(pflft_v7_runner_tp_env)
+    if pflft_v7_prev_range_max_env:
+        params.pflft.V7_PREV_RANGE_MAX_TICKS = float(pflft_v7_prev_range_max_env)
+    if pflft_v7_prev_abs_flow_max_env:
+        params.pflft.V7_PREV_ABS_FLOW_MAX = float(pflft_v7_prev_abs_flow_max_env)
+    if pflft_v7_allow_mismatch_env:
+        params.pflft.V7_ALLOW_MISMATCH = pflft_v7_allow_mismatch_env in {"1", "true", "yes", "on"}
+    if pflft_v8_enable_env:
+        params.pflft.V8_ENABLE = pflft_v8_enable_env in {"1", "true", "yes", "on"}
+    if pflft_v8_lfp_min_env:
+        params.pflft.V8_LFP_ALIGNED_10_MIN = float(pflft_v8_lfp_min_env)
+    if pflft_v8_stress_min_env:
+        params.pflft.V8_STRESS_RATIO_MIN = float(pflft_v8_stress_min_env)
+    if pflft_v8_depth_max_env:
+        params.pflft.V8_DEPTH_TOTAL_TOP5_MAX = float(pflft_v8_depth_max_env)
+    if pflft_v8_imb_delta_min_env:
+        params.pflft.V8_ALIGNED_IMB_DELTA_MIN = float(pflft_v8_imb_delta_min_env)
+    if pflft_v8_toxicity_max_env:
+        params.pflft.V8_TOXICITY_MAX = float(pflft_v8_toxicity_max_env)
+    if pflft_v8_tox_proxy_max_env:
+        params.pflft.V8_TOX_PROXY_MAX = float(pflft_v8_tox_proxy_max_env)
+        params.pflft.V8_TOX_PROXY_ENABLE = params.pflft.V8_TOX_PROXY_MAX > 0.0
     if pflft_stop_env:
         params.pflft.STOP_TICKS = int(pflft_stop_env)
     if pflft_tp_env:
         params.pflft.TP_TICKS = int(pflft_tp_env)
     if pflft_time_stop_env:
         params.pflft.TIME_STOP_BARS = int(pflft_time_stop_env)
+    # Fail fast: v6 analysis is invalid if proof gating is disabled.
+    if params.pflft.V6_ENABLE:
+        if int(params.pflft.V6_PROOF_BARS) <= 0 or int(params.pflft.V6_PROOF_TICKS) <= 0:
+            raise ValueError(
+                "PFLFT_v6 requires proof gating enabled. "
+                "Set PFLFT_V6_PROOF_BARS >= 1 and PFLFT_V6_PROOF_TICKS >= 1."
+            )
+    # Fail fast: v7 analysis is invalid if proof gating is disabled.
+    if params.pflft.V7_ENABLE:
+        if int(params.pflft.V7_PROOF_BARS) <= 0 or int(params.pflft.V7_PROOF_TICKS) <= 0:
+            raise ValueError(
+                "PFLFT_v7 requires proof gating enabled. "
+                "Set PFLFT_V7_PROOF_BARS >= 1 and PFLFT_V7_PROOF_TICKS >= 1."
+            )
 
 def _entry_alpha_forward_stats(
     trades: pd.DataFrame, df_day: pd.DataFrame, tick_size: float, horizons: List[int]
@@ -6586,6 +7379,7 @@ def _run_entry_alpha_ablation(
                 entry_alpha_params=entry_alpha_params,
                 entry_alpha_gate_mode=entry_alpha_gate_mode,
                 entry_alpha_allow_mismatch=entry_alpha_allow_mismatch,
+                entry_alpha_allow_mismatch_v7=entry_alpha_allow_mismatch_v7,
                 entry_alpha_allow_mismatch_pbra=entry_alpha_allow_mismatch_pbra,
                 strategy_mode="entry_alpha_v1",
                 gated=gated_mode,
@@ -7377,6 +8171,15 @@ def main() -> None:
     }
     if entry_alpha_allow_mismatch:
         print("ENTRY_ALPHA_ALLOW_MISMATCH enabled: shadow-allow mismatches", flush=True)
+    entry_alpha_allow_mismatch_v7 = os.environ.get("ENTRY_ALPHA_ALLOW_MISMATCH_V7", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    if entry_alpha_allow_mismatch_v7:
+        print("ENTRY_ALPHA_ALLOW_MISMATCH_V7 enabled: allow PFLFT_v7 mismatch", flush=True)
     entry_alpha_allow_mismatch_pbra = os.environ.get("ENTRY_ALPHA_ALLOW_MISMATCH_PBRA", "0").strip().lower() in {
         "1",
         "true",
@@ -7458,6 +8261,14 @@ def main() -> None:
     if os.environ.get("SRF_ARM_SELF_TEST", "0").strip() == "1":
         _self_test_srf_arm_window()
         return
+    # Validate entry-alpha overrides early so smoke checks can fail fast.
+    entry_alpha_params = EntryAlphaParams()
+    _apply_entry_alpha_overrides(entry_alpha_params)
+    if entry_alpha_params.pflft.V7_ENABLE:
+        if entry_confirm_style != "price_only" or entry_confirm_bars <= 0:
+            raise ValueError(
+                "PFLFT_v7 requires ENTRY_CONFIRM_STYLE=price_only and ENTRY_CONFIRM_BARS >= 1."
+            )
     if os.environ.get("ENTRY_ALPHA_SELF_TEST", "0").strip() == "1":
         print("ENTRY_ALPHA_SELF_TEST: start", flush=True)
         entry_alpha_self_test(tick_size=tick_size)
@@ -7515,8 +8326,6 @@ def main() -> None:
         print("Warning: USE_ALL_AVAILABLE_DAYS selected fewer than 5 days; low-confidence results.", flush=True)
     if len(selected_days) < 3:
         print("Warning: fewer than 3 days selected; continuing.", flush=True)
-    entry_alpha_params = EntryAlphaParams()
-    _apply_entry_alpha_overrides(entry_alpha_params)
     print(
         "Run config:",
         {
@@ -7599,6 +8408,75 @@ def main() -> None:
             if entry_alpha_params is not None
             else None,
             "pflft_time_stop_bars": entry_alpha_params.pflft.TIME_STOP_BARS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v7_enable": entry_alpha_params.pflft.V7_ENABLE
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v7_spread_max": entry_alpha_params.pflft.V7_SPREAD_MAX
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v7_flowint_pre3_min": entry_alpha_params.pflft.V7_FLOWINT_PRE3_MIN
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v7_sv_pre3_min": entry_alpha_params.pflft.V7_SV_PRE3_MIN
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v7_dmid1_max": entry_alpha_params.pflft.V7_DMID1_MAX
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v7_proof_bars": entry_alpha_params.pflft.V7_PROOF_BARS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v7_proof_ticks": entry_alpha_params.pflft.V7_PROOF_TICKS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v7_proof_min_flow": entry_alpha_params.pflft.V7_PROOF_MIN_FLOW
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v7_time_stop_bars": entry_alpha_params.pflft.V7_TIME_STOP_BARS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v7_tp_ticks": entry_alpha_params.pflft.V7_TP_TICKS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v7_sl_ticks": entry_alpha_params.pflft.V7_SL_TICKS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v7_flowint_pre3_p90": entry_alpha_params.pflft.V7_FLOWINT_PRE3_P90
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v7_runner_tp_ticks": entry_alpha_params.pflft.V7_RUNNER_TP_TICKS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v7_prev_range_max_ticks": entry_alpha_params.pflft.V7_PREV_RANGE_MAX_TICKS
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v7_prev_abs_flow_max": entry_alpha_params.pflft.V7_PREV_ABS_FLOW_MAX
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v8_enable": entry_alpha_params.pflft.V8_ENABLE
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v8_lfp_aligned_10_min": entry_alpha_params.pflft.V8_LFP_ALIGNED_10_MIN
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v8_stress_ratio_min": entry_alpha_params.pflft.V8_STRESS_RATIO_MIN
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v8_depth_total_top5_max": entry_alpha_params.pflft.V8_DEPTH_TOTAL_TOP5_MAX
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v8_aligned_imb_delta_min": entry_alpha_params.pflft.V8_ALIGNED_IMB_DELTA_MIN
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v8_toxicity_max": entry_alpha_params.pflft.V8_TOXICITY_MAX
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v8_tox_proxy_enable": entry_alpha_params.pflft.V8_TOX_PROXY_ENABLE
+            if entry_alpha_params is not None
+            else None,
+            "pflft_v8_tox_proxy_max": entry_alpha_params.pflft.V8_TOX_PROXY_MAX
             if entry_alpha_params is not None
             else None,
             "pbra_enter_proof_bars": pbra_enter_proof_bars,
@@ -7897,6 +8775,7 @@ def main() -> None:
     df = df[(df["Symbol"] == instrument) & (df["date"].isin(selected_days))].reset_index(drop=True)
     if df.empty:
         raise ValueError("No data after applying date filters.")
+    _verify_signed_volume_sign_convention(df)
     events = _build_events(
         df,
         v_min=v_min,
@@ -8412,6 +9291,7 @@ def main() -> None:
                                     weak_side_lookback_bars=weak_side_lookback_bars,
                                     entry_alpha_weak_side_mode=entry_alpha_weak_side_mode,
                                     entry_alpha_allow_mismatch=entry_alpha_allow_mismatch,
+                                    entry_alpha_allow_mismatch_v7=entry_alpha_allow_mismatch_v7,
                                     entry_alpha_allow_mismatch_pbra=entry_alpha_allow_mismatch_pbra,
                                     entry_alpha_family_allowlist=entry_alpha_family_allowlist,
                                     entry_alpha_max_sl_ticks=entry_alpha_max_sl_ticks,
@@ -8799,9 +9679,10 @@ def main() -> None:
                                 min_spread_ticks=min_spread_ticks,
                                 entry_cooldown_bars=entry_cooldown_bars,
                                 gate_lookback_bars=gate_lookback_bars,
-                                    weak_side_lookback_bars=weak_side_lookback_bars,
+                                weak_side_lookback_bars=weak_side_lookback_bars,
                                 entry_alpha_weak_side_mode=entry_alpha_weak_side_mode,
                                 entry_alpha_allow_mismatch=entry_alpha_allow_mismatch,
+                                entry_alpha_allow_mismatch_v7=entry_alpha_allow_mismatch_v7,
                                 entry_alpha_allow_mismatch_pbra=entry_alpha_allow_mismatch_pbra,
                                 entry_alpha_family_allowlist=entry_alpha_family_allowlist,
                                     entry_alpha_max_sl_ticks=entry_alpha_max_sl_ticks,

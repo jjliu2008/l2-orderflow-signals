@@ -677,6 +677,10 @@ def _build_screening_config(
     screening: ScreeningConfig,
 ) -> Tuple[Path, Dict[str, object]]:
     cfg_data = _load_json(experiment_config)
+    guardrails = cfg_data.get("guardrails", {})
+    if not isinstance(guardrails, dict):
+        guardrails = {}
+    cfg_data["guardrails"] = {**guardrails, "allow_screening_split_override": True}
     data_days = cfg_data.get("data_days", {})
     if isinstance(data_days, dict):
         ts = str(data_days.get("train_start", ""))

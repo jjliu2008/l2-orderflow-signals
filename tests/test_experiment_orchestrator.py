@@ -229,6 +229,37 @@ class TestExperimentOrchestrator(unittest.TestCase):
             self.assertIn("confirm_failed", best_block_reasons)
             self.assertGreater(best_block_reasons["confirm_failed"], 0.0)
 
+    def test_build_screening_config_sets_guardrail_override(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            tmp_path = Path(d)
+            base_cfg_path = tmp_path / "experiment_agent.json"
+            base_cfg_path.write_text(
+                json.dumps(
+                    {
+                        "data_days": {
+                            "train_start": "2025-12-01",
+                            "train_end": "2025-12-12",
+                            "lock_start": "2025-12-13",
+                            "lock_end": "2025-12-18",
+                        },
+                        "grid": [{"name": "A", "env": {}}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            screening = eo.ScreeningConfig(
+                enabled=True,
+                train_days=3,
+                lock_days=2,
+                top_k=2,
+                min_valid_runs=1,
+                full_run_on_positive_only=True,
+                positive_lock_ev_threshold=0.0,
+            )
+            screen_cfg_path, _ = eo._build_screening_config(base_cfg_path, tmp_path / "_screen", screening)
+            screen_cfg = json.loads(screen_cfg_path.read_text(encoding="utf-8"))
+            self.assertTrue(screen_cfg.get("guardrails", {}).get("allow_screening_split_override", False))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ Env vars:
   DATA_DIR_RAW      raw data root (default: data/raw)
   OUTPUT_DIR        processed output root (default: data/processed)
   INSTRUMENT        instrument symbol (default: ES)
+  FRONT_MONTH_RAW   optional raw symbol to keep (e.g., ESZ5) — required when auto-detect fails (e.g., file starts before midnight UTC)
   FRONT_MONTH_ID    optional instrument_id to keep
   STEP_MS           bar size in ms (default: 100)
   LFP_TICK_SIZE     tick size override (optional)
@@ -54,6 +55,19 @@ def _discover_raw_files(raw_root: Path, date_str: str) -> tuple[list[Path], list
         "sample_candidates": [str(p) for p in candidates[:10]],
     }
     return mbp, trades, report
+
+
+def _resolve_dbn_path(p: Path) -> Path:
+    """Databento downloads wrap the actual .dbn inside a same-named directory.
+
+    e.g.  .../foo.mbp-10.dbn/foo.mbp-10.dbn   <- real file inside a dir
+    If *p* is a directory and contains a single .dbn file, return that file.
+    """
+    if p.is_dir():
+        candidates = list(p.glob("*.dbn"))
+        if len(candidates) == 1:
+            return candidates[0]
+    return p
 
 
 def _rank_matches(paths: list[Path], date_str: str) -> list[Path]:
@@ -101,6 +115,7 @@ def main() -> None:
     output_dir = os.environ.get("OUTPUT_DIR", "data/processed")
     instrument = os.environ.get("INSTRUMENT", "ES")
     front_month_id = os.environ.get("FRONT_MONTH_ID", "").strip()
+    front_month_raw = os.environ.get("FRONT_MONTH_RAW", "").strip()
     step_ms = os.environ.get("STEP_MS", "100")
     lfp_tick_size = os.environ.get("LFP_TICK_SIZE", "").strip()
     raw_root = Path(os.environ.get("DATA_DIR_RAW", "data/raw")).expanduser().resolve()
@@ -113,9 +128,9 @@ def main() -> None:
         mbp_paths: list[Path] = []
         trade_paths: list[Path] = []
         if mbp_path and Path(mbp_path).exists():
-            mbp_paths = [Path(mbp_path)]
+            mbp_paths = [_resolve_dbn_path(Path(mbp_path))]
         if trades_path and Path(trades_path).exists():
-            trade_paths = [Path(trades_path)]
+            trade_paths = [_resolve_dbn_path(Path(trades_path))]
 
         if (mbp_path and not mbp_paths) or (trades_path and not trade_paths):
             print("Template path missing; falling back to discovery.", flush=True)
@@ -125,9 +140,9 @@ def main() -> None:
             print(f"Discovery report for {date}: {report}", flush=True)
             if not mbp_paths:
                 ranked = _rank_matches(mbp_found, date)
-                mbp_paths = ranked[:1]
+                mbp_paths = [_resolve_dbn_path(p) for p in ranked[:1]]
                 if ranked:
-                    print(f"Selected MBP: {ranked[0]}", flush=True)
+                    print(f"Selected MBP: {mbp_paths[0]}", flush=True)
                     if len(ranked) > 1:
                         print(f"Top MBP alternatives: {[str(p) for p in ranked[1:6]]}", flush=True)
             if not trade_paths:
@@ -137,9 +152,11 @@ def main() -> None:
                     print(f"Selected TRADES: {ranked[0]}", flush=True)
                     if len(ranked) > 1:
                         print(f"Top TRADES alternatives: {[str(p) for p in ranked[1:6]]}", flush=True)
-        if not mbp_paths or not trade_paths:
-            print(f"Skipping {date}: missing raw MBP or TRADES file.", flush=True)
+        if not mbp_paths:
+            print(f"Skipping {date}: no MBP file found.", flush=True)
             continue
+        if not trade_paths:
+            print(f"No TRADES file for {date}; proceeding MBP-only.", flush=True)
         env = os.environ.copy()
         if mbp_paths:
             env["INPUT_MBP_DBN"] = str(mbp_paths[0])
@@ -150,6 +167,8 @@ def main() -> None:
         env["STEP_MS"] = step_ms
         if front_month_id:
             env["FRONT_MONTH_ID"] = front_month_id
+        if front_month_raw:
+            env["FRONT_MONTH_RAW"] = front_month_raw
         if lfp_tick_size:
             env["LFP_TICK_SIZE"] = lfp_tick_size
         env["DATE_FILTER"] = date

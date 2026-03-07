@@ -1,26 +1,49 @@
 {
-  "run_id": "reentry_chop_guard_v1",
+  "run_id": "pflft_v8_regime_v1",
   "strategy_mode": "entry_alpha_v1",
   "family_allowlist": [
-    "PFLFT_v1"
+    "PFLFT_v8"
   ],
   "fixed_env": {
     "VALIDATE_DEBUG": "0",
     "ENTRY_CONFIRM_STYLE": "price_only",
     "ENTRY_CONFIRM_BARS": "2",
+    "ENTRY_ALPHA_ALLOW_MISMATCH_V7": "1",
     "DISABLE_GATE": "0",
     "PNL_TICK_VALUE": "12.5",
     "PNL_COMMISSION_ROUND_TURN": "1.2",
     "PNL_SLIPPAGE_TICKS": "1",
-    "PFLFT_STOP_TICKS": "3",
-    "PFLFT_TP_TICKS": "4",
-    "PFLFT_TIME_STOP_BARS": "20"
+    "PFLFT_V7_ENABLE": "1",
+    "PFLFT_V7_SPREAD_MAX": "1",
+    "PFLFT_V7_FLOWINT_PRE3_MIN": "15",
+    "PFLFT_V7_SV_PRE3_MIN": "12",
+    "PFLFT_V7_DMID1_MAX": "1",
+    "PFLFT_V7_PROOF_BARS": "2",
+    "PFLFT_V7_PROOF_TICKS": "1",
+    "PFLFT_V7_PROOF_MIN_FLOW": "0",
+    "PFLFT_V7_TIME_STOP_BARS": "5",
+    "PFLFT_V7_TP_TICKS": "1",
+    "PFLFT_V7_SL_TICKS": "1",
+    "PFLFT_V7_FLOWINT_PRE3_P90": "25",
+    "PFLFT_V7_RUNNER_TP_TICKS": "4",
+    "PFLFT_V7_PREV_RANGE_MAX_TICKS": "15",
+    "PFLFT_V7_PREV_ABS_FLOW_MAX": "20000",
+    "PFLFT_V8_ENABLE": "1",
+    "PFLFT_V8_LFP_ALIGNED_10_MIN": "0.58",
+    "PFLFT_V8_STRESS_RATIO_MIN": "0.18",
+    "PFLFT_V8_DEPTH_TOTAL_TOP5_MAX": "640",
+    "PFLFT_V8_ALIGNED_IMB_DELTA_MIN": "0.05",
+    "PFLFT_V8_TOXICITY_MAX": "0.156",
+    "PFLFT_V8_TOX_PROXY_MAX": "0"
   },
   "data_days": {
-    "train_start": "2025-12-01",
-    "train_end": "2025-12-12",
-    "lock_start": "2025-12-13",
-    "lock_end": "2025-12-18"
+    "train_start": "2025-12-02",
+    "train_end": "2025-12-02",
+    "lock_start": "2025-12-03",
+    "lock_end": "2025-12-03"
+  },
+  "guardrails": {
+    "allow_screening_split_override": true
   },
   "min_trades": {
     "train": 120,

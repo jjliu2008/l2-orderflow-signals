@@ -29,27 +29,74 @@
     "configs/experiment_agent.json"
   ],
   "allowed_knobs": {
-    "PFLFT_FLOW_WIN_BARS": ["10", "20", "40"],
-    "PFLFT_SPREAD_MAX": ["1", "2"],
-    "PFLFT_DMID_ABS_MAX_TICKS": ["1", "2"],
-    "PFLFT_LAG_SCORE_MIN": ["low", "mid", "high", "10"],
-    "PFLFT_PROOF_MAX_BARS": ["0", "3", "5"],
-    "PFLFT_PROOF_TICKS": ["1", "2"],
-    "PFLFT_CONFIRM_MIN_ABS_OFID": ["5", "8", "12"],
-    "PFLFT_CONFIRM_MIN_FLOW_SUM": ["0", "5", "8"],
-    "PFLFT_PROOF_MIN_FLOW": ["0", "5", "8"],
-    "TRADE_START_HHMM": ["0000", "0930", "1130", "1400"],
-    "TRADE_END_HHMM": ["2359", "1130", "1400", "1555"],
-    "TRADE_SESSION": ["all", "rth"]
+    "PFLFT_FLOW_WIN_BARS": [
+      "10",
+      "20",
+      "40"
+    ],
+    "PFLFT_SPREAD_MAX": [
+      "1",
+      "2"
+    ],
+    "PFLFT_DMID_ABS_MAX_TICKS": [
+      "1",
+      "2"
+    ],
+    "PFLFT_LAG_SCORE_MIN": [
+      "low",
+      "mid",
+      "high",
+      "10"
+    ],
+    "PFLFT_PROOF_MAX_BARS": [
+      "0",
+      "3",
+      "5"
+    ],
+    "PFLFT_PROOF_TICKS": [
+      "1",
+      "2"
+    ],
+    "PFLFT_CONFIRM_MIN_ABS_OFID": [
+      "5",
+      "8",
+      "12"
+    ],
+    "PFLFT_CONFIRM_MIN_FLOW_SUM": [
+      "0",
+      "5",
+      "8"
+    ],
+    "PFLFT_PROOF_MIN_FLOW": [
+      "0",
+      "5",
+      "8"
+    ],
+    "TRADE_START_HHMM": [
+      "0000",
+      "0930",
+      "1130",
+      "1400"
+    ],
+    "TRADE_END_HHMM": [
+      "2359",
+      "1130",
+      "1400",
+      "1555"
+    ],
+    "TRADE_SESSION": [
+      "all",
+      "rth"
+    ]
   },
-  "allow_any_knob": true
-  ,
+  "allow_any_knob": true,
   "allow_fixed_env_changes": true,
   "allowed_fixed_env_keys": [
     "ENTRY_CONFIRM_STYLE",
     "ENTRY_CONFIRM_BARS",
     "ENTRY_MIN_PROGRESS_TICKS",
     "ENTRY_COOLDOWN_BARS",
+    "ENTRY_ALPHA_ALLOW_MISMATCH_V7",
     "DISABLE_GATE",
     "PFLFT_FLOW_WIN_BARS",
     "PFLFT_SPREAD_MAX",
@@ -59,7 +106,29 @@
     "PFLFT_PROOF_TICKS",
     "PFLFT_PROOF_MIN_FLOW",
     "PFLFT_CONFIRM_MIN_ABS_OFID",
-    "PFLFT_CONFIRM_MIN_FLOW_SUM"
+    "PFLFT_CONFIRM_MIN_FLOW_SUM",
+    "PFLFT_V7_ENABLE",
+    "PFLFT_V7_SPREAD_MAX",
+    "PFLFT_V7_FLOWINT_PRE3_MIN",
+    "PFLFT_V7_SV_PRE3_MIN",
+    "PFLFT_V7_DMID1_MAX",
+    "PFLFT_V7_PROOF_BARS",
+    "PFLFT_V7_PROOF_TICKS",
+    "PFLFT_V7_PROOF_MIN_FLOW",
+    "PFLFT_V7_TIME_STOP_BARS",
+    "PFLFT_V7_TP_TICKS",
+    "PFLFT_V7_SL_TICKS",
+    "PFLFT_V7_FLOWINT_PRE3_P90",
+    "PFLFT_V7_RUNNER_TP_TICKS",
+    "PFLFT_V7_PREV_RANGE_MAX_TICKS",
+    "PFLFT_V7_PREV_ABS_FLOW_MAX",
+    "PFLFT_V8_ENABLE",
+    "PFLFT_V8_LFP_ALIGNED_10_MIN",
+    "PFLFT_V8_STRESS_RATIO_MIN",
+    "PFLFT_V8_DEPTH_TOTAL_TOP5_MAX",
+    "PFLFT_V8_ALIGNED_IMB_DELTA_MIN",
+    "PFLFT_V8_TOXICITY_MAX",
+    "PFLFT_V8_TOX_PROXY_MAX"
   ],
   "ideas_require_strict_json": false,
   "ideas_allow_embedded_json": true,

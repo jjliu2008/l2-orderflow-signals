@@ -123,6 +123,39 @@ def _sweep_cost(prices: List[float], sizes: List[float], mid: float, qty: float 
     return (avg_price - mid) / mid
 
 
+def _sweep_cost_ticks(
+    prices: List[float],
+    sizes: List[float],
+    best_price: float,
+    tick_size: float,
+    qty: float = 5.0,
+) -> Optional[float]:
+    """Slippage in ticks from best_price to fill qty lots through the book.
+
+    For a buy sweep: prices are ask levels ascending, best_price = ask[0].
+    For a sell sweep: prices are bid levels descending, best_price = bid[0].
+    Returns a non-negative number of ticks of slippage (0.0 = filled at best).
+    """
+    if tick_size <= 0 or not np.isfinite(best_price):
+        return None
+    remaining = qty
+    cost = 0.0
+    filled = 0.0
+    for p, s in zip(prices, sizes):
+        if not np.isfinite(p) or s <= 0:
+            continue
+        take = min(s, remaining)
+        cost += take * p
+        filled += take
+        remaining -= take
+        if remaining <= 0:
+            break
+    if filled == 0:
+        return None
+    avg_price = cost / filled
+    return abs(avg_price - best_price) / tick_size
+
+
 def _price_to_float(raw: int) -> float:
     import databento as db
     if raw == db.UNDEF_PRICE:
@@ -130,7 +163,7 @@ def _price_to_float(raw: int) -> float:
     return raw / db.FIXED_PRICE_SCALE
 
 
-def _parse_mbp10(rec) -> Dict[str, float]:
+def _parse_mbp10(rec, tick_size: float = 0.25) -> Dict[str, float]:
     # Extract top-10 book arrays from MBP-10 record levels.
     levels = getattr(rec, "levels", [])
     if not levels:
@@ -167,6 +200,38 @@ def _parse_mbp10(rec) -> Dict[str, float]:
     sweep_cost_buy1 = _sweep_cost(ask_px, ask_sz, mid=mid, qty=1.0)
     sweep_cost_sell1 = _sweep_cost(bid_px, bid_sz, mid=mid, qty=1.0)
 
+    # ── New level-2-10 features ──────────────────────────────────────────────
+
+    # Per-level bid/ask sizes for levels 2-10 (level 1 already stored above).
+    n_levels = len(bid_sz)
+    per_level: Dict[str, float] = {}
+    for i in range(1, 10):  # 0-indexed: level i+1
+        per_level[f"bid_size_{i + 1}"] = bid_sz[i] if i < n_levels else np.nan
+        per_level[f"ask_size_{i + 1}"] = ask_sz[i] if i < n_levels else np.nan
+
+    # Depth shape ratio: fraction of top-5 cumulative depth sitting at level 1.
+    depth_shape_ratio_bid = top_bid_depth / depth_bid_top5 if depth_bid_top5 > 0 else np.nan
+    depth_shape_ratio_ask = top_ask_depth / depth_ask_top5 if depth_ask_top5 > 0 else np.nan
+
+    # Book depth slope: OLS slope of size vs level index over levels 0-9.
+    # For fixed x=[0..9]: denom = 10*285 - 45^2 = 825.
+    _N = min(10, n_levels)
+    _sum_y_bid = sum(bid_sz[:_N])
+    _sum_y_ask = sum(ask_sz[:_N])
+    _sum_xy_bid = sum(i * bid_sz[i] for i in range(_N))
+    _sum_xy_ask = sum(i * ask_sz[i] for i in range(_N))
+    _sx = sum(range(_N))
+    _sx2 = sum(i * i for i in range(_N))
+    _slope_denom = _N * _sx2 - _sx * _sx
+    book_depth_slope_bid = (_N * _sum_xy_bid - _sx * _sum_y_bid) / _slope_denom if _slope_denom else np.nan
+    book_depth_slope_ask = (_N * _sum_xy_ask - _sx * _sum_y_ask) / _slope_denom if _slope_denom else np.nan
+
+    # Sweep cost in ticks: how many ticks above/below best to fill N lots.
+    sweep_cost_buy1_ticks = _sweep_cost_ticks(ask_px[:5], ask_sz[:5], best_price=ask0, tick_size=tick_size, qty=1.0)
+    sweep_cost_sell1_ticks = _sweep_cost_ticks(bid_px[:5], bid_sz[:5], best_price=bid0, tick_size=tick_size, qty=1.0)
+    sweep_cost_buy5_ticks = _sweep_cost_ticks(ask_px[:5], ask_sz[:5], best_price=ask0, tick_size=tick_size, qty=5.0)
+    sweep_cost_sell5_ticks = _sweep_cost_ticks(bid_px[:5], bid_sz[:5], best_price=bid0, tick_size=tick_size, qty=5.0)
+
     return {
         "bid_price_1": bid0,
         "ask_price_1": ask0,
@@ -183,6 +248,16 @@ def _parse_mbp10(rec) -> Dict[str, float]:
         "book_slope_top5": book_slope,
         "sweep_cost_buy1": sweep_cost_buy1,
         "sweep_cost_sell1": sweep_cost_sell1,
+        # Level 2-10
+        **per_level,
+        "depth_shape_ratio_bid": depth_shape_ratio_bid,
+        "depth_shape_ratio_ask": depth_shape_ratio_ask,
+        "book_depth_slope_bid": book_depth_slope_bid,
+        "book_depth_slope_ask": book_depth_slope_ask,
+        "sweep_cost_buy1_ticks": sweep_cost_buy1_ticks,
+        "sweep_cost_sell1_ticks": sweep_cost_sell1_ticks,
+        "sweep_cost_buy5_ticks": sweep_cost_buy5_ticks,
+        "sweep_cost_sell5_ticks": sweep_cost_sell5_ticks,
     }
 
 
@@ -468,6 +543,8 @@ def main():
     lfp_lambda_slow = int(os.environ.get("LFP_LAMBDA_SLOW", "100"))
     lfp_stress_window = int(os.environ.get("LFP_STRESS_WINDOW", "50"))
     lfp_tick_size = float(os.environ.get("LFP_TICK_SIZE", "0"))
+    # Resolve tick_size early so _parse_mbp10 can compute sweep-cost-in-ticks.
+    tick_size = _tick_size_for_symbol(instrument, lfp_tick_size)
     emit_empty = os.environ.get("EMIT_EMPTY", "0").strip() in {"1", "true", "yes", "y"}
     session_start = _parse_time(os.environ.get("SESSION_START", "").strip())
     session_end = _parse_time(os.environ.get("SESSION_END", "").strip())
@@ -608,7 +685,7 @@ def main():
 
         # Update book or trades
         if rec.__class__.__name__.lower().startswith("mbp"):
-            parsed = _parse_mbp10(rec)
+            parsed = _parse_mbp10(rec, tick_size=tick_size)
             if parsed:
                 book = parsed
         elif rec.__class__.__name__.lower().startswith("trade"):
@@ -649,7 +726,6 @@ def main():
     ask = pd.to_numeric(df["ask_price_1"], errors="coerce")
     df["mid"] = 0.5 * (bid + ask)
     df["spread"] = ask - bid
-    tick_size = _tick_size_for_symbol(instrument, lfp_tick_size)
     _validate_book_sanity(df, step_ms=step_ms, tick_size=tick_size, jump_bound_points=20.0)
     df = _add_derived_features(df, step_ms=step_ms, window=flow_window)
     df = _add_lfp_features_labels(
@@ -697,6 +773,15 @@ def main():
         "fav_excursion",
         "trade_volume",
         "signed_volume",
+        # Level 2-10 derived features
+        "depth_shape_ratio_bid",
+        "depth_shape_ratio_ask",
+        "book_depth_slope_bid",
+        "book_depth_slope_ask",
+        "sweep_cost_buy1_ticks",
+        "sweep_cost_sell1_ticks",
+        "sweep_cost_buy5_ticks",
+        "sweep_cost_sell5_ticks",
     ]
     int32_cols = [
         "trade_count",
@@ -706,6 +791,9 @@ def main():
         "top_ask_depth",
         "depth_bid_top5",
         "depth_ask_top5",
+        # Per-level bid/ask sizes for levels 2-10
+        *[f"bid_size_{i}" for i in range(2, 11)],
+        *[f"ask_size_{i}" for i in range(2, 11)],
     ]
     int8_cols = ["label"]
     for col in float32_cols:

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from scripts.experiment_agent import _compute_cost_ticks, _load_trades
+from scripts.experiment_agent import _compute_cost_ticks, _load_trades, _validate_guardrails
 
 
 class ExperimentAgentTests(unittest.TestCase):
@@ -51,6 +51,36 @@ class ExperimentAgentTests(unittest.TestCase):
             self.assertTrue((loaded["strategy"] == "gated").all())
             self.assertEqual(len(loaded), 1)
             self.assertEqual(float(loaded.iloc[0]["pnl_ticks"]), 1.0)
+
+    def test_validate_guardrails_rejects_noncanonical_split_without_override(self) -> None:
+        cfg = {
+            "data_days": {
+                "train_start": "2025-12-01",
+                "train_end": "2025-12-03",
+                "lock_start": "2025-12-13",
+                "lock_end": "2025-12-14",
+            },
+            "min_trades": {"train": 120, "lock": 50},
+            "risk_limits": {"daily_loss_limit_ticks": 80, "trailing_dd_limit_ticks": 160},
+        }
+        with self.assertRaises(ValueError):
+            _validate_guardrails(cfg)
+
+    def test_validate_guardrails_allows_narrow_screening_split_with_override(self) -> None:
+        cfg = {
+            "guardrails": {"allow_screening_split_override": True},
+            "data_days": {
+                "train_start": "2025-12-01",
+                "train_end": "2025-12-03",
+                "lock_start": "2025-12-13",
+                "lock_end": "2025-12-14",
+            },
+            "min_trades": {"train": 120, "lock": 50},
+            "risk_limits": {"daily_loss_limit_ticks": 80, "trailing_dd_limit_ticks": 160},
+        }
+        guard = _validate_guardrails(cfg)
+        self.assertEqual(guard.train_end, "2025-12-03")
+        self.assertEqual(guard.lock_end, "2025-12-14")
 
 
 if __name__ == "__main__":
