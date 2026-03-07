@@ -1,0 +1,89 @@
+{
+  "_doc": "Frozen out-of-sample specification for bid_absorption entry on ESH6. No parameter changes after ESH6 data is pulled. Written 2026-03-07 before any ESH6 data examined.",
+  "spec_id": "bid_absorption_oos_v1",
+  "status": "frozen",
+  "frozen_date": "2026-03-07",
+
+  "instrument": {
+    "in_sample":     "ESZ5 (front month Dec 2025, 2025-12-01 through 2025-12-12)",
+    "out_of_sample": "ESH6 (front month Mar 2026)",
+    "note": "Roll date: ESZ5 expired 2025-12-20; ESH6 is the current front month as of frozen date"
+  },
+
+  "filter_chain": {
+    "step_1_signal": {
+      "source": "PFLFT_v8 gated trades",
+      "filter": "strategy == 'gated' AND entry_family.startswith('PFLFT_v8')",
+      "note": "Same signal generation as in-sample. No signal parameter changes."
+    },
+    "step_2_dsr_gate": {
+      "spec_file": "configs/gate_dsr_v1.json",
+      "threshold": "DSR < 0.135",
+      "alignment": "ask-side for longs, bid-side for shorts",
+      "exclusion_policy": "skip sessions containing FOMC_DECISION, NFP, or CPI events"
+    },
+    "step_3_absorption_window": {
+      "window_secs": 30,
+      "min_dip_ticks": 3,
+      "note": "Arm when price first moves >= 3 ticks adverse from bar_close_mid within window"
+    },
+    "step_4_signature": {
+      "active_signature": "bid_absorption",
+      "inactive_signatures": ["ask_exhausted", "ask_absorbed", "aggressor_flip"],
+      "note": "ask_exhausted and aggressor_flip showed definitively negative EV on ESZ5 in-sample. Only bid_absorption is tested OOS.",
+      "parameters": {
+        "absorption_prints": 5,
+        "burst_ms": 500,
+        "bid_sz_min_lots": 5,
+        "obs_period_secs": 1.0
+      }
+    }
+  },
+
+  "execution": {
+    "entry": {
+      "long":  "ask_px at the tick bid_absorption fires",
+      "short": "bid_px at the tick bid_absorption fires"
+    },
+    "stop_loss": {
+      "long":  "bid_absorption_px - 0.25 (1 tick below the absorbed bid level)",
+      "short": "bid_absorption_px + 0.25 (1 tick above the absorbed ask level)",
+      "rationale": "Absorption level breaking by 1 tick means the absorbed bid/ask failed — thesis violated. Distance from entry is always ~1 tick (entry at ask = bid+1t, SL at bid-1t).",
+      "note": "This eliminates the arm_sl_dist <= 0 ambiguity entirely. SL anchored to absorption level, not arm level."
+    },
+    "take_profit": {
+      "value_ticks": 8,
+      "rationale": "Lowest TP with positive EV on ESZ5 in-sample (EV = +0.20t at TP=8t, SL=1t). Lower TPs are negative EV."
+    }
+  },
+
+  "in_sample_evidence": {
+    "n_dsr_passing":        69,
+    "n_bid_absorption":     15,
+    "all_shorts":           true,
+    "note_direction_skew":  "All 15 ESZ5 in-sample bid_absorption fires were shorts. Verify direction distribution on ESH6 before treating as direction-agnostic.",
+    "sl_dist_ticks":        1.0,
+    "results_by_tp": {
+      "TP_4t":  {"wins": 2, "losses": 13, "holds": 0, "ev_ticks": -0.33},
+      "TP_6t":  {"wins": 2, "losses": 13, "holds": 0, "ev_ticks": -0.07},
+      "TP_8t":  {"wins": 2, "losses": 13, "holds": 0, "ev_ticks": +0.20},
+      "TP_12t": {"wins": 1, "losses": 13, "holds": 1, "ev_ticks": -0.13}
+    },
+    "win_rate_at_tp8": 0.133,
+    "breakeven_win_rate_at_tp8": 0.111
+  },
+
+  "out_of_sample_test_criteria": {
+    "minimum_n_bid_absorption": 30,
+    "primary_hypothesis": "win_rate at TP=8t/SL=1t > 0.20 (above in-sample 13.3%)",
+    "inconclusive_if": "n_bid_absorption < 30",
+    "failure_criterion": "win_rate < 0.111 (below TP=8t/SL=1t breakeven)",
+    "no_parameter_adjustments": "If ESH6 win rate is 10-13% (below in-sample but above breakeven), this is inconclusive — do NOT adjust TP downward to manufacture positive EV."
+  },
+
+  "what_is_not_tested": {
+    "ask_exhausted":  "Negative EV on ESZ5 (arm-SL too wide at 3t for 1.5t entry dip). Not validated OOS.",
+    "aggressor_flip": "Fires too rarely (3/69 windows) on ESZ5 to assess. Not validated OOS.",
+    "ask_absorbed":   "Never fires on ESZ5 with 50-lot threshold. Not validated OOS."
+  }
+}
