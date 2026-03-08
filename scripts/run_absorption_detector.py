@@ -49,8 +49,9 @@ EXCL_DATES    = {"2025-12-10", "2025-12-14"}
 
 
 # ── Load gated trades for one date ───────────────────────────────────────────
-def load_trades(date_str: str) -> pd.DataFrame:
-    p = TRADES_ROOT / f"W10/mode=side_matched/ES_{date_str}/trades_gated.csv"
+def load_trades(date_str: str, trades_root: Path | None = None) -> pd.DataFrame:
+    root = trades_root if trades_root is not None else TRADES_ROOT
+    p = root / f"W10/mode=side_matched/ES_{date_str}/trades_gated.csv"
     if not p.exists():
         return pd.DataFrame()
     df = pd.read_csv(p)
@@ -96,13 +97,14 @@ def attach_dsr(trades: pd.DataFrame, date_str: str) -> pd.DataFrame:
 
 
 # ── Stream trade events from DBN file ────────────────────────────────────────
-def load_dbn_trades(date_str: str) -> list[dict]:
+def load_dbn_trades(date_str: str, dbn_root: Path | None = None, symbol: str = "ESZ5") -> list[dict]:
     """
     Returns all action='T' records from the DBN file as a list of dicts,
     sorted by ts_event. Loads the full session so we can slice any window.
     """
+    root = dbn_root if dbn_root is not None else DBN_ROOT
     compact = date_str.replace("-", "")
-    dbn_dir = DBN_ROOT / f"glbx-mdp3-{compact}.mbp-10.dbn"
+    dbn_dir = root / f"glbx-mdp3-{compact}.mbp-10.dbn"
     candidates = [dbn_dir / f"glbx-mdp3-{compact}.mbp-10.dbn", dbn_dir]
     dbn_path = None
     for c in candidates:
@@ -114,24 +116,24 @@ def load_dbn_trades(date_str: str) -> list[dict]:
 
     store = db.DBNStore.from_file(dbn_path)
 
-    # Resolve ESZ5 instrument_id from symbology (varies per date)
-    esz5_iid = None
+    # Resolve instrument_id from symbology (varies per date)
+    target_iid = None
     try:
         sym_map = store.symbology
         for sym, mappings in sym_map.get("mappings", {}).items():
-            if sym == "ESZ5":
-                esz5_iid = int(mappings[0]["symbol"])
+            if sym == symbol:
+                target_iid = int(mappings[0]["symbol"])
                 break
     except Exception:
         pass
-    if esz5_iid is None:
-        raise RuntimeError(f"Could not resolve ESZ5 instrument_id for {date_str}")
+    if target_iid is None:
+        raise RuntimeError(f"Could not resolve {symbol} instrument_id for {date_str}")
 
     records = []
     for rec in store:
         if str(getattr(rec, "action", "")) != "T":
             continue
-        if rec.instrument_id != esz5_iid:
+        if rec.instrument_id != target_iid:
             continue
         lvl = rec.levels[0]
         records.append({
@@ -144,7 +146,7 @@ def load_dbn_trades(date_str: str) -> list[dict]:
             "bid_sz":    lvl.bid_sz,
             "ask_sz":    lvl.ask_sz,
         })
-    print(f"  ESZ5 instrument_id={esz5_iid}, trade events: {len(records):,}")
+    print(f"  {symbol} instrument_id={target_iid}, trade events: {len(records):,}")
     return records
 
 
@@ -507,13 +509,25 @@ def main():
     parser.add_argument("--flip-curr-min",      type=float, default=0.60)
     parser.add_argument("--genuine-adverse",       type=float, default=4.0)
     parser.add_argument("--ask-absorbed-min-lots", type=int,   default=50)
+    parser.add_argument("--trades-root",  default=None,
+                        help="Override TRADES_ROOT (parent of W10/mode=side_matched/ES_DATE/)")
+    parser.add_argument("--dbn-root",     default=None,
+                        help="Override DBN_ROOT (parent of glbx-mdp3-DATE.mbp-10.dbn)")
+    parser.add_argument("--symbol",       default="ESZ5",
+                        help="Front-month raw symbol to look up in DBN symbology (default: ESZ5)")
+    parser.add_argument("--output-dir",   default=None,
+                        help="Override OUTPUT_DIR for JSONL results")
     args = parser.parse_args()
+
+    trades_root = Path(args.trades_root).expanduser().resolve() if args.trades_root else None
+    dbn_root    = Path(args.dbn_root).expanduser().resolve()    if args.dbn_root    else None
+    out_dir     = Path(args.output_dir).expanduser().resolve()  if args.output_dir  else OUTPUT_DIR
 
     date_str = args.date
     print(f"=== Absorption Detector — {date_str} ===")
 
     # Load signals
-    trades = load_trades(date_str)
+    trades = load_trades(date_str, trades_root=trades_root)
     if trades.empty:
         print(f"No gated trades for {date_str}")
         sys.exit(0)
@@ -529,7 +543,7 @@ def main():
 
     # Load full session tick stream (once)
     print(f"Loading tick stream from DBN...")
-    dbn_trades = load_dbn_trades(date_str)
+    dbn_trades = load_dbn_trades(date_str, dbn_root=dbn_root, symbol=args.symbol)
     print(f"  Trade events loaded: {len(dbn_trades):,}")
 
     # Run detector on each signal
@@ -593,8 +607,8 @@ def main():
         print(f"\ngenuine_adverse max dips: {sorted(adv)}")
 
     # ── Write output ──────────────────────────────────────────────────────────
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUTPUT_DIR / f"absorption_{date_str}.jsonl"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"absorption_{date_str}.jsonl"
     with open(out_path, "w", encoding="utf-8") as f:
         for r in results:
             f.write(json.dumps(r, default=str) + "\n")

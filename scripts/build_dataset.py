@@ -688,6 +688,14 @@ def main():
             parsed = _parse_mbp10(rec, tick_size=tick_size)
             if parsed:
                 book = parsed
+            # MBP-10 embeds trade records inline (action='T'); accumulate them.
+            if str(getattr(rec, "action", "")) == "T":
+                size = getattr(rec, "size", None)
+                side = getattr(rec, "side", None)
+                if size is not None:
+                    agg.volume += float(size)
+                    agg.signed_volume += float(size) * _trade_side_sign(side)
+                    agg.count += 1
         elif rec.__class__.__name__.lower().startswith("trade"):
             price = getattr(rec, "price", None)
             size = getattr(rec, "size", None)
