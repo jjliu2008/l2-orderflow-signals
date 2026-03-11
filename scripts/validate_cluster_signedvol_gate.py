@@ -16,6 +16,11 @@ Primary comparison:
   - threshold 250
   - threshold 300
 
+Optional live candidate:
+  - setup: signal_cluster_live_candidate
+  - entry gate: cash_open signedvol_sum30s <= 100, otherwise <= 250
+  - exit: fail-fast invalidation in first 3 minutes + 30m max hold
+
 Outputs:
   - artifacts/signal_research/es_cluster_signedvol_gate_validation_*.json
   - artifacts/signal_research/es_cluster_signedvol_gate_validation_*_trades.csv
@@ -111,6 +116,9 @@ def _simulate_variant(
     step_ms: int,
     hold_minutes: int,
     sv_threshold: float | None,
+    variant_name: str | None = None,
+    setup_name: str = "signal_cluster_first",
+    live_policy: dict | None = None,
 ) -> pd.DataFrame:
     if entries.empty:
         return pd.DataFrame()
@@ -160,19 +168,68 @@ def _simulate_variant(
             continue
 
         # New causal gate: pre-entry signed volume sum over 30s at signal bar.
-        if sv_threshold is not None:
-            sv = sig_row.get("signedvol_sum30s", np.nan)
+        sv = sig_row.get("signedvol_sum30s", np.nan)
+        if live_policy is not None:
             if not np.isfinite(sv):
                 continue
-            if float(sv) > float(sv_threshold):
+            sess = str(e_row.get("session_bucket", ""))
+            sv_max = (
+                float(live_policy["cash_open_sv_max"])
+                if sess == "cash_open"
+                else float(live_policy["non_cash_sv_max"])
+            )
+            if float(sv) > sv_max:
                 continue
+        else:
+            if sv_threshold is not None:
+                if not np.isfinite(sv):
+                    continue
+                if float(sv) > float(sv_threshold):
+                    continue
 
         cut_idx = day_cutoff_idx.get(date_et, None)
         if cut_idx is None:
             continue
-        x_idx = min(idx_use + hold_bars, int(cut_idx))
-        if x_idx <= idx_use:
+        x_idx_natural = min(idx_use + hold_bars, int(cut_idx))
+        if x_idx_natural <= idx_use:
             continue
+
+        # Optional fast thesis-invalidation exit for live candidate.
+        x_idx = x_idx_natural
+        exit_reason = "TIME_30M"
+        if live_policy is not None:
+            fail_bars = max(1, int((float(live_policy["failfast_seconds"]) * 1000.0) // float(step_ms)))
+            flow_thresh = float(live_policy["failfast_adverse_flow30"])
+            obi_thresh = float(live_policy["failfast_adverse_obi"])
+            min_prog = float(live_policy["failfast_min_progress_ticks"])
+
+            entry_mid = float(e_row["mid"])
+            path = df.iloc[idx_use : x_idx_natural + 1].copy()
+            flow30 = (
+                pd.to_numeric(path.get("signed_volume", 0.0), errors="coerce")
+                .fillna(0.0)
+                .rolling(30, min_periods=5)
+                .sum()
+                .to_numpy()
+            )
+            obi = pd.to_numeric(path.get("order_book_imbalance", 0.0), errors="coerce").fillna(0.0).to_numpy()
+            mid = pd.to_numeric(path["mid"], errors="coerce").to_numpy()
+
+            mfe_mid = 0.0
+            rel_exit = len(path) - 1
+            for j in range(1, len(path)):
+                mid_pnl_ticks = side * (mid[j] - entry_mid) / tick_size
+                mfe_mid = max(mfe_mid, float(mid_pnl_ticks))
+                if j > fail_bars:
+                    continue
+                no_progress = mfe_mid < min_prog
+                adverse_flow = (side * float(flow30[j])) < -flow_thresh
+                adverse_obi = (side * float(obi[j])) < -obi_thresh
+                if no_progress and adverse_flow and adverse_obi:
+                    rel_exit = j
+                    exit_reason = "FAIL_FAST"
+                    break
+            x_idx = idx_use + int(rel_exit)
 
         x_row = df.iloc[x_idx]
         entry_px = suite._entry_fill(e_row, side)
@@ -181,9 +238,11 @@ def _simulate_variant(
 
         rows.append(
             {
-                "variant": f"sv_le_{int(sv_threshold)}" if sv_threshold is not None else "baseline_no_sv_gate",
+                "variant": variant_name
+                if variant_name is not None
+                else (f"sv_le_{int(sv_threshold)}" if sv_threshold is not None else "baseline_no_sv_gate"),
                 "sv_threshold": sv_threshold,
-                "setup": "signal_cluster_first",
+                "setup": setup_name,
                 "filter": "spread_1tick",
                 "mode": "delayed_1bar",
                 "date_et": date_et,
@@ -197,6 +256,7 @@ def _simulate_variant(
                 "entry_idx_used": idx_use,
                 "delay_bars": int(idx_use - e_idx),
                 "exit_idx_used": x_idx,
+                "exit_reason": exit_reason,
                 "signal_signedvol_sum30s": _safe(sig_row.get("signedvol_sum30s", np.nan)),
                 "pnl_gross_ticks": float(gross),
             }
@@ -226,6 +286,15 @@ def main() -> None:
     ap.add_argument("--commission-ticks", type=float, default=0.36)
     ap.add_argument("--thresholds", default="200,250,300")
     ap.add_argument("--oos-month", default="2026-02")
+    ap.add_argument("--include-live-candidate", type=int, default=1)
+    ap.add_argument("--live-variant-name", default="live_candidate_v1")
+    ap.add_argument("--live-setup-name", default="signal_cluster_live_candidate")
+    ap.add_argument("--live-cash-open-sv-max", type=float, default=100.0)
+    ap.add_argument("--live-non-cash-sv-max", type=float, default=250.0)
+    ap.add_argument("--live-failfast-seconds", type=float, default=180.0)
+    ap.add_argument("--live-failfast-min-progress-ticks", type=float, default=1.0)
+    ap.add_argument("--live-failfast-adverse-flow30", type=float, default=200.0)
+    ap.add_argument("--live-failfast-adverse-obi", type=float, default=0.03)
     ap.add_argument(
         "--output-json",
         default=str(OUT_DIR / "es_cluster_signedvol_gate_validation_20260310.json"),
@@ -265,6 +334,29 @@ def main() -> None:
         )
         if not tdf.empty:
             trade_frames.append(tdf)
+
+    if bool(int(args.include_live_candidate)):
+        live_policy = {
+            "cash_open_sv_max": float(args.live_cash_open_sv_max),
+            "non_cash_sv_max": float(args.live_non_cash_sv_max),
+            "failfast_seconds": float(args.live_failfast_seconds),
+            "failfast_min_progress_ticks": float(args.live_failfast_min_progress_ticks),
+            "failfast_adverse_flow30": float(args.live_failfast_adverse_flow30),
+            "failfast_adverse_obi": float(args.live_failfast_adverse_obi),
+        }
+        live_df = _simulate_variant(
+            df=df,
+            entries=entries,
+            tick_size=args.tick_size,
+            step_ms=args.step_ms,
+            hold_minutes=args.hold_minutes,
+            sv_threshold=None,
+            variant_name=str(args.live_variant_name),
+            setup_name=str(args.live_setup_name),
+            live_policy=live_policy,
+        )
+        if not live_df.empty:
+            trade_frames.append(live_df)
     trades = pd.concat(trade_frames, ignore_index=True) if trade_frames else pd.DataFrame()
 
     # Global stats by variant.
@@ -317,6 +409,17 @@ def main() -> None:
             "commission_ticks": float(args.commission_ticks),
             "thresholds": thresholds,
             "oos_month": args.oos_month,
+            "include_live_candidate": bool(int(args.include_live_candidate)),
+            "live_candidate": {
+                "variant_name": str(args.live_variant_name),
+                "setup_name": str(args.live_setup_name),
+                "cash_open_sv_max": float(args.live_cash_open_sv_max),
+                "non_cash_sv_max": float(args.live_non_cash_sv_max),
+                "failfast_seconds": float(args.live_failfast_seconds),
+                "failfast_min_progress_ticks": float(args.live_failfast_min_progress_ticks),
+                "failfast_adverse_flow30": float(args.live_failfast_adverse_flow30),
+                "failfast_adverse_obi": float(args.live_failfast_adverse_obi),
+            },
             "frozen_branch": {
                 "setup": "signal_cluster_first",
                 "mode": "delayed_1bar",
