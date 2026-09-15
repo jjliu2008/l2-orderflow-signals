@@ -1,0 +1,12 @@
+databento
+duckdb>=1.1
+joblib
+numpy>=1.26
+pandas>=2.2
+plotly>=5.22
+pyarrow>=17
+pytest
+scikit-learn>=1.4
+scipy
+streamlit>=1.36
+websockets

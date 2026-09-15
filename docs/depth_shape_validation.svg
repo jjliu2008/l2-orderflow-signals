@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="540" viewBox="0 0 920 540" role="img" aria-labelledby="title desc">
+  <title id="title">Depth-shape follow-through validation</title>
+  <desc id="desc">Grouped bars compare one-tick follow-through rates for low-concentration and level-one-heavy entry-side books on fit, holdout, and combined samples.</desc>
+  <rect width="920" height="540" fill="#0d1117"/>
+  <text x="70" y="46" fill="#f0f6fc" font-family="system-ui, sans-serif" font-size="24" font-weight="700">Entry-side depth shape predicts one-tick follow-through</text>
+  <text x="70" y="72" fill="#8b949e" font-family="system-ui, sans-serif" font-size="14">ES futures, December 2025 · scheduled FOMC session excluded</text>
+  <g stroke="#30363d" stroke-width="1">
+    <line x1="90" y1="420" x2="870" y2="420"/><line x1="90" y1="356" x2="870" y2="356"/><line x1="90" y1="292" x2="870" y2="292"/><line x1="90" y1="228" x2="870" y2="228"/><line x1="90" y1="164" x2="870" y2="164"/><line x1="90" y1="100" x2="870" y2="100"/>
+  </g>
+  <g fill="#8b949e" font-family="system-ui, sans-serif" font-size="12" text-anchor="end">
+    <text x="80" y="424">0%</text><text x="80" y="360">10%</text><text x="80" y="296">20%</text><text x="80" y="232">30%</text><text x="80" y="168">40%</text><text x="80" y="104">50%</text>
+  </g>
+  <text x="22" y="270" transform="rotate(-90 22 270)" fill="#8b949e" font-family="system-ui, sans-serif" font-size="13" text-anchor="middle">follow-through rate (MFE ≥ 1 tick)</text>
+  <g>
+    <rect x="170" y="156.3" width="72" height="263.7" rx="4" fill="#2f81f7"/><rect x="250" y="310.6" width="72" height="109.4" rx="4" fill="#f0883e"/>
+    <rect x="414" y="246.6" width="72" height="173.4" rx="4" fill="#2f81f7"/><rect x="494" y="344.5" width="72" height="75.5" rx="4" fill="#f0883e"/>
+    <rect x="658" y="205.0" width="72" height="215.0" rx="4" fill="#2f81f7"/><rect x="738" y="325.9" width="72" height="94.1" rx="4" fill="#f0883e"/>
+  </g>
+  <g fill="#f0f6fc" font-family="system-ui, sans-serif" font-size="13" font-weight="700" text-anchor="middle">
+    <text x="206" y="146">41.2%</text><text x="286" y="300">17.1%</text><text x="450" y="236">27.1%</text><text x="530" y="334">11.8%</text><text x="694" y="195">33.6%</text><text x="774" y="316">14.7%</text>
+  </g>
+  <g fill="#c9d1d9" font-family="system-ui, sans-serif" font-size="14" text-anchor="middle">
+    <text x="246" y="449">Fit</text><text x="246" y="468" fill="#8b949e" font-size="12">n = 92</text><text x="490" y="449">Holdout</text><text x="490" y="468" fill="#8b949e" font-size="12">n = 93</text><text x="734" y="449">Combined</text><text x="734" y="468" fill="#8b949e" font-size="12">n = 185</text>
+  </g>
+  <g font-family="system-ui, sans-serif" font-size="13">
+    <rect x="250" y="500" width="14" height="14" rx="2" fill="#2f81f7"/><text x="272" y="512" fill="#c9d1d9">Low L1 concentration</text><rect x="490" y="500" width="14" height="14" rx="2" fill="#f0883e"/><text x="512" y="512" fill="#c9d1d9">L1-heavy book</text>
+  </g>
+</svg>
