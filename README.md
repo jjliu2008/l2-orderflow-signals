@@ -4,7 +4,7 @@ Research and engineering stack for testing short-horizon signals in futures Leve
 
 ## Evidence first: depth shape predicts follow-through
 
-The strongest result in this repository is `depth_shape_ratio`: level-one size divided by cumulative L1-L5 size on the side an entry would consume—ask depth for longs and bid depth for shorts.
+The strongest result in this repository is `depth_shape_ratio`: level-one size divided by cumulative L1-L5 size on the side an entry would consumeâ€”ask depth for longs and bid depth for shorts.
 
 `depth_shape_ratio = L1 size / (L1 + L2 + L3 + L4 + L5 size)`
 
@@ -19,7 +19,7 @@ The initial `qcut` check was monotone: low ratio had the highest follow-through,
 | Entry-side ratio tercile | Book shape | One-tick follow-through | Difference from low tercile |
 |---|---|---|---:|
 | Low | Thin L1 relative to L1-L5 | Highest | reference |
-| Middle | Intermediate concentration | Between the endpoints | — |
+| Middle | Intermediate concentration | Between the endpoints | â€” |
 | High | L1-heavy | Lowest | about -25 pp |
 
 The original per-tercile cell counts were not retained in the committed artifact, so they are not reconstructed with invented precision. The exact fit/holdout rates were preserved:
@@ -32,13 +32,13 @@ The original per-tercile cell counts were not retained in the committed artifact
 | Holdout: next 2 sessions | 93 | 59 | 27.1% | 34 | 11.8% | +15.4 pp |
 | Combined, excluding FOMC | 185 | 110 | 33.6% | 75 | 14.7% | +18.9 pp |
 
-The relationship appeared in seven of eight usable days. The scheduled FOMC session inverted and was excluded under a fixed event rule; December 1 had only 10 entries and was too small to interpret. Holdout lift shrank by 8.7 points, so the result is presented as a useful rejection filter—not a finished trading strategy.
+The relationship appeared in seven of eight usable days. The scheduled FOMC session inverted and was excluded under a fixed event rule; December 1 had only 10 entries and was too small to interpret. Holdout lift shrank by 8.7 points, so the result is presented as a useful rejection filterâ€”not a finished trading strategy.
 
 The analysis is implemented in [`scripts/run_book_shape_analysis.py`](scripts/run_book_shape_analysis.py), feature construction is in [`scripts/build_dataset.py`](scripts/build_dataset.py), schema checks are in [`scripts/verify_mbp10_schema.py`](scripts/verify_mbp10_schema.py), and the frozen result is [`configs/gate_dsr_v1.json`](configs/gate_dsr_v1.json).
 
 ## System architecture
 
-The pipeline is organized as ingestion → filtration → feature extraction → regime-aware labeling → model training and evaluation → execution-aware backtesting.
+The pipeline is organized as ingestion â†’ filtration â†’ feature extraction â†’ regime-aware labeling â†’ model training and evaluation â†’ execution-aware backtesting.
 
 ```mermaid
 flowchart LR
@@ -82,12 +82,23 @@ Evaluation includes chronological fit/holdout splits, day-level consistency chec
 
 This path needs no market-data files and exercises synthetic quote generation, feature construction, forward labels, chronological fitting, and holdout evaluation:
 
+Clone the repository, then run the smoke path with the virtual environment's
+interpreter directly (no shell activation required):
+
 ```bash
 git clone https://github.com/jjliu2008/l2-orderflow-signals.git
 cd l2-orderflow-signals
 python -m venv .venv
-python -m pip install -r requirements-demo.txt
-python scripts/run_toy_showcase.py
+# macOS / Linux
+.venv/bin/python -m pip install -r requirements-demo.txt
+.venv/bin/python scripts/run_toy_showcase.py
+```
+
+```powershell
+# Windows PowerShell (after cloning and entering the repository)
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-demo.txt
+.\.venv\Scripts\python.exe scripts\run_toy_showcase.py
 ```
 
 Expected final line:
@@ -134,3 +145,4 @@ The following stages require files that cannot be shipped in this public reposit
 ## Scope of the result
 
 The depth-shape study predicts whether a candidate moves at least one tick in its intended direction. It did not improve payoff magnitude among winners, and it does not establish net profitability after fees, latency, slippage, or queue position. What it does establish is a real, time-split order-book effect with a visible failure regime and an implementation that can be inspected end to end.
+
